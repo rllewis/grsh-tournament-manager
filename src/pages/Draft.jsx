@@ -1,4 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { computeScore, formatReturningBadge } from "../lib/playerScoring";
+
+const API   = window.grshConfig?.apiUrl || "/wp-json/grsh/v1";
+const NONCE = window.grshConfig?.nonce  || "";
 
 // -------------------------------------------------------------------------
 // Mock data
@@ -111,6 +115,10 @@ function PlayerRow({ player, onPick, active, picked }) {
   const pc = POSITION_COLOR[player.position] || {};
   const tc = TIER_COLOR(player.skill_tier_reported);
   const initials = `${player.first_name[0]}${player.last_name[0]}`;
+  const years      = player.years_experience || 0;
+  const adjustment = player.committee_score_adjustment || 0;
+  const score = computeScore(player.skill_tier_reported, years, adjustment);
+  const returningBadge = formatReturningBadge(player.returning_seasons);
 
   return (
     <div
@@ -146,12 +154,26 @@ function PlayerRow({ player, onPick, active, picked }) {
         }}>
           {player.first_name} {player.last_name}
           {player.sandbagging_flag && !picked && <span style={{ fontSize:9, color:"#EF4444" }}>⚠</span>}
+          {returningBadge && !picked && (
+            <span style={{
+              fontFamily:"'DM Mono',monospace", fontSize:8, fontWeight:700,
+              background:"#1a1a2e", color:"#D4A017",
+              padding:"1px 4px", borderRadius:3, letterSpacing:".04em",
+            }}>{returningBadge}</span>
+          )}
           {picked && <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:"#ccc" }}>picked</span>}
         </div>
-        <div style={{ display:"flex", gap:4, marginTop:2 }}>
+        <div style={{ display:"flex", gap:4, marginTop:2, alignItems:"center" }}>
           <Pill {...pc} small>{POSITION_LABEL[player.position]}</Pill>
           <Pill {...tc} small>{player.skill_tier_reported}</Pill>
-          <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:"#bbb" }}>age {player.age}</span>
+          <span style={{ fontFamily:"'DM Mono',monospace", fontSize:9, color:"#888" }}>
+            {years} yrs · <strong style={{ color:"#1a1a2e" }}>{score.toFixed(1)}</strong>
+            {adjustment !== 0 && (
+              <span style={{ color: adjustment > 0 ? "#166534" : "#991B1B", marginLeft:3 }}>
+                ({adjustment > 0 ? "+" : ""}{adjustment})
+              </span>
+            )}
+          </span>
         </div>
       </div>
       {active && !picked && hover && (
@@ -208,11 +230,18 @@ function DraftPickCard({ pick, teams }) {
 // -------------------------------------------------------------------------
 
 export default function Draft() {
-  const ROUNDS = Math.ceil(MOCK_PLAYERS.length / MOCK_TEAMS.length);
-  const snakeOrder = useMemo(() => buildSnakeOrder(MOCK_TEAMS.length, ROUNDS), []);
+  const [teams, setTeams]           = useState([]);
+  const [available, setAvailable]   = useState([]);
+  const [loading, setLoading]       = useState(true);
+  const [loadError, setLoadError]   = useState(null);
 
-  const [teams, setTeams]           = useState(MOCK_TEAMS);
-  const [available, setAvailable]   = useState(MOCK_PLAYERS);
+  // Derived once teams/players are loaded
+  const ROUNDS      = teams.length > 0 && available.length > 0
+    ? Math.ceil(available.length / teams.length) : 0;
+  const snakeOrder  = useMemo(
+    () => teams.length > 0 ? buildSnakeOrder(teams.length, ROUNDS) : [],
+    [teams.length, ROUNDS]
+  );
   const [picks, setPicks]           = useState([]);
   const [currentPickIdx, setCurrentPickIdx] = useState(0);
   const [timer, setTimer]           = useState(TIMER_DEFAULT);
@@ -221,11 +250,58 @@ export default function Draft() {
   const [draftState, setDraftState] = useState("ready"); // ready | active | paused | complete
   const [filterPos, setFilterPos]   = useState("");
   const [history, setHistory]       = useState([]); // for undo
+  const [showConfirm, setShowConfirm] = useState(false); // pre-draft confirmation modal
   const intervalRef = useRef(null);
 
   const currentPick = snakeOrder[currentPickIdx];
   const currentTeam = currentPick ? teams[currentPick.teamIndex] : null;
   const isDone = currentPickIdx >= snakeOrder.length || available.length === 0;
+
+  // ---- Load teams + available players from rosters API -------------------
+  // Falls back to mock data if the endpoint returns 404 (rosters not yet
+  // set up) so the draft UI is always usable. A warning banner is shown
+  // when mock data is active so the committee knows rosters aren't live.
+  const [usingMock, setUsingMock] = useState(false);
+
+  const loadDraft = useCallback(() => {
+    setLoading(true);
+    setLoadError(null);
+    fetch(`${API}/rosters`, { headers: { "X-WP-Nonce": NONCE } })
+      .then(r => {
+        if (r.status === 404) {
+          // Rosters endpoint not yet registered — use mock so draft is usable
+          setUsingMock(true);
+          setTeams(MOCK_TEAMS);
+          setAvailable(MOCK_PLAYERS);
+          setLoading(false);
+          return null;
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(data => {
+        if (!data) return; // already handled 404 above
+        const liveteams = (data.teams ?? []).map(t => ({
+          ...t,
+          players: [],
+        }));
+        setTeams(liveteams.length > 0 ? liveteams : MOCK_TEAMS);
+        setAvailable(data.unassigned ?? MOCK_PLAYERS);
+        setUsingMock(liveteams.length === 0);
+        setLoading(false);
+      })
+      .catch(err => {
+        // Network error — fall back to mock so draft can still be run offline
+        console.warn("GRSH Draft: rosters fetch failed, using mock data.", err.message);
+        setUsingMock(true);
+        setTeams(MOCK_TEAMS);
+        setAvailable(MOCK_PLAYERS);
+        setLoadError(err.message); // kept for the warning banner, not a blocker
+        setLoading(false);
+      });
+  }, []);
+
+  useEffect(() => { loadDraft(); }, [loadDraft]);
 
   // ---- Timer ---------------------------------------------------------------
   useEffect(() => {
@@ -253,6 +329,12 @@ export default function Draft() {
 
   // ---- Draft actions -------------------------------------------------------
   const startDraft = () => {
+    // Show confirmation modal instead of starting immediately
+    setShowConfirm(true);
+  };
+
+  const confirmStartDraft = () => {
+    setShowConfirm(false);
     setDraftState("active");
     if (timerEnabled) startTimer();
   };
@@ -307,18 +389,25 @@ export default function Draft() {
   };
 
   const resetDraft = () => {
-    setTeams(MOCK_TEAMS);
-    setAvailable(MOCK_PLAYERS);
     setPicks([]);
     setCurrentPickIdx(0);
     setHistory([]);
     resetTimer();
     setDraftState("ready");
+    loadDraft(); // re-fetch fresh roster state
   };
 
   // ---- Filtered pool -------------------------------------------------------
+  // Sort by composite draft score DESC so the strongest available player is
+  // surfaced first — the typical committee draft order.
   const filteredAvailable = useMemo(() =>
-    available.filter(p => !filterPos || p.position === filterPos),
+    available
+      .filter(p => !filterPos || p.position === filterPos)
+      .sort((a, b) => {
+        const av = computeScore(a.skill_tier_reported, a.years_experience, a.committee_score_adjustment);
+        const bv = computeScore(b.skill_tier_reported, b.years_experience, b.committee_score_adjustment);
+        return bv - av;
+      }),
   [available, filterPos]);
 
   // ---- Round display -------------------------------------------------------
@@ -326,8 +415,42 @@ export default function Draft() {
   const isSnakeReversed = currentRound % 2 === 0;
   const pickedIds = new Set(picks.map(p => p.player.id));
 
+  if (loading) return (
+    <div style={{ padding: 48, fontFamily: "'DM Mono',monospace", fontSize: 13, color: "#aaa" }}>
+      Loading draft data...
+    </div>
+  );
+
+  if (teams.length === 0) return (
+    <div style={{ padding: 48, fontFamily: "'DM Mono',monospace", fontSize: 13, color: "#aaa" }}>
+      No teams created yet — go to Rosters to create teams before running the draft.
+    </div>
+  );
+
   return (
     <div style={styles.root}>
+
+      {/* Mock data / API warning banner */}
+      {usingMock && (
+        <div style={{
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          background:"#FEF9C3", borderBottom:"1px solid #FDE047",
+          padding:"8px 20px", gap:12, flexShrink:0,
+          fontFamily:"'DM Mono',monospace", fontSize:11,
+        }}>
+          <span style={{ color:"#713F12" }}>
+            ⚠ {loadError
+              ? `Rosters API error (${loadError}) — running with sample data. Upload class-grsh-rosters.php to load live rosters.`
+              : "No live rosters found — running with sample data. Create teams in Rosters first."
+            }
+          </span>
+          <button onClick={loadDraft} style={{
+            fontFamily:"'DM Mono',monospace", fontSize:11, padding:"3px 10px",
+            background:"#fff", border:"1px solid #FDE047", borderRadius:5,
+            color:"#713F12", cursor:"pointer",
+          }}>↺ Retry</button>
+        </div>
+      )}
 
       {/* Header */}
       <div style={styles.header}>
@@ -391,6 +514,9 @@ export default function Draft() {
               }}>{f.label}</button>
             ))}
           </div>
+          <div style={styles.scoreCaption}>
+            Sorted by score · range 3.0 – 27.0
+          </div>
           <div style={styles.playerList}>
             {filteredAvailable.map(p => (
               <PlayerRow
@@ -424,7 +550,21 @@ export default function Draft() {
             ) : draftState === "ready" ? (
               <div style={{ textAlign:"center", padding:"10px 0" }}>
                 <p style={{ fontFamily:"'Fraunces',serif", fontSize:16, fontWeight:700, color:"#1a1a2e", margin:"0 0 4px" }}>Ready to draft</p>
-                <p style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:"#aaa" }}>Press Start draft to begin</p>
+                <p style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:"#aaa", marginBottom:16 }}>Review the checklist before starting</p>
+                <div style={{ textAlign:"left", maxWidth:380, margin:"0 auto" }}>
+                  {[
+                    { ok: teams.length > 0,    text: `${teams.length} teams configured (${teams.map(t=>t.name).join(", ")})` },
+                    { ok: available.length > 0, text: `${available.length} players available in pool` },
+                    { ok: available.length > 0, text: `Score range: ${available.length>0?Math.min(...available.map(p=>computeScore(p.skill_tier_reported,p.years_experience||0,0))).toFixed(1):"—"} – ${available.length>0?Math.max(...available.map(p=>computeScore(p.skill_tier_reported,p.years_experience||0,0))).toFixed(1):"—"}` },
+                    { ok: teams.length > 0,    text: `Draft date: March 15, 2027` },
+                    { ok: available.filter(p=>p.sandbagging_flag).length === 0, warn: available.filter(p=>p.sandbagging_flag).length > 0, text: available.filter(p=>p.sandbagging_flag).length > 0 ? `${available.filter(p=>p.sandbagging_flag).length} sandbagging flag(s) — review recommended` : "No sandbagging flags" },
+                  ].map((item, i) => (
+                    <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:10, padding:"8px 0", borderBottom:"1px solid #F0EEE8", fontFamily:"'DM Mono',monospace", fontSize:12, color: item.ok ? "#555" : "#aaa" }}>
+                      <span style={{ color: item.ok ? (item.warn ? "#BA7517" : "#1D9E75") : "#D3D1C7", fontSize:14, flexShrink:0 }}>{item.ok ? (item.warn ? "⚠" : "✓") : "○"}</span>
+                      {item.text}
+                    </div>
+                  ))}
+                </div>
               </div>
             ) : (
               <div style={styles.activePickInner}>
@@ -631,6 +771,13 @@ const styles = {
     padding:"3px 9px", borderRadius:5, cursor:"pointer",
   },
   playerList: { overflowY:"auto", maxHeight:520 },
+  scoreCaption: {
+    fontFamily:"'DM Mono',monospace", fontSize:9,
+    color:"#aaa", padding:"4px 14px",
+    borderBottom:"1px solid #F0EEE8",
+    background:"#FAFAF8",
+    textTransform:"uppercase", letterSpacing:".06em",
+  },
   emptyPool: {
     fontFamily:"'DM Mono',monospace", fontSize:11, color:"#ccc",
     textAlign:"center", padding:"24px 0",

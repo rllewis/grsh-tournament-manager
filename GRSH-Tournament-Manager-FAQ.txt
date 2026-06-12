@@ -1,0 +1,514 @@
+================================================================================
+GRSH TOURNAMENT MANAGER
+FREQUENTLY ASKED QUESTIONS
+================================================================================
+Plugin Name:    GRSH Tournament Manager
+Version:        1.0.0
+Developer:      Tech Tribe Consulting
+Author URI:     https://techtribeconsulting.com
+Site:           grsht.com (Gold Rush Senior Hockey Tournament)
+Last Updated:   2026-05-29
+================================================================================
+
+
+================================================================================
+SECTION 1 — ABOUT THE PLUGIN
+================================================================================
+
+Q. What is GRSH Tournament Manager?
+
+A. GRSH Tournament Manager is a custom WordPress plugin that runs the Gold
+   Rush Senior Hockey Tournament management workflow end to end. It takes
+   player registrations from WPForms, deduplicates returning players against
+   historical data, supports committee review and overrides, builds tier-
+   balanced rosters via a snake draft, tracks alternates, and produces the
+   communications and reports the tournament committee needs each season.
+
+
+Q. Who is this plugin for?
+
+A. The tournament committee and their delegated captains. It is not a public
+   plugin and is not distributed through the WordPress.org repository. It is
+   built specifically for grsht.com and the Gold Rush Senior Hockey workflow.
+
+
+Q. What does it replace?
+
+A. Spreadsheets, email threads, and manual data entry. Before this plugin the
+   committee tracked registrations across multiple Google Sheets, performed
+   the draft by hand, and reconciled payment status against PayPal exports
+   manually. This plugin centralises all of that inside WordPress.
+
+
+Q. What WordPress features does it depend on?
+
+A. The plugin requires:
+     - WordPress 6.4 or higher
+     - PHP 8.1 or higher
+     - WPForms Pro (registration form intake)
+     - MySQL or MariaDB for database storage
+
+   Optional but recommended:
+     - SportsPress (player profile display on the frontend)
+     - UpdraftPlus (database backups)
+
+
+================================================================================
+SECTION 2 — INSTALLATION AND ACTIVATION
+================================================================================
+
+Q. How do I install the plugin?
+
+A. The plugin is delivered as a folder containing PHP files and a built
+   React app. Upload the entire grsh-tournament-manager folder to:
+
+     /wp-content/plugins/
+
+   The folder must contain:
+     - grsh-tournament-manager.php       (main plugin file, ~10 KB)
+     - includes/                          (four class-grsh-*.php files)
+     - dist/grsh-admin.js                 (built React admin app)
+
+   Use SiteGround File Manager or FTP. Do not rename any file or folder.
+
+
+Q. What happens when I activate the plugin for the first time?
+
+A. Activation triggers four things:
+
+     1. Eight database tables are created with the wp_grsh_ prefix.
+     2. A default Season 2027 record is inserted, linked to WPForms Form #5047.
+     3. Three custom user roles are registered: GRSH Committee, GRSH Captain,
+        and GRSH Read Only.
+     4. Six custom capabilities are added to the WordPress Administrator role.
+
+   You will see a green dismissible admin notice confirming activation and
+   linking you to the Dashboard.
+
+
+Q. Why does activation fail with a PHP version error?
+
+A. The plugin requires PHP 8.1 or higher. Check your PHP version in:
+
+     SiteGround Site Tools → Devs → PHP Manager
+
+   Upgrade to PHP 8.1, 8.2, or 8.3 before reactivating.
+
+
+Q. Why does activation fail with a WPForms error?
+
+A. The plugin requires WPForms Pro to be installed and active. Install
+   WPForms Pro first, activate it, then activate GRSH Tournament Manager.
+
+
+================================================================================
+SECTION 3 — CONFIGURATION AND FIRST USE
+================================================================================
+
+Q. Where do I find the admin interface after activation?
+
+A. A new top-level menu called GRSH appears in the WordPress admin sidebar
+   with a trophy icon. It contains nine subpages:
+
+     - Dashboard
+     - Players
+     - Rosters
+     - Draft
+     - Alternates
+     - History
+     - Reports
+     - Settings
+     - Import History
+
+   All pages render through a single React app — navigation is client-side.
+
+
+Q. What do the dashboard numbers mean?
+
+A. The dashboard shows six metric cards for the current season:
+
+     - Total Registered: total form submissions received
+     - Imported: registrations synced to the database
+     - Unpaid: registrations awaiting payment confirmation
+     - Subs Registered: number of alternates registered
+     - Unsynced Entries: form submissions not yet pulled in
+     - Active Warnings: sandbagging alerts requiring committee review
+
+
+Q. What is a sandbagging warning?
+
+A. A sandbagging warning appears when a registered player's stated skill tier
+   conflicts with the division they requested. For example, an A-tier player
+   requesting Senior C, or a B-tier player requesting Senior B/C, gets flagged
+   for committee review. The committee can approve, override, or move the
+   player to a different division.
+
+
+================================================================================
+SECTION 4 — PLAYER REGISTRATION SYNC
+================================================================================
+
+Q. How do registrations get into the system?
+
+A. There are two sync paths:
+
+     - Automatic: when a player completes the WPForms registration form,
+       the wpforms_process_complete hook fires and the entry is mapped,
+       deduplicated, and inserted into the GRSH database in a single
+       transaction.
+
+     - Manual: click "Import Registrations" on the Dashboard. This pulls
+       any WPForms entries that have not yet been imported. Useful if the
+       automatic hook failed or registrations existed before plugin activation.
+
+
+Q. How does the plugin handle returning players?
+
+A. Returning players are detected by email address match. When an existing
+   email submits a new registration, the plugin updates the existing player
+   record rather than creating a duplicate. Any committee overrides previously
+   applied to that player (such as forced division placement) are preserved.
+
+
+Q. What if two players share an email address?
+
+A. The wp_grsh_players table has a UNIQUE KEY on the email column. Each email
+   maps to exactly one player. If two real people share an email, the second
+   registration will update the first record rather than create a new one.
+   The recommended workaround is for each player to provide a unique email.
+
+
+Q. The form has a Primary/Sub field. What does that do?
+
+A. The field labelled "Primary or Sub" determines whether the registrant is
+   a primary tournament player or a substitute (alternate). When "Sub" is
+   selected, several fields are hidden via WPForms conditional logic and
+   four sub-specific fields appear: Max Games, Late Game tolerance, Division
+   Eligibility, and Available Days. Subs are tracked in the Alternates page,
+   not in the main player pool.
+
+
+================================================================================
+SECTION 5 — ROSTERS AND DRAFT
+================================================================================
+
+Q. How does the snake draft work?
+
+A. The Draft page implements a standard snake draft. Captains select players
+   in order in round 1, then in reverse order in round 2, then forward again
+   in round 3, and so on. The plugin tracks each pick, prevents duplicate
+   selection, and updates the wp_grsh_rosters table in real time.
+
+
+Q. Can I auto-balance rosters instead of running a manual draft?
+
+A. Yes. The Rosters page has an auto-balance function that distributes
+   players across teams to balance skill tiers and positions automatically.
+   The committee can review the result and adjust manually before locking
+   rosters.
+
+
+Q. Can I move a player between teams after the draft?
+
+A. Yes. The Rosters page supports drag-and-drop reassignment. Every
+   reassignment is recorded in the audit log so the committee can trace
+   who moved which player and when.
+
+
+================================================================================
+SECTION 6 — ALTERNATES
+================================================================================
+
+Q. How are alternates managed?
+
+A. Players who registered as Subs appear on the Alternates page. The page
+   shows each sub's availability constraints (max games, late game tolerance,
+   division eligibility, available days) so the committee can match them to
+   teams needing fill-ins. Subs are not assigned to a single team — they
+   are deployed as needed throughout the tournament.
+
+
+Q. Do alternates pay a different fee?
+
+A. Fee structure is configured at the form level in WPForms. The plugin
+   surfaces the payment status (paid, pending, waived) but does not modify
+   the fee calculation itself.
+
+
+================================================================================
+SECTION 7 — HISTORICAL DATA IMPORT
+================================================================================
+
+Q. How do I bring in past tournament data?
+
+A. The Import History page accepts a CSV file with one row per historical
+   player-season combination. A template CSV is provided with seven example
+   rows showing the expected column structure. Upload the CSV, preview the
+   parse result, and confirm to populate the wp_grsh_player_history table.
+
+
+Q. What columns does the historical CSV need?
+
+A. The required columns are:
+
+     - email
+     - first_name
+     - last_name
+     - season_year
+     - division
+     - skill_tier
+     - team_name
+     - position
+     - notes
+
+   Email is the join key. Players with matching emails in the current season
+   are flagged as returning automatically.
+
+
+Q. Can I re-import the same CSV without creating duplicates?
+
+A. Yes. The import is idempotent on the combination of email and season_year.
+   Re-importing the same file updates existing rows rather than duplicating.
+
+
+================================================================================
+SECTION 8 — PERMISSIONS AND USER ROLES
+================================================================================
+
+Q. Who can see what?
+
+A. The plugin defines three custom roles:
+
+     GRSH Committee   — full read/write on all pages, can run drafts,
+                        sync imports, and send emails.
+     GRSH Captain     — can view the roster assigned to them only.
+     GRSH Read Only   — can view rosters and run reports, no edits.
+
+   The WordPress Administrator role inherits all GRSH capabilities by default.
+
+
+Q. How do I assign someone a GRSH role?
+
+A. Edit the user in WP Admin → Users → All Users. In the Role dropdown,
+   select GRSH Committee, GRSH Captain, or GRSH Read Only. Save. The user's
+   permissions in the GRSH admin will update on their next page load.
+
+
+Q. Can a user have both a GRSH role and a regular WordPress role?
+
+A. WordPress supports a single primary role per user, but additional
+   capabilities can be added programmatically. For most workflows, assigning
+   the GRSH role as the primary role is sufficient.
+
+
+================================================================================
+SECTION 9 — KNOWN ISSUES AND WORKAROUNDS
+================================================================================
+
+Q. Why do my GRSH sidebar links return "This page doesn't seem to exist"?
+
+A. This is caused by the WPS Hide Login plugin intercepting wp-admin URLs.
+   WPS Hide Login redirects any unrecognised admin page request to a custom
+   redirect URL — on grsht.com this is set to https://grsht.com/404/.
+
+   Workarounds in order of preference:
+
+     1. Go to WP Admin → Settings → WPS Hide Login. Clear the "Redirection url"
+        field so it is empty. Save.
+
+     2. Deactivate WPS Hide Login entirely. Your login URL will revert to
+        the standard /wp-login.php path.
+
+     3. Check if WPS Hide Login has a compatibility mode option and enable it.
+
+
+Q. Why does the Dashboard work but other sidebar links fail?
+
+A. The Dashboard slug grsh-tm-dashboard is matched first by WordPress before
+   any redirect rule fires. The other slugs (grsh-tm-players, grsh-tm-draft,
+   etc.) trigger the WPS Hide Login interception. The root cause is the
+   same plugin conflict described above.
+
+
+Q. SportsPress and GRSH both appeared to conflict early on. Is that resolved?
+
+A. Yes. Earlier plugin versions used short slugs (grsh-players, grsh-draft)
+   that partially matched SportsPress custom post type slugs (players, draft).
+   Version 1.0.0 final uses the grsh-tm-* prefix throughout, which has zero
+   overlap with SportsPress or any other plugin.
+
+
+Q. The React app loads but shows a blank screen. What now?
+
+A. Most likely the React build file dist/grsh-admin.js is missing or out of
+   date. Verify:
+
+     1. The file exists at /wp-content/plugins/grsh-tournament-manager/dist/
+        grsh-admin.js
+     2. The file size is approximately 176 KB
+     3. Browser developer console (F12) shows no JavaScript errors
+
+   If you rebuilt App.jsx locally, run "npm run build" from the plugin root
+   and re-upload the new dist/grsh-admin.js.
+
+
+================================================================================
+SECTION 10 — TROUBLESHOOTING
+================================================================================
+
+Q. The plugin won't activate. Where do I check for errors?
+
+A. Check three places in order:
+
+     1. WP Admin → Plugins — look for a red error message under the plugin
+        name. WordPress will print PHP fatal errors here.
+
+     2. SiteGround Site Tools → Statistics → Error Log — look for entries
+        with today's timestamp mentioning grsh-tournament-manager.
+
+     3. wp-content/debug.log — only available if WP_DEBUG_LOG is enabled
+        in wp-config.php.
+
+
+Q. How do I enable WordPress debug logging?
+
+A. Edit wp-config.php in your site root. Find this line:
+
+     define( 'WP_DEBUG', false );
+
+   Replace with these three lines:
+
+     define( 'WP_DEBUG', true );
+     define( 'WP_DEBUG_LOG', true );
+     define( 'WP_DEBUG_DISPLAY', false );
+
+   Save. Reproduce the error. Check wp-content/debug.log for the stack trace.
+   Turn debug mode back off when finished to prevent errors leaking to
+   visitors.
+
+
+Q. SiteGround says my changes are not taking effect even after upload.
+
+A. PHP OPcache caches compiled PHP in memory. To force a cache clear:
+
+     1. Site Tools → Devs → PHP Manager — change PHP version to a different
+        version then back. This restarts PHP and clears OPcache.
+
+     2. Site Tools → Speed → Caching → Flush Cache — clears SiteGround's
+        full-page dynamic cache.
+
+     3. Deactivate and reactivate the plugin from WP Admin → Plugins to
+        re-trigger registration hooks.
+
+
+Q. The Import Registrations button does nothing.
+
+A. Check three things:
+
+     1. Browser developer console (F12) for JavaScript errors.
+
+     2. REST API connectivity — try visiting:
+        https://grsht.com/wp-json/grsh/v1/sync/status
+        in a logged-in browser tab. You should see a JSON response.
+
+     3. WPForms Form ID matches the value in GRSH_Sync_Engine::FORM_ID
+        (currently 5047).
+
+
+================================================================================
+SECTION 11 — MAINTENANCE AND UPGRADES
+================================================================================
+
+Q. How do I update the plugin to a new version?
+
+A. The plugin is not distributed through the WordPress.org repository, so
+   it does not auto-update. To upgrade:
+
+     1. Back up the database first (use UpdraftPlus or your preferred tool).
+
+     2. Upload the new plugin files via FTP or File Manager, overwriting
+        the existing files in /wp-content/plugins/grsh-tournament-manager/.
+
+     3. If the database schema has changed, the activation hook will run
+        the necessary migrations. You may need to deactivate and reactivate
+        the plugin to trigger them.
+
+     4. Test on a staging site first if the upgrade is major.
+
+
+Q. Will updating the plugin lose my data?
+
+A. No. Plugin deactivation and file replacement do not touch the database
+   tables. Data is only removed if you uninstall the plugin via the WordPress
+   admin Delete action, which runs the uninstall hook.
+
+
+Q. How do I back up the GRSH database tables specifically?
+
+A. Use phpMyAdmin in SiteGround Site Tools. Select the eight wp_grsh_*
+   tables and export as SQL. Store the export file somewhere safe before
+   any major update.
+
+
+================================================================================
+SECTION 12 — DATA EXPORT AND REMOVAL
+================================================================================
+
+Q. Can I export tournament data?
+
+A. Yes. The Reports page exports rosters, registrations, and historical
+   data in CSV format. For full database exports, use phpMyAdmin to dump
+   the wp_grsh_* tables directly.
+
+
+Q. How do I completely remove the plugin and all its data?
+
+A. Go to WP Admin → Plugins. Deactivate GRSH Tournament Manager, then click
+   Delete. The uninstall hook will:
+
+     - Drop all eight wp_grsh_* database tables
+     - Remove the three custom user roles
+     - Strip the six custom capabilities from the Administrator role
+     - Delete the grsh_settings and grsh_db_version options
+
+   This is irreversible. Back up your data first.
+
+
+Q. Deactivating the plugin alone — does that delete data?
+
+A. No. Deactivation only stops the plugin from running. It preserves all
+   database tables, user roles, and settings. You can reactivate and
+   continue where you left off.
+
+
+================================================================================
+SECTION 13 — SUPPORT
+================================================================================
+
+Q. Who do I contact for support?
+
+A. Tech Tribe Consulting
+   Website: https://techtribeconsulting.com
+
+   Include in your support request:
+     - A description of the issue
+     - Steps to reproduce
+     - Any error messages (exact text or screenshot)
+     - WordPress version, PHP version, and active plugins list
+     - Browser developer console output if the issue is in the React UI
+
+
+Q. Is there a public bug tracker?
+
+A. No. The plugin is private and supported directly by Tech Tribe Consulting.
+
+
+Q. Can I contribute code or feature requests?
+
+A. Feature requests go through the tournament committee. Code contributions
+   should be coordinated with Tech Tribe Consulting directly.
+
+
+================================================================================
+END OF FAQ
+================================================================================

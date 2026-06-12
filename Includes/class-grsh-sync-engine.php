@@ -12,8 +12,8 @@
  *   2. Manual    — called via REST API from React admin dashboard
  *
  * Dependencies:
- *   - GRSH_Field_Mapper  (class-grsh-field-mapper.php)
- *   - GRSH_Database      (class-grsh-database.php)
+ *   - GRSH_Field_Mapper  (grsh-sync-field-map.php)
+ *   - GRSH_Database      (grsh-database-schema.php)
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -231,30 +231,103 @@ class GRSH_Sync_Engine {
 
         global $wpdb;
 
+        // Resolve real season FK id (1) from the year constant (2027)
+        $season_db_id  = $this->get_season_db_id() ?? 0;
+
         $total_entries  = $this->count_wpforms_entries();
         $total_imported = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_registrations
              WHERE season_id = %d AND source = 'wpforms'",
-            self::SEASON
+            $season_db_id
         ) );
 
         $unpaid = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_registrations
              WHERE season_id = %d AND payment_status = 'pending'",
-            self::SEASON
+            $season_db_id
         ) );
 
         $subs = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_registrations
              WHERE season_id = %d AND player_type = 'sub'",
-            self::SEASON
+            $season_db_id
         ) );
 
         $warnings = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_audit_logs
              WHERE season_id = %d AND action = 'sandbagging_review'",
-            self::SEASON
+            $season_db_id
         ) );
+
+        // Recent imports — last 5 registrations with player name, division, position, status
+        $recent_rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT
+                r.id,
+                CONCAT(p.first_name, ' ', p.last_name) AS name,
+                p.first_name,
+                p.last_name,
+                r.player_type   AS type,
+                r.division_requested AS division,
+                p.position,
+                r.payment_status AS status,
+                r.imported_at
+             FROM {$wpdb->prefix}grsh_registrations r
+             JOIN {$wpdb->prefix}grsh_players p ON p.id = r.player_id
+             WHERE r.season_id = %d
+             ORDER BY r.imported_at DESC
+             LIMIT 5",
+            $season_db_id
+        ), ARRAY_A );
+
+        $recent_imports = array_map( function( $row ) {
+            $imported = $row['imported_at'] ?? null;
+            $time     = '';
+            if ( $imported ) {
+                $diff = time() - strtotime( $imported );
+                if ( $diff < 3600 )      $time = round( $diff / 60 ) . 'm ago';
+                elseif ( $diff < 86400 ) $time = round( $diff / 3600 ) . 'h ago';
+                else                     $time = round( $diff / 86400 ) . 'd ago';
+            }
+            return [
+                'id'       => (int) $row['id'],
+                'name'     => $row['name'] ?? '',
+                'type'     => $row['type'] ?? 'primary',
+                'division' => $row['division'] ?? '',
+                'position' => $row['position'] ?: '—',
+                'status'   => $row['status'] ?? 'pending',
+                'time'     => $time,
+            ];
+        }, $recent_rows ?: [] );
+
+        // Active warnings — sandbagging flags from players table
+        $warning_rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT
+                p.id,
+                CONCAT(p.first_name, ' ', p.last_name) AS player,
+                p.skill_tier_reported,
+                r.division_requested,
+                r.imported_at
+             FROM {$wpdb->prefix}grsh_players p
+             JOIN {$wpdb->prefix}grsh_registrations r ON r.player_id = p.id AND r.season_id = %d
+             WHERE p.sandbagging_flag = 1
+             ORDER BY r.imported_at DESC
+             LIMIT 10",
+            $season_db_id
+        ), ARRAY_A );
+
+        $active_warnings = array_map( function( $row ) {
+            return [
+                'id'     => (int) $row['id'],
+                'type'   => 'sandbagging',
+                'player' => $row['player'] ?? '',
+                'detail' => sprintf(
+                    'Skill tier %s requested %s — committee review required',
+                    $row['skill_tier_reported'] ?? '?',
+                    $row['division_requested']  ?? '?'
+                ),
+                'time'   => '',
+            ];
+        }, $warning_rows ?: [] );
 
         return new WP_REST_Response( [
             'season'          => self::SEASON,
@@ -264,6 +337,8 @@ class GRSH_Sync_Engine {
             'unpaid'          => $unpaid,
             'subs'            => $subs,
             'warnings'        => $warnings,
+            'recent_imports'  => $recent_imports,
+            'active_warnings' => $active_warnings,
         ], 200 );
     }
 
@@ -309,6 +384,18 @@ class GRSH_Sync_Engine {
             ];
         }
 
+        // Resolve the real season DB id (FK) from the season_year constant.
+        // SEASON = 2027 is the year, not the auto-increment id in wp_grsh_seasons.
+        $season_db_id = $this->get_season_db_id();
+        if ( ! $season_db_id ) {
+            return [
+                'player_id'       => null,
+                'registration_id' => null,
+                'warnings'        => [],
+                'errors'          => [ 'Season record not found for year ' . self::SEASON . ' in wp_grsh_seasons.' ],
+            ];
+        }
+
         $wpdb->query( 'START TRANSACTION' );
 
         try {
@@ -319,15 +406,31 @@ class GRSH_Sync_Engine {
                 $mapped['registrations']['player_type']
             );
 
+            // upsert_player now throws its own RuntimeException with the real DB error;
+            // this guard handles the case where it returns null without throwing.
             if ( ! $player_id ) {
-                throw new RuntimeException( 'Failed to upsert player record.' );
+                throw new RuntimeException( 'upsert_player returned null — check previous audit log entries.' );
             }
 
             // Step 4 — insert registration record
-            $reg_data                 = $mapped['registrations'];
-            $reg_data['player_id']    = $player_id;
+            $reg_data                     = $mapped['registrations'];
+            $reg_data['season_id']        = $season_db_id; // overwrite year with real FK id
+            $reg_data['player_id']        = $player_id;
             $reg_data['wpforms_entry_id'] = $entry_id;
-            $reg_data['imported_at']  = current_time( 'mysql' );
+            $reg_data['imported_at']      = current_time( 'mysql' );
+
+            // Strip any keys not in wp_grsh_registrations schema
+            $allowed_reg_cols = [
+                'player_id', 'season_id', 'form_id', 'wpforms_entry_id', 'source',
+                'player_type', 'division_requested', 'division_assigned', 'age',
+                'amount_paid', 'payment_method', 'payment_status', 'payment_date',
+                'waiver_accepted', 'esignature', 'signed_at',
+                'status', 'committee_notes', 'imported_at',
+            ];
+            $reg_data = array_intersect_key(
+                $reg_data,
+                array_flip( $allowed_reg_cols )
+            );
 
             $reg_inserted = $wpdb->insert(
                 "{$wpdb->prefix}grsh_registrations",
@@ -346,8 +449,20 @@ class GRSH_Sync_Engine {
             // Step 5 — insert availability record (subs only)
             if ( ! empty( $mapped['availability'] ) ) {
                 $avail_data                    = $mapped['availability'];
+                $avail_data['season_id']       = $season_db_id;
                 $avail_data['player_id']       = $player_id;
                 $avail_data['registration_id'] = $registration_id;
+
+                // Strip any keys not in wp_grsh_availability schema
+                $allowed_avail_cols = [
+                    'player_id', 'season_id', 'registration_id',
+                    'available_days', 'max_games_per_day', 'late_game_available',
+                    'division_eligibility', 'times_activated', 'last_activated_at',
+                ];
+                $avail_data = array_intersect_key(
+                    $avail_data,
+                    array_flip( $allowed_avail_cols )
+                );
 
                 $avail_inserted = $wpdb->insert(
                     "{$wpdb->prefix}grsh_availability",
@@ -409,6 +524,29 @@ class GRSH_Sync_Engine {
                 'errors'          => [ $e->getMessage() ],
             ];
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Season ID resolver
+    // -------------------------------------------------------------------------
+
+    /**
+     * Look up the auto-increment id for the current season year.
+     * SEASON constant is the year (2027); the FK column needs the row id (e.g. 1).
+     * Result is cached in a static variable to avoid repeated DB hits.
+     */
+    private function get_season_db_id(): ?int {
+        static $cached_id = null;
+        if ( $cached_id !== null ) {
+            return $cached_id;
+        }
+        global $wpdb;
+        $id = $wpdb->get_var( $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}grsh_seasons WHERE season_year = %d LIMIT 1",
+            self::SEASON
+        ) );
+        $cached_id = $id ? (int) $id : null;
+        return $cached_id;
     }
 
     // -------------------------------------------------------------------------
@@ -483,13 +621,37 @@ class GRSH_Sync_Engine {
         $player_data['is_alternate'] = ( $player_type === 'sub' ) ? 1 : 0;
         $player_data['is_goalie']    = ( ( $player_data['position'] ?? '' ) === 'goaltender' ) ? 1 : 0;
 
+        // Remove any keys not present in wp_grsh_players to avoid "Unknown column" errors
+        // Exact column list from wp_grsh_players — no extras allowed.
+        $allowed_player_cols = [
+            'first_name', 'last_name', 'email', 'phone',
+            'position', 'skill_tier_reported', 'skill_tier_assigned',
+            'current_league', 'years_experience', 'jersey_size',
+            'tshirt_size', 'tshirt_type', 'notes',
+            'is_alternate', 'is_goalie', 'is_locked',
+            'sandbagging_flag', 'suspended',
+            'attendance_rating', 'no_show_count', 'wp_user_id',
+        ];
+        $player_data = array_intersect_key(
+            $player_data,
+            array_flip( $allowed_player_cols )
+        );
+
         $inserted = $wpdb->insert(
             "{$wpdb->prefix}grsh_players",
             $player_data,
             $this->get_format_array( $player_data )
         );
 
-        return $inserted ? (int) $wpdb->insert_id : null;
+        if ( ! $inserted ) {
+            // Surface the real MySQL error so it appears in the audit log
+            throw new RuntimeException(
+                'Failed to insert player: ' . ( $wpdb->last_error ?: 'unknown DB error' )
+                . ' | Data keys: ' . implode( ', ', array_keys( $player_data ) )
+            );
+        }
+
+        return (int) $wpdb->insert_id;
     }
 
     // -------------------------------------------------------------------------
@@ -568,14 +730,104 @@ class GRSH_Sync_Engine {
      * Build the entry array structure expected by GRSH_Field_Mapper
      * from a WPForms DB row (manual import path).
      */
+    /**
+     * Build the entry array structure expected by GRSH_Field_Mapper
+     * from a WPForms DB row (manual import path).
+     *
+     * WPForms Pro stores field values in a normalised sibling table
+     * (wp_wpforms_entry_fields), one row per field -- NOT as a JSON blob
+     * in wp_wpforms_entries.fields. We query that table and reconstruct
+     * the structure the mapper expects: ['fields'][$field_id]['value'].
+     *
+     * Name fields (field 20) are stored as a single "First Last" value.
+     * We split on the first space so subkey 'first'/'last' lookups work.
+     */
     private function build_entry_array_from_db( object $entry ): array {
-        $fields = json_decode( $entry->fields ?? '{}', true ) ?: [];
-        $meta   = [
-            'entry_id'       => $entry->entry_id,
-            'payment_status' => $entry->status ?? 'pending',
+        global $wpdb;
+
+        $entry_id = (int) $entry->entry_id;
+
+        // Source 1 — normalised wp_wpforms_entry_fields table (one row per field).
+        // WPForms conditional logic can suppress fields from this table for subs,
+        // so we treat it as primary but not authoritative.
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT field_id, value
+             FROM {$wpdb->prefix}wpforms_entry_fields
+             WHERE entry_id = %d",
+            $entry_id
+        ), ARRAY_A );
+
+        $fields = [];
+        foreach ( $rows as $row ) {
+            $fid   = (string) $row['field_id'];
+            $value = $row['value'];
+            $fields[ $fid ] = $this->make_field_struct( $fid, $value );
+        }
+
+        // Source 2 — JSON blob in wp_wpforms_entries.fields.
+        // Used as fallback for any field IDs missing from the normalised table
+        // (common for subs where conditional logic hides name/email/phone).
+        $json_blob = $entry->fields ?? '';
+        if ( $json_blob ) {
+            $blob = json_decode( $json_blob, true );
+            if ( is_array( $blob ) ) {
+                foreach ( $blob as $fid => $field_data ) {
+                    $fid = (string) $fid;
+                    if ( isset( $fields[ $fid ] ) ) {
+                        continue; // already have it from normalised table
+                    }
+                    // JSON blob field structure: {"name":"Name","value":"Lorenzo Lewis",...}
+                    // OR for sub-fields: {"first":"Lorenzo","last":"Lewis","value":"Lorenzo Lewis",...}
+                    if ( is_array( $field_data ) ) {
+                        $value = $field_data['value'] ?? '';
+                        if ( $fid === '20' ) {
+                            // Use dedicated first/last subkeys if present,
+                            // otherwise split the value string
+                            $first = $field_data['first'] ?? null;
+                            $last  = $field_data['last']  ?? null;
+                            if ( ! $first ) {
+                                $parts = explode( ' ', trim( (string) $value ), 2 );
+                                $first = $parts[0] ?? '';
+                                $last  = $parts[1] ?? '';
+                            }
+                            $fields[ $fid ] = [
+                                'value' => $value,
+                                'first' => $first,
+                                'last'  => $last,
+                            ];
+                        } else {
+                            $fields[ $fid ] = [ 'value' => $value ];
+                        }
+                    } elseif ( is_string( $field_data ) ) {
+                        $fields[ $fid ] = $this->make_field_struct( $fid, $field_data );
+                    }
+                }
+            }
+        }
+
+        $meta = [
+            'entry_id'       => $entry_id,
+            'payment_status' => $entry->status          ?? 'pending',
             'payment_type'   => $entry->payment_gateway ?? 'paypal',
         ];
+
         return [ 'fields' => $fields, 'meta' => $meta ];
+    }
+
+    /**
+     * Build the ['value','first','last'] field struct the mapper expects.
+     * Handles the name field (ID 20) split specially.
+     */
+    private function make_field_struct( string $fid, string $value ): array {
+        if ( $fid === '20' ) {
+            $parts = explode( ' ', trim( $value ), 2 );
+            return [
+                'value' => $value,
+                'first' => $parts[0] ?? '',
+                'last'  => $parts[1] ?? '',
+            ];
+        }
+        return [ 'value' => $value ];
     }
 
     // -------------------------------------------------------------------------

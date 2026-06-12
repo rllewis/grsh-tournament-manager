@@ -1,0 +1,253 @@
+================================================================================
+GRSH TOURNAMENT MANAGER - CHANGE LOG
+================================================================================
+Plugin: GRSH Tournament Manager
+Developer: Tech Tribe Consulting
+Site: grsht.com (SiteGround hosting)
+Domain: Gold Rush Senior Hockey Tournament
+================================================================================
+
+
+--------------------------------------------------------------------------------
+VERSION 1.0.0 - INITIAL BUILD
+Date: 2026-05-28 (early session)
+File: grsh-tournament-manager.php (~287 lines, ~10 KB)
+--------------------------------------------------------------------------------
+
+ADDED:
+  - Plugin bootstrap with PHP 8.1 and WordPress 6.4 minimum requirements
+  - WPForms Pro dependency check on activation
+  - PSR-4 style autoloader for GRSH_* classes from /includes/
+  - Activation hook: creates 8 database tables via GRSH_Database::install()
+  - Activation hook: creates default Season 2027 record
+  - Activation hook: registers custom roles (committee, captain, readonly)
+  - Deactivation hook: flushes rewrite rules (data preserved)
+  - Uninstall hook: full data removal including custom roles and options
+  - 7 custom capabilities granted to administrator role:
+      grsh_committee, grsh_view_roster, grsh_edit_roster,
+      grsh_run_draft, grsh_sync_import, grsh_send_email
+  - Bootstrap on plugins_loaded hook
+  - WPForms missing admin notice
+  - Activation success admin notice with dashboard link
+  - REST API registration via GRSH_Sync_Engine::register_hooks()
+  - History import REST API via GRSH_History_Import::register_hooks()
+  - Admin menu with Dashboard parent and 9 subpages
+  - React app shell mount point (#grsh-app div)
+  - Vite-built React app enqueue from /dist/grsh-admin.js
+  - wp_localize_script passing config to React (apiUrl, nonce, season,
+    formId, userCaps, adminUrl, pluginUrl)
+  - User capability resolver for React permission checks
+
+ADMIN PAGE SLUGS (original):
+  - grsh-dashboard
+  - grsh-players
+  - grsh-rosters
+  - grsh-draft
+  - grsh-alternates
+  - grsh-history
+  - grsh-reports
+  - grsh-settings
+  - grsh-history-import
+
+CAPABILITIES (original):
+  - add_menu_page:    manage_options
+  - add_submenu_page: manage_options
+
+
+--------------------------------------------------------------------------------
+REVISION 2 - SLUG CONFLICT FIX ATTEMPT (URL REWRITE HOOK)
+Date: 2026-05-29
+File: grsh-tournament-manager.php (~313 lines)
+--------------------------------------------------------------------------------
+
+ISSUE IDENTIFIED:
+  Sidebar links rendering as bare slugs (e.g. grsht.com/wp-admin/grsh-players)
+  instead of full admin.php?page= URLs. Dashboard worked, all other pages
+  failed with "This page doesn't seem to exist."
+
+ROOT CAUSE THEORY:
+  SportsPress plugin registers 'players', 'teams', 'staff' as custom post type
+  slugs. With Post Name permalinks active, WordPress was routing 'grsh-players'
+  to the frontend instead of the admin.
+
+ADDED:
+  - URL rewrite hook on admin_menu priority 9999
+  - Hook iterates $submenu['grsh-dashboard'] and rewrites bare slugs
+    matching 'grsh-*' pattern to 'admin.php?page=grsh-*'
+  - Comment block explaining SportsPress conflict rationale
+
+CHANGED:
+  - None (slugs and capabilities unchanged)
+
+RESULT:
+  Did not fix the issue. Sidebar links still failed.
+
+
+--------------------------------------------------------------------------------
+REVISION 3 - CAPABILITY FIX (manage_options → read)
+Date: 2026-05-29
+File: grsh-tournament-manager.php
+--------------------------------------------------------------------------------
+
+ISSUE IDENTIFIED:
+  WordPress was blocking subpage access. Theory: 'manage_options' parent
+  capability mismatched with 'read' children, causing access denial.
+
+CHANGED:
+  - add_menu_page capability:    manage_options → read
+  - add_submenu_page capability: manage_options → read
+
+RESULT:
+  No improvement. Pages still failed.
+
+
+--------------------------------------------------------------------------------
+REVISION 4 - SLUG RENAME TO grsh-tm-* PREFIX
+Date: 2026-05-29
+File: grsh-tournament-manager.php (~444 lines including embedded URL rewrite)
+--------------------------------------------------------------------------------
+
+ISSUE IDENTIFIED:
+  SportsPress custom post type slugs were definitively the conflict source.
+  Decision: rename ALL admin page slugs to use grsh-tm-* prefix for zero
+  overlap with any SportsPress or other plugin slug.
+
+CHANGED:
+  Admin page slugs renamed:
+    grsh-dashboard      → grsh-tm-dashboard
+    grsh-players        → grsh-tm-players
+    grsh-rosters        → grsh-tm-rosters
+    grsh-draft          → grsh-tm-draft
+    grsh-alternates     → grsh-tm-alternates
+    grsh-history        → grsh-tm-history
+    grsh-reports        → grsh-tm-reports
+    grsh-settings       → grsh-tm-settings
+    grsh-history-import → grsh-tm-history-import
+
+  URL rewrite hook strpos check updated:
+    'grsh-' → 'grsh-tm-'
+
+  Activation notice link URL updated:
+    page=grsh-dashboard → page=grsh-tm-dashboard
+
+  React App.jsx PAGES object keys updated to match new slugs (separate file).
+
+  Capabilities reverted in some iterations between 'read' and 'manage_options'
+  during debugging cycles.
+
+RESULT:
+  Dashboard rendered correctly at admin.php?page=grsh-tm-dashboard.
+  Sidebar Dashboard link worked.
+  All other sidebar links still failed.
+
+
+--------------------------------------------------------------------------------
+REVISION 5 - CLEAN REWRITE FROM SCRATCH
+Date: 2026-05-29 04:08 AM
+File: grsh-tournament-manager.php (287 lines, 10 KB exactly)
+--------------------------------------------------------------------------------
+
+PURPOSE:
+  Eliminate any accumulated cruft from iterative edits. Build a clean,
+  definitive file from scratch with consistent capabilities and slugs.
+
+CHANGED:
+  - Complete file rewrite, condensed and consistent
+  - All admin slugs use grsh-tm-* prefix throughout
+  - All capabilities set to 'manage_options' (administrators always have this)
+  - Removed URL rewrite hook entirely (deemed unnecessary with new slugs)
+  - Hook filter changed from str_contains($hook, 'grsh') to 'grsh-tm'
+  - Streamlined role registration into compact one-liners for captain/readonly
+  - Consolidated role capability iteration into shared array constant pattern
+
+REMOVED:
+  - Standalone add_action admin_menu URL rewrite hook (was conflicting)
+  - Verbose docblock comments (kept essential ones only)
+  - Redundant capability iterations
+
+UPLOADED TO:
+  /wp-content/plugins/grsh-tournament-manager/grsh-tournament-manager.php
+  via FTP (after File Manager upload was inconsistent)
+
+VERIFIED:
+  - File on server is 10 KB
+  - File modified date: 2026-05-29 04:08 AM
+  - Plugin shows as active in WP Admin
+  - 8 DB tables present
+  - Dashboard at admin.php?page=grsh-tm-dashboard renders correctly
+
+
+--------------------------------------------------------------------------------
+ROOT CAUSE DISCOVERED - NOT A PLUGIN ISSUE
+Date: 2026-05-29 22:50 PT
+--------------------------------------------------------------------------------
+
+DIAGNOSIS:
+  After exhaustive plugin debugging, discovered that even the basic
+  WordPress admin URL grsht.com/wp-admin/ returns "This page doesn't
+  seem to exist" — meaning the issue is NOT with the GRSH plugin at all.
+
+ACTUAL CAUSE:
+  WPS Hide Login plugin is intercepting ALL /wp-admin/ URLs and redirecting
+  unrecognised admin page requests to https://grsht.com/404/.
+
+WPS HIDE LOGIN CONFIGURATION:
+  Login URL:       https://grsht.com/manage/
+  Redirection URL: https://grsht.com/404/
+
+PROPOSED FIX (pending verification):
+  Option A: Clear the Redirection URL field in WPS Hide Login settings
+  Option B: Deactivate WPS Hide Login plugin entirely
+  Option C: Configure WPS Hide Login compatibility mode if available
+  Option D: Add GRSH admin page slugs to WPS Hide Login allowlist
+
+STATUS:
+  Pending user action to test WPS Hide Login configuration changes.
+  GRSH plugin code itself is correct and complete.
+
+
+================================================================================
+SUMMARY OF FINAL STATE (as of last revision)
+================================================================================
+
+PLUGIN FILES:
+  /wp-content/plugins/grsh-tournament-manager/
+    grsh-tournament-manager.php   (287 lines, 10 KB)
+    includes/
+      class-grsh-database.php       (513 lines)
+      class-grsh-field-mapper.php   (573 lines)
+      class-grsh-sync-engine.php    (659 lines)
+      class-grsh-history-import.php (737 lines)
+    dist/
+      grsh-admin.js                 (~176 KB built React app)
+
+ADMIN PAGE SLUGS (current):
+  grsh-tm-dashboard, grsh-tm-players, grsh-tm-rosters, grsh-tm-draft,
+  grsh-tm-alternates, grsh-tm-history, grsh-tm-reports, grsh-tm-settings,
+  grsh-tm-history-import
+
+CAPABILITIES (current):
+  All admin pages: manage_options
+
+DATABASE TABLES CREATED:
+  wp_grsh_seasons, wp_grsh_players, wp_grsh_registrations,
+  wp_grsh_availability, wp_grsh_teams, wp_grsh_rosters,
+  wp_grsh_player_history, wp_grsh_audit_logs
+
+DEFAULT DATA:
+  Season 2027 record auto-created on activation
+  Linked to WPForms Form ID #5047
+
+USER ROLES:
+  grsh_committee (manage rosters/drafts/players/sync/email)
+  grsh_captain   (view assigned roster only)
+  grsh_readonly  (view rosters and run reports)
+  Administrator inherits all GRSH capabilities
+
+KNOWN BLOCKER:
+  WPS Hide Login plugin redirecting wp-admin URLs to /404/.
+  Awaiting configuration change to resolve.
+
+================================================================================
+END OF CHANGELOG
+================================================================================

@@ -134,6 +134,21 @@ class GRSH_Sync_Engine {
             'callback'            => [ $this, 'rest_sync_status' ],
             'permission_callback' => [ $this, 'rest_permission_check' ],
         ] );
+
+        // PATCH /wp-json/grsh/v1/sync/registrations/{id}/withdraw
+        // Soft-delete a registration — sets status = 'withdrawn', logs to audit table.
+        // Does NOT hard-delete any rows. Reversible via WP Adminer if needed.
+        register_rest_route( 'grsh/v1', '/sync/registrations/(?P<id>\d+)/withdraw', [
+            'methods'             => 'PATCH',
+            'callback'            => [ $this, 'rest_withdraw_registration' ],
+            'permission_callback' => [ $this, 'rest_permission_check' ],
+            'args'                => [
+                'id' => [
+                    'validate_callback' => fn( $v ) => is_numeric( $v ),
+                    'sanitize_callback' => 'absint',
+                ],
+            ],
+        ] );
     }
 
     /**
@@ -319,8 +334,10 @@ class GRSH_Sync_Engine {
                 $mapped['registrations']['player_type']
             );
 
+            // upsert_player now throws its own RuntimeException with the real DB error;
+            // this guard handles the case where it returns null without throwing.
             if ( ! $player_id ) {
-                throw new RuntimeException( 'Failed to upsert player record.' );
+                throw new RuntimeException( 'upsert_player returned null — check previous audit log entries.' );
             }
 
             // Step 4 — insert registration record
@@ -483,13 +500,34 @@ class GRSH_Sync_Engine {
         $player_data['is_alternate'] = ( $player_type === 'sub' ) ? 1 : 0;
         $player_data['is_goalie']    = ( ( $player_data['position'] ?? '' ) === 'goaltender' ) ? 1 : 0;
 
+        // Remove any keys not present in wp_grsh_players to avoid "Unknown column" errors
+        $allowed_player_cols = [
+            'season_id', 'first_name', 'last_name', 'email', 'phone', 'age',
+            'position', 'skill_tier_reported', 'skill_tier_assigned',
+            'current_league', 'years_experience', 'jersey_size',
+            'tshirt_size', 'tshirt_type', 'notes',
+            'is_alternate', 'is_goalie', 'sandbagging_flag',
+        ];
+        $player_data = array_intersect_key(
+            $player_data,
+            array_flip( $allowed_player_cols )
+        );
+
         $inserted = $wpdb->insert(
             "{$wpdb->prefix}grsh_players",
             $player_data,
             $this->get_format_array( $player_data )
         );
 
-        return $inserted ? (int) $wpdb->insert_id : null;
+        if ( ! $inserted ) {
+            // Surface the real MySQL error so it appears in the audit log
+            throw new RuntimeException(
+                'Failed to insert player: ' . ( $wpdb->last_error ?: 'unknown DB error' )
+                . ' | Data keys: ' . implode( ', ', array_keys( $player_data ) )
+            );
+        }
+
+        return (int) $wpdb->insert_id;
     }
 
     // -------------------------------------------------------------------------
@@ -568,17 +606,217 @@ class GRSH_Sync_Engine {
      * Build the entry array structure expected by GRSH_Field_Mapper
      * from a WPForms DB row (manual import path).
      */
+    /**
+     * Build the entry array structure expected by GRSH_Field_Mapper
+     * from a WPForms DB row (manual import path).
+     *
+     * WPForms Pro stores field values in a normalised sibling table
+     * (wp_wpforms_entry_fields), one row per field -- NOT as a JSON blob
+     * in wp_wpforms_entries.fields. We query that table and reconstruct
+     * the structure the mapper expects: ['fields'][$field_id]['value'].
+     *
+     * Name fields (field 20) are stored as a single "First Last" value.
+     * We split on the first space so subkey 'first'/'last' lookups work.
+     */
     private function build_entry_array_from_db( object $entry ): array {
-        $fields = json_decode( $entry->fields ?? '{}', true ) ?: [];
-        $meta   = [
-            'entry_id'       => $entry->entry_id,
-            'payment_status' => $entry->status ?? 'pending',
+        global $wpdb;
+
+        $entry_id = (int) $entry->entry_id;
+
+        // Source 1 — normalised wp_wpforms_entry_fields table (one row per field).
+        // WPForms conditional logic can suppress fields from this table for subs,
+        // so we treat it as primary but not authoritative.
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT field_id, value
+             FROM {$wpdb->prefix}wpforms_entry_fields
+             WHERE entry_id = %d",
+            $entry_id
+        ), ARRAY_A );
+
+        $fields = [];
+        foreach ( $rows as $row ) {
+            $fid   = (string) $row['field_id'];
+            $value = $row['value'];
+            $fields[ $fid ] = $this->make_field_struct( $fid, $value );
+        }
+
+        // Source 2 — JSON blob in wp_wpforms_entries.fields.
+        // Used as fallback for any field IDs missing from the normalised table
+        // (common for subs where conditional logic hides name/email/phone).
+        $json_blob = $entry->fields ?? '';
+        if ( $json_blob ) {
+            $blob = json_decode( $json_blob, true );
+            if ( is_array( $blob ) ) {
+                foreach ( $blob as $fid => $field_data ) {
+                    $fid = (string) $fid;
+                    if ( isset( $fields[ $fid ] ) ) {
+                        continue; // already have it from normalised table
+                    }
+                    // JSON blob field structure: {"name":"Name","value":"Lorenzo Lewis",...}
+                    // OR for sub-fields: {"first":"Lorenzo","last":"Lewis","value":"Lorenzo Lewis",...}
+                    if ( is_array( $field_data ) ) {
+                        $value = $field_data['value'] ?? '';
+                        if ( $fid === '20' ) {
+                            // Use dedicated first/last subkeys if present,
+                            // otherwise split the value string
+                            $first = $field_data['first'] ?? null;
+                            $last  = $field_data['last']  ?? null;
+                            if ( ! $first ) {
+                                $parts = explode( ' ', trim( (string) $value ), 2 );
+                                $first = $parts[0] ?? '';
+                                $last  = $parts[1] ?? '';
+                            }
+                            $fields[ $fid ] = [
+                                'value' => $value,
+                                'first' => $first,
+                                'last'  => $last,
+                            ];
+                        } else {
+                            $fields[ $fid ] = [ 'value' => $value ];
+                        }
+                    } elseif ( is_string( $field_data ) ) {
+                        $fields[ $fid ] = $this->make_field_struct( $fid, $field_data );
+                    }
+                }
+            }
+        }
+
+        $meta = [
+            'entry_id'       => $entry_id,
+            'payment_status' => $entry->status          ?? 'pending',
             'payment_type'   => $entry->payment_gateway ?? 'paypal',
         ];
+
         return [ 'fields' => $fields, 'meta' => $meta ];
     }
 
+    /**
+     * Build the ['value','first','last'] field struct the mapper expects.
+     * Handles the name field (ID 20) split specially.
+     */
+    private function make_field_struct( string $fid, string $value ): array {
+        if ( $fid === '20' ) {
+            $parts = explode( ' ', trim( $value ), 2 );
+            return [
+                'value' => $value,
+                'first' => $parts[0] ?? '',
+                'last'  => $parts[1] ?? '',
+            ];
+        }
+        return [ 'value' => $value ];
+    }
+
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Soft delete — PATCH /sync/registrations/{id}/withdraw
+    // -------------------------------------------------------------------------
+
+    /**
+     * Soft-delete a registration by setting status = 'withdrawn'.
+     *
+     * Does NOT hard-delete any rows — fully reversible via WP Adminer.
+     * Logs the action to wp_grsh_audit_logs using the confirmed schema.
+     *
+     * Responses:
+     *   200 — successfully withdrawn
+     *   404 — registration not found
+     *   409 — already withdrawn
+     *   500 — DB update failed
+     */
+    public function rest_withdraw_registration( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+
+        $registration_id = (int) $request->get_param( 'id' );
+        $body            = $request->get_json_params() ?? [];
+        $reason          = sanitize_text_field( $body['reason'] ?? 'withdrawn by committee' );
+
+        // ── Fetch the registration ────────────────────────────────────────────
+        $reg = $wpdb->get_row( $wpdb->prepare(
+            "SELECT r.id, r.player_id, r.season_id, r.status,
+                    r.division_requested, r.player_type,
+                    r.wpforms_entry_id,
+                    p.first_name, p.last_name, p.email
+             FROM {$wpdb->prefix}grsh_registrations r
+             JOIN {$wpdb->prefix}grsh_players p ON p.id = r.player_id
+             WHERE r.id = %d
+             LIMIT 1",
+            $registration_id
+        ) );
+
+        // ── 404 — not found ───────────────────────────────────────────────────
+        if ( ! $reg ) {
+            return new WP_REST_Response(
+                [
+                    'withdrawn' => false,
+                    'error'     => "Registration {$registration_id} not found.",
+                ],
+                404
+            );
+        }
+
+        // ── 409 — already withdrawn ───────────────────────────────────────────
+        if ( $reg->status === 'withdrawn' ) {
+            return new WP_REST_Response(
+                [
+                    'withdrawn'         => false,
+                    'already_withdrawn' => true,
+                    'registration_id'   => $registration_id,
+                    'message'           => "{$reg->first_name} {$reg->last_name} is already withdrawn.",
+                ],
+                409
+            );
+        }
+
+        // ── Soft delete — update status only ─────────────────────────────────
+        $updated = $wpdb->update(
+            "{$wpdb->prefix}grsh_registrations",
+            [ 'status' => 'withdrawn' ],
+            [ 'id'     => $registration_id ],
+            [ '%s' ],
+            [ '%d' ]
+        );
+
+        if ( false === $updated ) {
+            return new WP_REST_Response(
+                [
+                    'withdrawn' => false,
+                    'error'     => 'Database update failed: ' . $wpdb->last_error,
+                ],
+                500
+            );
+        }
+
+        // ── Audit log — uses confirmed wp_grsh_audit_logs schema ─────────────
+        $this->log_audit(
+            'registration_withdrawn',
+            'registration',
+            $registration_id,
+            [
+                'status'           => $reg->status,
+                'division'         => $reg->division_requested,
+                'player_type'      => $reg->player_type,
+                'wpforms_entry_id' => $reg->wpforms_entry_id,
+            ],
+            [
+                'status' => 'withdrawn',
+                'reason' => $reason,
+            ],
+            "{$reg->first_name} {$reg->last_name} ({$reg->email}) — {$reason}"
+        );
+
+        return new WP_REST_Response(
+            [
+                'withdrawn'       => true,
+                'registration_id' => $registration_id,
+                'player_id'       => (int) $reg->player_id,
+                'player_name'     => "{$reg->first_name} {$reg->last_name}",
+                'email'           => $reg->email,
+                'previous_status' => $reg->status,
+            ],
+            200
+        );
+    }
+
     // Audit logging
     // -------------------------------------------------------------------------
 

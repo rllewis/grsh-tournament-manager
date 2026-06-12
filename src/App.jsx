@@ -9,20 +9,20 @@ import Settings      from "./pages/Settings";
 import HistoryImport from "./pages/HistoryImport";
 
 const PAGES = {
-  "grsh-dashboard":      Dashboard,
-  "grsh-players":        Players,
-  "grsh-rosters":        Rosters,
-  "grsh-draft":          Draft,
-  "grsh-alternates":     Alternates,
-  "grsh-history":        History,
-  "grsh-reports":        Reports,
-  "grsh-settings":       Settings,
-  "grsh-history-import": HistoryImport,
+  "grsh-tm-dashboard":      Dashboard,
+  "grsh-tm-players":        Players,
+  "grsh-tm-rosters":        Rosters,
+  "grsh-tm-draft":          Draft,
+  "grsh-tm-alternates":     Alternates,
+  "grsh-tm-history":        History,
+  "grsh-tm-reports":        Reports,
+  "grsh-tm-settings":       Settings,
+  "grsh-tm-history-import": HistoryImport,
 };
 
 export default function App() {
   const params = new URLSearchParams( window.location.search );
-  const page   = params.get( "page" ) || "grsh-dashboard";
+  const page   = params.get( "page" ) || "grsh-tm-dashboard";
   const Page   = PAGES[ page ] || Dashboard;
 
   return (

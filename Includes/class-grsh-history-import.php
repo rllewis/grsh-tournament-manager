@@ -7,10 +7,12 @@
  * Handles importing player history from prior seasons via CSV upload.
  *
  * REST endpoints:
- *   POST /grsh/v1/history/import        — upload and process CSV
- *   GET  /grsh/v1/history/template      — download blank CSV template
- *   GET  /grsh/v1/history/preview       — preview last uploaded CSV before commit
- *   DELETE /grsh/v1/history/import/{id} — remove a history record
+ *   POST   /grsh/v1/history/import        — upload and process CSV
+ *   GET    /grsh/v1/history/template      — download blank CSV template
+ *   GET    /grsh/v1/history/stats         — stat card counts
+ *   GET    /grsh/v1/history/records       — all history rows with filters
+ *   GET    /grsh/v1/history/import-logs   — *** NEW *** per-import session log
+ *   DELETE /grsh/v1/history/records/{id}  — remove a history record
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -61,28 +63,24 @@ class GRSH_History_Import {
 
     public function register_rest_routes(): void {
 
-        // Upload and process CSV
         register_rest_route( 'grsh/v1', '/history/import', [
             'methods'             => 'POST',
             'callback'            => [ $this, 'rest_import_csv' ],
             'permission_callback' => [ $this, 'rest_permission_check' ],
         ] );
 
-        // Download blank template
         register_rest_route( 'grsh/v1', '/history/template', [
             'methods'             => 'GET',
             'callback'            => [ $this, 'rest_download_template' ],
             'permission_callback' => [ $this, 'rest_permission_check' ],
         ] );
 
-        // Get import stats and recent history
         register_rest_route( 'grsh/v1', '/history/stats', [
             'methods'             => 'GET',
             'callback'            => [ $this, 'rest_get_stats' ],
             'permission_callback' => [ $this, 'rest_permission_check' ],
         ] );
 
-        // Get all history records with filters
         register_rest_route( 'grsh/v1', '/history/records', [
             'methods'             => 'GET',
             'callback'            => [ $this, 'rest_get_records' ],
@@ -95,14 +93,33 @@ class GRSH_History_Import {
             ],
         ] );
 
-        // Delete a history record
+        // ── FIX: New endpoint so the Import Log tab can actually load data ──
+        register_rest_route( 'grsh/v1', '/history/import-logs', [
+            'methods'             => 'GET',
+            'callback'            => [ $this, 'rest_get_import_logs' ],
+            'permission_callback' => [ $this, 'rest_permission_check' ],
+            'args'                => [
+                'limit' => [ 'sanitize_callback' => 'absint', 'default' => 20 ],
+            ],
+        ] );
+
         register_rest_route( 'grsh/v1', '/history/records/(?P<id>\d+)', [
             'methods'             => 'DELETE',
             'callback'            => [ $this, 'rest_delete_record' ],
             'permission_callback' => [ $this, 'rest_permission_check' ],
             'args'                => [
-                'id' => [ 'validate_callback' => fn( $v ) => is_numeric( $v ), 'sanitize_callback' => 'absint' ],
+                'id' => [
+                    'validate_callback' => fn( $v ) => is_numeric( $v ),
+                    'sanitize_callback' => 'absint',
+                ],
             ],
+        ] );
+
+        // DELETE /history/records — clear ALL history (React "Clear all history" button)
+        register_rest_route( 'grsh/v1', '/history/records', [
+            'methods'             => 'DELETE',
+            'callback'            => [ $this, 'rest_delete_all_records' ],
+            'permission_callback' => [ $this, 'rest_permission_check' ],
         ] );
     }
 
@@ -127,7 +144,6 @@ class GRSH_History_Import {
 
         $file = $files['csv'];
 
-        // Validate file type
         $ext = strtolower( pathinfo( $file['name'], PATHINFO_EXTENSION ) );
         if ( ! in_array( $ext, [ 'csv', 'txt' ], true ) ) {
             return new WP_REST_Response( [
@@ -136,7 +152,6 @@ class GRSH_History_Import {
             ], 400 );
         }
 
-        // Parse CSV
         $rows = $this->parse_csv( $file['tmp_name'] );
 
         if ( empty( $rows ) ) {
@@ -146,7 +161,6 @@ class GRSH_History_Import {
             ], 400 );
         }
 
-        // Validate headers
         $header_check = $this->validate_headers( array_keys( $rows[0] ) );
         if ( ! empty( $header_check['missing'] ) ) {
             return new WP_REST_Response( [
@@ -155,9 +169,9 @@ class GRSH_History_Import {
             ], 400 );
         }
 
-        // Process rows
         $imported  = 0;
         $skipped   = 0;
+        $updated   = 0;
         $errors    = [];
         $warnings  = [];
 
@@ -166,33 +180,28 @@ class GRSH_History_Import {
 
         try {
             foreach ( $rows as $i => $row ) {
-                $line = $i + 2; // 1-indexed, +1 for header row
+                $line = $i + 2;
 
-                // Validate row
                 $validation = $this->validate_row( $row, $line );
                 if ( ! empty( $validation['errors'] ) ) {
-                    $errors = array_merge( $errors, $validation['errors'] );
+                    $errors  = array_merge( $errors, $validation['errors'] );
                     $skipped++;
                     continue;
                 }
 
-                // Collect any row warnings
                 if ( ! empty( $validation['warnings'] ) ) {
                     $warnings = array_merge( $warnings, $validation['warnings'] );
                 }
 
-                // Resolve or create player record
                 $player_id = $this->resolve_player( $row );
                 if ( ! $player_id ) {
-                    $errors[] = "Line {$line}: Could not resolve player for email {$row['email']} — skipped.";
+                    $errors[] = "Line {$line}: Could not resolve or create player for email {$row['email']} — skipped.";
                     $skipped++;
                     continue;
                 }
 
-                // Resolve season record
                 $season_id = $this->resolve_season( (int) $row['season_year'] );
 
-                // Check for duplicate
                 $existing = $wpdb->get_var( $wpdb->prepare(
                     "SELECT id FROM {$wpdb->prefix}grsh_player_history
                      WHERE player_id = %d AND season_id = %d",
@@ -200,26 +209,34 @@ class GRSH_History_Import {
                 ) );
 
                 if ( $existing ) {
-                    $warnings[] = "Line {$line}: History record for {$row['email']} season {$row['season_year']} already exists — updated.";
+                    $warnings[] = "Line {$line}: {$row['email']} season {$row['season_year']} already existed — record updated.";
                     $this->update_history_record( (int) $existing, $row, $player_id, $season_id );
+                    $updated++;
                 } else {
                     $this->insert_history_record( $row, $player_id, $season_id );
                 }
 
-                // Update player reliability stats
                 $this->update_player_reliability( $player_id );
-
                 $imported++;
             }
 
             $wpdb->query( 'COMMIT' );
 
-            // Audit log
-            $this->log_import( $imported, $skipped, count( $rows ) );
+            // ── FIX: pass full errors + warnings arrays to the log ──
+            $this->log_import(
+                $imported,
+                $skipped,
+                $updated,
+                count( $rows ),
+                basename( $file['name'] ),
+                $errors,
+                $warnings
+            );
 
             return new WP_REST_Response( [
                 'success'  => true,
                 'imported' => $imported,
+                'updated'  => $updated,
                 'skipped'  => $skipped,
                 'total'    => count( $rows ),
                 'warnings' => $warnings,
@@ -245,27 +262,12 @@ class GRSH_History_Import {
         header( 'Cache-Control: no-cache' );
 
         $out = fopen( 'php://output', 'w' );
-
-        // Header row
         fputcsv( $out, array_keys( self::COLUMN_MAP ) );
 
-        // Example rows
         $examples = [
-            [
-                'Dave', 'Kowalski', 'd.kowalski@email.com',
-                '2026', 'gold_open', 'Team Gold', '1', 'winner',
-                '1', '0', '0', 'B1', '6', '6', '0', '0', '',
-            ],
-            [
-                'Janet', 'Ruiz', 'j.ruiz@email.com',
-                '2026', 'senior_c', 'Team Blue', '2', 'runner_up',
-                '0', '0', '1', 'C1', '6', '5', '1', '0', 'Goalie sub used twice',
-            ],
-            [
-                'Amy', 'Buchanan', 'a.buchanan@email.com',
-                '2026', 'gold_open', 'Sub pool', '', 'none',
-                '0', '1', '0', 'R1', '3', '3', '0', '0', '',
-            ],
+            [ 'Dave',  'Kowalski', 'd.kowalski@email.com', '2026', 'gold_open', 'Team Gold', '1', 'winner',     '1', '0', '0', 'B1', '6', '6', '0', '0', ''                    ],
+            [ 'Janet', 'Ruiz',     'j.ruiz@email.com',     '2026', 'senior_c',  'Team Blue', '2', 'runner_up',  '0', '0', '1', 'C1', '6', '5', '1', '0', 'Goalie sub used twice' ],
+            [ 'Amy',   'Buchanan', 'a.buchanan@email.com', '2026', 'gold_open', 'Sub pool',  '',  'none',       '0', '1', '0', 'R1', '3', '3', '0', '0', ''                    ],
         ];
 
         foreach ( $examples as $row ) {
@@ -277,35 +279,49 @@ class GRSH_History_Import {
     }
 
     // -------------------------------------------------------------------------
-    // REST: Get stats
+    // REST: Stats
+    // ── FIX: added captains + seasons_count; renamed total_records → total
+    //         so React reads data.total consistently with /history/records
     // -------------------------------------------------------------------------
 
     public function rest_get_stats(): WP_REST_Response {
         global $wpdb;
 
-        $total_records = (int) $wpdb->get_var(
+        // Total imported rows
+        $total = (int) $wpdb->get_var(
             "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_player_history"
         );
 
+        // Distinct seasons
         $seasons = $wpdb->get_col(
             "SELECT DISTINCT s.season_year
              FROM {$wpdb->prefix}grsh_player_history h
              JOIN {$wpdb->prefix}grsh_seasons s ON s.id = h.season_id
              ORDER BY s.season_year DESC"
-        );
+        ) ?: [];
 
+        // Past champions (distinct players who won at least once)
         $champions = (int) $wpdb->get_var(
             "SELECT COUNT(DISTINCT player_id)
              FROM {$wpdb->prefix}grsh_player_history
              WHERE championship_result = 'winner'"
         );
 
+        // Captains — FIX: was missing from original, caused 0 in React stat chip
+        $captains = (int) $wpdb->get_var(
+            "SELECT COUNT(DISTINCT player_id)
+             FROM {$wpdb->prefix}grsh_player_history
+             WHERE was_captain = 1"
+        );
+
+        // Sandbagging flags
         $sandbagging = (int) $wpdb->get_var(
             "SELECT COUNT(DISTINCT player_id)
              FROM {$wpdb->prefix}grsh_player_history
              WHERE sandbagging_flag = 1"
         );
 
+        // No-shows
         $no_shows = (int) $wpdb->get_var(
             "SELECT COUNT(DISTINCT player_id)
              FROM {$wpdb->prefix}grsh_player_history
@@ -313,11 +329,15 @@ class GRSH_History_Import {
         );
 
         return new WP_REST_Response( [
-            'total_records' => $total_records,
-            'seasons'       => $seasons,
-            'champions'     => $champions,
-            'sandbagging'   => $sandbagging,
-            'no_shows'      => $no_shows,
+            // ── FIX: React reads data.total — was data.total_records (mismatch) ──
+            'total'          => $total,
+            'total_records'  => $total,    // keep alias for backward compat
+            'seasons'        => array_map( 'intval', $seasons ),
+            'seasons_count'  => count( $seasons ),
+            'champions'      => $champions,
+            'captains'       => $captains,
+            'sandbagging'    => $sandbagging,
+            'no_shows'       => $no_shows,
         ], 200 );
     }
 
@@ -331,18 +351,18 @@ class GRSH_History_Import {
         $season_year = $request->get_param( 'season_year' );
         $division    = $request->get_param( 'division' );
         $page        = max( 1, (int) $request->get_param( 'page' ) );
-        $per_page    = min( 100, max( 1, (int) $request->get_param( 'per_page' ) ) );
+        $per_page    = min( 500, max( 1, (int) $request->get_param( 'per_page' ) ) );
         $offset      = ( $page - 1 ) * $per_page;
 
         $where  = [ '1=1' ];
         $params = [];
 
         if ( $season_year ) {
-            $where[]  = "s.season_year = %d";
+            $where[]  = 's.season_year = %d';
             $params[] = $season_year;
         }
         if ( $division ) {
-            $where[]  = "h.division_played = %s";
+            $where[]  = 'h.division_played = %s';
             $params[] = $division;
         }
 
@@ -358,7 +378,8 @@ class GRSH_History_Import {
 
         $records = $wpdb->get_results( $wpdb->prepare(
             "SELECT
-                h.id, h.player_id, h.division_played, h.team_name,
+                h.id, h.player_id,
+                h.division_played, h.team_name,
                 h.finish_position, h.championship_result,
                 h.was_captain, h.was_alternate, h.was_emergency_goalie,
                 h.skill_tier_reported, h.sandbagging_flag,
@@ -368,19 +389,31 @@ class GRSH_History_Import {
                 p.first_name, p.last_name, p.email
              FROM {$wpdb->prefix}grsh_player_history h
              JOIN {$wpdb->prefix}grsh_seasons s ON s.id = h.season_id
-             JOIN {$wpdb->prefix}grsh_players p ON p.id = h.player_id
+             JOIN {$wpdb->prefix}grsh_players  p ON p.id = h.player_id
              WHERE {$where_sql}
              ORDER BY s.season_year DESC, p.last_name ASC
              LIMIT %d OFFSET %d",
             ...[...$params, $per_page, $offset]
-        ) );
+        ), ARRAY_A ) ?: [];
+
+        // Cast booleans so JS receives true/false not "0"/"1" ── FIX
+        $records = array_map( function ( $r ) {
+            $r['season_year']      = (int) $r['season_year'];
+            $r['was_captain']      = (bool) (int) $r['was_captain'];
+            $r['was_alternate']    = (bool) (int) $r['was_alternate'];
+            $r['sandbagging_flag'] = (bool) (int) $r['sandbagging_flag'];
+            $r['games_scheduled']  = $r['games_scheduled'] !== null ? (int) $r['games_scheduled'] : null;
+            $r['games_attended']   = $r['games_attended']  !== null ? (int) $r['games_attended']  : null;
+            $r['no_show_count']    = (int) ( $r['no_show_count'] ?? 0 );
+            return $r;
+        }, $records );
 
         return new WP_REST_Response( [
-            'records'    => $records,
-            'total'      => $total,
-            'page'       => $page,
-            'per_page'   => $per_page,
-            'total_pages'=> (int) ceil( $total / $per_page ),
+            'records'     => $records,
+            'total'       => $total,
+            'page'        => $page,
+            'per_page'    => $per_page,
+            'total_pages' => (int) ceil( $total / max( 1, $per_page ) ),
         ], 200 );
     }
 
@@ -413,12 +446,36 @@ class GRSH_History_Import {
             [ '%d' ]
         );
 
-        // Recalculate reliability for this player
         $this->update_player_reliability( (int) $record->player_id );
+
+        return new WP_REST_Response( [ 'success' => true, 'deleted' => $id ], 200 );
+    }
+
+    // -------------------------------------------------------------------------
+    // REST: Delete ALL records (clear all history)
+    // Called by DELETE /grsh/v1/history/records from the React "Clear all history" button
+    // -------------------------------------------------------------------------
+
+    public function rest_delete_all_records(): WP_REST_Response {
+        global $wpdb;
+
+        $count = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_player_history"
+        );
+
+        $wpdb->query( "TRUNCATE TABLE {$wpdb->prefix}grsh_player_history" );
+        $wpdb->query( "TRUNCATE TABLE {$wpdb->prefix}grsh_import_logs" );
+
+        // Reset per-player reliability stats derived from history
+        $wpdb->query(
+            "UPDATE {$wpdb->prefix}grsh_players
+             SET attendance_rating = NULL, no_show_count = 0"
+        );
 
         return new WP_REST_Response( [
             'success' => true,
-            'deleted' => $id,
+            'deleted' => $count,
+            'message' => "{$count} record" . ( $count !== 1 ? 's' : '' ) . ' deleted.',
         ], 200 );
     }
 
@@ -437,13 +494,11 @@ class GRSH_History_Import {
         $headers = null;
 
         while ( ( $line = fgetcsv( $handle, 0, ',', '"', '\\' ) ) !== false ) {
-            // Skip blank lines
             if ( empty( array_filter( $line ) ) ) {
                 continue;
             }
 
             if ( $headers === null ) {
-                // Normalise headers — trim, lowercase, replace spaces with underscores
                 $headers = array_map(
                     fn( $h ) => strtolower( trim( str_replace( ' ', '_', $h ) ) ),
                     $line
@@ -451,12 +506,11 @@ class GRSH_History_Import {
                 continue;
             }
 
-            // Pad short rows
             while ( count( $line ) < count( $headers ) ) {
                 $line[] = '';
             }
 
-            $row = array_combine( $headers, array_slice( $line, 0, count( $headers ) ) );
+            $row    = array_combine( $headers, array_slice( $line, 0, count( $headers ) ) );
             $rows[] = array_map( 'trim', $row );
         }
 
@@ -482,50 +536,43 @@ class GRSH_History_Import {
         $errors   = [];
         $warnings = [];
 
-        // Required fields
         foreach ( self::COLUMN_MAP as $col => $config ) {
             if ( $config['required'] && empty( $row[ $col ] ) ) {
                 $errors[] = "Line {$line}: Missing required field '{$col}'.";
             }
         }
 
-        // Email format
         if ( ! empty( $row['email'] ) && ! is_email( $row['email'] ) ) {
-            $errors[] = "Line {$line}: Invalid email address '{$row['email']}'.";
+            $errors[] = "Line {$line}: Invalid email '{$row['email']}'.";
         }
 
-        // Season year
         if ( ! empty( $row['season_year'] ) ) {
             $year = (int) $row['season_year'];
             if ( $year < 2000 || $year > 2100 ) {
-                $errors[] = "Line {$line}: season_year '{$row['season_year']}' is not a valid year.";
+                $errors[] = "Line {$line}: season_year '{$row['season_year']}' is not a valid year (2000–2100).";
             }
         }
 
-        // Division
         if ( ! empty( $row['division_played'] ) ) {
-            $div = strtolower( $row['division_played'] );
+            $div = strtolower( trim( $row['division_played'] ) );
             if ( ! in_array( $div, self::VALID_DIVISIONS, true ) ) {
-                $errors[] = "Line {$line}: division_played '{$row['division_played']}' is not valid. Use: " . implode( ', ', self::VALID_DIVISIONS );
+                $errors[] = "Line {$line}: division_played '{$row['division_played']}' not valid. Accepted: " . implode( ', ', self::VALID_DIVISIONS ) . ". Check spelling and case.";
             }
         }
 
-        // Championship result
         if ( ! empty( $row['championship_result'] ) ) {
-            $champ = strtolower( $row['championship_result'] );
+            $champ = strtolower( trim( $row['championship_result'] ) );
             if ( ! in_array( $champ, self::VALID_CHAMP_RESULTS, true ) ) {
-                $errors[] = "Line {$line}: championship_result '{$row['championship_result']}' is not valid. Use: " . implode( ', ', self::VALID_CHAMP_RESULTS );
+                $errors[] = "Line {$line}: championship_result '{$row['championship_result']}' not valid. Accepted: " . implode( ', ', self::VALID_CHAMP_RESULTS );
             }
         }
 
-        // Attendance sanity check
         if ( ! empty( $row['games_attended'] ) && ! empty( $row['games_scheduled'] ) ) {
             if ( (int) $row['games_attended'] > (int) $row['games_scheduled'] ) {
-                $warnings[] = "Line {$line}: games_attended ({$row['games_attended']}) exceeds games_scheduled ({$row['games_scheduled']}) — check values.";
+                $warnings[] = "Line {$line}: games_attended ({$row['games_attended']}) > games_scheduled ({$row['games_scheduled']}) — values may be transposed.";
             }
         }
 
-        // Sandbagging auto-detection
         if ( ! empty( $row['skill_tier_reported'] ) && ! empty( $row['division_played'] ) ) {
             $tier = strtoupper( substr( $row['skill_tier_reported'], 0, 1 ) );
             $div  = strtolower( $row['division_played'] );
@@ -541,15 +588,11 @@ class GRSH_History_Import {
     // Player resolution
     // -------------------------------------------------------------------------
 
-    /**
-     * Find existing player by email or create a minimal new record.
-     */
     private function resolve_player( array $row ): ?int {
         global $wpdb;
 
         $email = sanitize_email( $row['email'] );
 
-        // Try to find existing player
         $player_id = $wpdb->get_var( $wpdb->prepare(
             "SELECT id FROM {$wpdb->prefix}grsh_players WHERE email = %s LIMIT 1",
             $email
@@ -559,7 +602,6 @@ class GRSH_History_Import {
             return (int) $player_id;
         }
 
-        // Create minimal player record from historical data
         $inserted = $wpdb->insert(
             "{$wpdb->prefix}grsh_players",
             [
@@ -579,9 +621,6 @@ class GRSH_History_Import {
     // Season resolution
     // -------------------------------------------------------------------------
 
-    /**
-     * Find or create a season record for the given year.
-     */
     private function resolve_season( int $year ): int {
         global $wpdb;
 
@@ -614,7 +653,6 @@ class GRSH_History_Import {
 
     private function insert_history_record( array $row, int $player_id, int $season_id ): void {
         global $wpdb;
-
         $wpdb->insert(
             "{$wpdb->prefix}grsh_player_history",
             $this->build_history_data( $row, $player_id, $season_id ),
@@ -624,7 +662,6 @@ class GRSH_History_Import {
 
     private function update_history_record( int $id, array $row, int $player_id, int $season_id ): void {
         global $wpdb;
-
         $wpdb->update(
             "{$wpdb->prefix}grsh_player_history",
             $this->build_history_data( $row, $player_id, $season_id ),
@@ -640,15 +677,15 @@ class GRSH_History_Import {
             'season_id'            => $season_id,
             'division_played'      => strtolower( sanitize_text_field( $row['division_played'] ) ),
             'team_name'            => sanitize_text_field( $row['team_name'] ?? '' ) ?: null,
-            'finish_position'      => isset( $row['finish_position'] ) && $row['finish_position'] !== '' ? (int) $row['finish_position'] : null,
+            'finish_position'      => ( isset( $row['finish_position'] ) && $row['finish_position'] !== '' ) ? (int) $row['finish_position'] : null,
             'championship_result'  => strtolower( sanitize_text_field( $row['championship_result'] ?? 'none' ) ) ?: 'none',
-            'was_captain'          => $this->parse_bool( $row['was_captain'] ?? '0' ),
-            'was_alternate'        => $this->parse_bool( $row['was_alternate'] ?? '0' ),
-            'was_emergency_goalie' => $this->parse_bool( $row['was_emergency_goalie'] ?? '0' ),
+            'was_captain'          => $this->parse_bool( $row['was_captain']          ?? '0' ),
+            'was_alternate'        => $this->parse_bool( $row['was_alternate']         ?? '0' ),
+            'was_emergency_goalie' => $this->parse_bool( $row['was_emergency_goalie']  ?? '0' ),
             'skill_tier_reported'  => sanitize_text_field( $row['skill_tier_reported'] ?? '' ) ?: null,
-            'sandbagging_flag'     => $this->parse_bool( $row['sandbagging_flag'] ?? '0' ),
-            'games_scheduled'      => isset( $row['games_scheduled'] ) && $row['games_scheduled'] !== '' ? (int) $row['games_scheduled'] : null,
-            'games_attended'       => isset( $row['games_attended'] ) && $row['games_attended'] !== '' ? (int) $row['games_attended'] : null,
+            'sandbagging_flag'     => $this->parse_bool( $row['sandbagging_flag']      ?? '0' ),
+            'games_scheduled'      => ( isset( $row['games_scheduled'] ) && $row['games_scheduled'] !== '' ) ? (int) $row['games_scheduled'] : null,
+            'games_attended'       => ( isset( $row['games_attended']  ) && $row['games_attended']  !== '' ) ? (int) $row['games_attended']  : null,
             'no_show_count'        => (int) ( $row['no_show_count'] ?? 0 ),
             'committee_notes'      => sanitize_textarea_field( $row['committee_notes'] ?? '' ) ?: null,
             'import_source'        => 'csv',
@@ -657,9 +694,12 @@ class GRSH_History_Import {
 
     private function build_history_format(): array {
         return [
-            '%d', '%d', '%s', '%s', '%d', '%s',
-            '%d', '%d', '%d', '%s', '%d',
-            '%d', '%d', '%d', '%s', '%s',
+            '%d', '%d',             // player_id, season_id
+            '%s', '%s', '%d', '%s', // division, team, finish, championship
+            '%d', '%d', '%d',       // was_captain, was_alternate, was_emergency_goalie
+            '%s', '%d',             // skill_tier, sandbagging_flag
+            '%d', '%d', '%d',       // games_scheduled, games_attended, no_show_count
+            '%s', '%s',             // committee_notes, import_source
         ];
     }
 
@@ -667,10 +707,6 @@ class GRSH_History_Import {
     // Reliability recalculation
     // -------------------------------------------------------------------------
 
-    /**
-     * Recalculate a player's attendance_rating and no_show_count
-     * from their full history after any import or delete.
-     */
     private function update_player_reliability( int $player_id ): void {
         global $wpdb;
 
@@ -689,7 +725,7 @@ class GRSH_History_Import {
             return;
         }
 
-        $rating = round( ( $stats->total_attended / $stats->total_scheduled ) * 100, 2 );
+        $rating = round( ( (float) $stats->total_attended / (float) $stats->total_scheduled ) * 100, 2 );
 
         $wpdb->update(
             "{$wpdb->prefix}grsh_players",
@@ -708,30 +744,165 @@ class GRSH_History_Import {
     // -------------------------------------------------------------------------
 
     private function parse_bool( $value ): int {
-        if ( in_array( strtolower( (string) $value ), [ '1', 'true', 'yes', 'y' ], true ) ) {
-            return 1;
-        }
-        return 0;
+        return in_array( strtolower( (string) $value ), [ '1', 'true', 'yes', 'y' ], true ) ? 1 : 0;
     }
 
-    private function log_import( int $imported, int $skipped, int $total ): void {
+    // -------------------------------------------------------------------------
+    // Import log — dedicated table, zero dependency on grsh_audit_logs schema
+    // -------------------------------------------------------------------------
+
+    /**
+     * Ensure the grsh_import_logs table exists.
+     *
+     * Uses dbDelta so it is safe to call on every import — it only creates
+     * the table if missing, never drops or truncates existing data.
+     * Called lazily from log_import() and rest_get_import_logs() so no
+     * activation hook or plugin update is required.
+     */
+    private function ensure_import_log_table(): void {
         global $wpdb;
 
-        $wpdb->insert(
-            "{$wpdb->prefix}grsh_audit_logs",
+        $table   = "{$wpdb->prefix}grsh_import_logs";
+        $charset = $wpdb->get_charset_collate();
+
+        // Quick bail if table already exists — avoids dbDelta overhead
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$table}'" ) === $table ) {
+            return;
+        }
+
+        $sql = "CREATE TABLE {$table} (
+            id           bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            wp_user_id   bigint(20) UNSIGNED NOT NULL DEFAULT 0,
+            user_display varchar(255)        NOT NULL DEFAULT '',
+            filename     varchar(255)        NOT NULL DEFAULT '',
+            imported     int(11)             NOT NULL DEFAULT 0,
+            updated      int(11)             NOT NULL DEFAULT 0,
+            skipped      int(11)             NOT NULL DEFAULT 0,
+            total        int(11)             NOT NULL DEFAULT 0,
+            errors       longtext            NOT NULL,
+            warnings     longtext            NOT NULL,
+            notes        text                NOT NULL,
+            created_at   datetime            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta( $sql );
+    }
+
+    /**
+     * Persist one import session to grsh_import_logs.
+     *
+     * Writes to a self-managed table (not grsh_audit_logs) so there is
+     * no dependency on the plugin installer's schema for that table.
+     * The table is created lazily via ensure_import_log_table() if absent.
+     */
+    private function log_import(
+        int    $imported,
+        int    $skipped,
+        int    $updated,
+        int    $total,
+        string $filename,
+        array  $errors   = [],
+        array  $warnings = []
+    ): void {
+        global $wpdb;
+
+        $this->ensure_import_log_table();
+
+        $table = "{$wpdb->prefix}grsh_import_logs";
+
+        $result = $wpdb->insert(
+            $table,
             [
                 'wp_user_id'   => get_current_user_id(),
-                'user_display' => wp_get_current_user()->display_name ?? 'system',
-                'action'       => 'history_csv_import',
-                'object_type'  => 'player_history',
-                'after_value'  => wp_json_encode( [
-                    'imported' => $imported,
-                    'skipped'  => $skipped,
-                    'total'    => $total,
-                ] ),
-                'notes'        => "CSV import: {$imported} imported, {$skipped} skipped of {$total} total rows.",
+                'user_display' => wp_get_current_user()->display_name ?: 'system',
+                'filename'     => $filename,
+                'imported'     => $imported,
+                'updated'      => $updated,
+                'skipped'      => $skipped,
+                'total'        => $total,
+                'errors'       => wp_json_encode( array_values( $errors ) ),
+                'warnings'     => wp_json_encode( array_values( $warnings ) ),
+                'notes'        => "CSV '{$filename}': {$imported} inserted, {$updated} updated, {$skipped} skipped of {$total} rows.",
             ],
-            [ '%d', '%s', '%s', '%s', '%s', '%s' ]
+            [ '%d', '%s', '%s', '%d', '%d', '%d', '%d', '%s', '%s', '%s' ]
         );
+
+        // If insert failed, fall back to wp_options so the log is never lost
+        if ( $result === false ) {
+            $fallback = get_option( 'grsh_import_logs_fallback', [] );
+            array_unshift( $fallback, [
+                'id'        => time(),
+                'user'      => wp_get_current_user()->display_name ?: 'system',
+                'filename'  => $filename,
+                'imported'  => $imported,
+                'updated'   => $updated,
+                'skipped'   => $skipped,
+                'total'     => $total,
+                'errors'    => $errors,
+                'warnings'  => $warnings,
+                'notes'     => "CSV '{$filename}': {$imported} inserted, {$updated} updated, {$skipped} skipped of {$total} rows.",
+                'timestamp' => current_time( 'mysql' ),
+            ] );
+            update_option( 'grsh_import_logs_fallback', array_slice( $fallback, 0, 50 ), false );
+        }
+    }
+
+    /**
+     * REST: Get import logs.
+     *
+     * Reads from grsh_import_logs (primary) with automatic fallback to
+     * the wp_options emergency store if the table doesn't exist yet.
+     * Called by the Import Log tab in HistoryImport.jsx via
+     * GET /grsh/v1/history/import-logs
+     */
+    public function rest_get_import_logs( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+
+        $limit = min( 50, max( 1, (int) $request->get_param( 'limit' ) ) );
+
+        $this->ensure_import_log_table();
+
+        $table = "{$wpdb->prefix}grsh_import_logs";
+
+        // Primary: dedicated table
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, wp_user_id, user_display, filename,
+                    imported, updated, skipped, total,
+                    errors, warnings, notes, created_at
+             FROM {$table}
+             ORDER BY id DESC
+             LIMIT %d",
+            $limit
+        ), ARRAY_A );
+
+        if ( is_array( $rows ) && count( $rows ) > 0 ) {
+            $result = array_map( function ( $row ) {
+                return [
+                    'id'        => (int) $row['id'],
+                    'user'      => $row['user_display'],
+                    'filename'  => $row['filename'],
+                    'imported'  => (int) $row['imported'],
+                    'updated'   => (int) $row['updated'],
+                    'skipped'   => (int) $row['skipped'],
+                    'total'     => (int) $row['total'],
+                    'errors'    => json_decode( $row['errors'],   true ) ?: [],
+                    'warnings'  => json_decode( $row['warnings'], true ) ?: [],
+                    'notes'     => $row['notes'],
+                    'timestamp' => $row['created_at'],
+                ];
+            }, $rows );
+
+            return new WP_REST_Response( $result, 200 );
+        }
+
+        // Fallback: wp_options store (used if table insert ever failed)
+        $fallback = get_option( 'grsh_import_logs_fallback', [] );
+        if ( ! empty( $fallback ) ) {
+            return new WP_REST_Response( array_slice( $fallback, 0, $limit ), 200 );
+        }
+
+        return new WP_REST_Response( [], 200 );
     }
 }
