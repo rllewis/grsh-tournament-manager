@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class GRSH_Database {
 
-    const DB_VERSION     = '1.0.0';
+    const DB_VERSION     = '1.2.1';
     const DB_VERSION_KEY = 'grsh_db_version';
 
     /**
@@ -33,6 +33,87 @@ class GRSH_Database {
     public static function install(): void {
         self::create_tables();
         update_option( self::DB_VERSION_KEY, self::DB_VERSION );
+    }
+
+    /**
+     * Run on every page load via 'plugins_loaded'. Re-running create_tables()
+     * lets dbDelta safely add new columns/keys to already-deployed tables
+     * (team_type, jersey_number, uq_team_jersey). The form_id NOT NULL → NULL
+     * change is a constraint loosening dbDelta does not reliably apply, so
+     * it is run explicitly and guarded so it only fires once.
+     *
+     * Added in 1.2.0 — full-team (captain-registered) roster support.
+     */
+    public static function maybe_upgrade(): void {
+        $installed = get_option( self::DB_VERSION_KEY, '0' );
+        if ( version_compare( $installed, self::DB_VERSION, '>=' ) ) {
+            return;
+        }
+
+        global $wpdb;
+        self::create_tables();
+
+        // dbDelta's diff logic for EXISTING tables is unreliable and can
+        // silently skip adding a column — confirmed in production: it
+        // missed team_type and jersey_number entirely with no error. Every
+        // 1.2.0 schema change is therefore applied explicitly below instead
+        // of trusting create_tables() to catch it.
+
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'team_type',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN team_type ENUM('draft','full_team') NOT NULL DEFAULT 'draft' AFTER division"
+        );
+
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_rosters", 'jersey_number',
+            "ALTER TABLE {$wpdb->prefix}grsh_rosters
+             ADD COLUMN jersey_number TINYINT UNSIGNED DEFAULT NULL AFTER is_alternate"
+        );
+
+        self::add_index_if_missing(
+            "{$wpdb->prefix}grsh_rosters", 'uq_team_jersey',
+            "ALTER TABLE {$wpdb->prefix}grsh_rosters
+             ADD UNIQUE KEY uq_team_jersey (team_id, jersey_number)"
+        );
+
+        $column = $wpdb->get_row( $wpdb->prepare(
+            "SELECT IS_NULLABLE FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'form_id'",
+            DB_NAME, "{$wpdb->prefix}grsh_registrations"
+        ) );
+        if ( $column && $column->IS_NULLABLE === 'NO' ) {
+            $wpdb->query(
+                "ALTER TABLE {$wpdb->prefix}grsh_registrations
+                 MODIFY form_id INT UNSIGNED DEFAULT NULL"
+            );
+        }
+
+        update_option( self::DB_VERSION_KEY, self::DB_VERSION );
+    }
+
+    private static function add_column_if_missing( string $table, string $column, string $alter_sql ): void {
+        global $wpdb;
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            DB_NAME, $table, $column
+        ) );
+        if ( ! $exists ) {
+            $wpdb->query( $alter_sql );
+        }
+    }
+
+    private static function add_index_if_missing( string $table, string $index, string $alter_sql ): void {
+        global $wpdb;
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND INDEX_NAME = %s",
+            DB_NAME, $table, $index
+        ) );
+        if ( ! $exists ) {
+            $wpdb->query( $alter_sql );
+        }
     }
 
     /**
@@ -145,8 +226,8 @@ class GRSH_Database {
                 season_id           INT UNSIGNED NOT NULL,
 
                 -- Source
-                form_id             INT UNSIGNED NOT NULL
-                                    COMMENT 'WPForms form ID',
+                form_id             INT UNSIGNED DEFAULT NULL
+                                    COMMENT 'WPForms form ID; NULL for manually-created (captain) registrations',
                 wpforms_entry_id    BIGINT UNSIGNED DEFAULT NULL
                                     COMMENT 'WPForms entry ID for lookup',
                 source              ENUM('wpforms','csv','manual')
@@ -278,6 +359,8 @@ class GRSH_Database {
                 division            ENUM(
                                         'gold_open','45a','senior_b','senior_c','womens'
                                     ) NOT NULL,
+                team_type           ENUM('draft','full_team') NOT NULL DEFAULT 'draft'
+                                    COMMENT 'How this team was formed — drives which roster rules apply',
                 name                VARCHAR(100) NOT NULL,
                 colour              VARCHAR(50) DEFAULT NULL,
                 captain_player_id   INT UNSIGNED DEFAULT NULL,
@@ -328,6 +411,8 @@ class GRSH_Database {
                 draft_pick          TINYINT UNSIGNED DEFAULT NULL,
                 is_captain          TINYINT(1) NOT NULL DEFAULT 0,
                 is_alternate        TINYINT(1) NOT NULL DEFAULT 0,
+                jersey_number       TINYINT UNSIGNED DEFAULT NULL
+                                    COMMENT 'Unique within team_id; the same number may be reused on a different team',
 
                 -- Snapshot at time of assignment
                 position_assigned   ENUM(
@@ -345,6 +430,7 @@ class GRSH_Database {
 
                 PRIMARY KEY         (id),
                 UNIQUE KEY          uq_player_team (player_id, team_id),
+                UNIQUE KEY          uq_team_jersey (team_id, jersey_number),
                 KEY                 idx_season (season_id),
                 KEY                 idx_team (team_id),
                 KEY                 idx_player (player_id),

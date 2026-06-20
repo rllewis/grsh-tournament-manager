@@ -68,6 +68,10 @@ $grsh_includes = [
     'class-grsh-scoring.php',         // Draft score engine
     'class-grsh-sync-engine.php',     // WPForms sync + /sync REST routes
     'class-grsh-rosters.php',         // GET/POST/PATCH/DELETE /rosters — needed by Draft + Rosters pages
+    'class-grsh-captain-roster.php',  // Front-end self-service full-team roster registration
+    'class-grsh-captain-frontend.php',// Captain shortcode + asset enqueue
+    'class-grsh-captain-sync.php',    // Tahoe Champions Cup: syncs WPForms 2273 → full_team
+    'class-grsh-admin-full-teams.php',// Board view/edit/override for full-team rosters
     'class-grsh-alternates.php',      // Alternates REST routes
     'class-grsh-reports.php',         // Reports REST routes
     'class-grsh-history-import.php',  // CSV history import + all /history/* REST routes
@@ -133,6 +137,18 @@ register_uninstall_hook( GRSH_PLUGIN_FILE, 'grsh_uninstall' );
 function grsh_bootstrap(): void {
     load_plugin_textdomain( 'grsh', false, dirname( GRSH_PLUGIN_BASE ) . '/languages' );
 
+    // Apply any pending schema upgrades before routes/queries run.
+    if ( class_exists( 'GRSH_Database' ) ) {
+        GRSH_Database::maybe_upgrade();
+    }
+
+    // 1.2.0: grant existing GRSH Captain accounts the new self-service
+    // roster capability without requiring plugin deactivate/reactivate.
+    $captain_role = get_role( 'grsh_captain' );
+    if ( $captain_role && ! $captain_role->has_cap( 'grsh_manage_own_roster' ) ) {
+        $captain_role->add_cap( 'grsh_manage_own_roster' );
+    }
+
     // REST API routes register on every request (including frontend AJAX).
     // Do NOT gate behind is_admin() — React app gets 404s otherwise.
     // Each call is guarded with class_exists so a missing or misnamed file
@@ -141,6 +157,10 @@ function grsh_bootstrap(): void {
     elseif ( class_exists( 'GRSH_Players' ) )    { GRSH_Players::register_hooks(); }
     if ( class_exists( 'GRSH_Sync_Engine' ) )    { GRSH_Sync_Engine::register_hooks(); }
     if ( class_exists( 'GRSH_Rosters' ) )        { GRSH_Rosters::register_hooks(); }
+    if ( class_exists( 'GRSH_Captain_Roster' ) )   { GRSH_Captain_Roster::register_hooks(); }
+    if ( class_exists( 'GRSH_Captain_Frontend' ) ) { GRSH_Captain_Frontend::register_hooks(); }
+    if ( class_exists( 'GRSH_Captain_Sync' ) )     { GRSH_Captain_Sync::register_hooks(); }
+    if ( class_exists( 'GRSH_Admin_Full_Teams' ) ) { GRSH_Admin_Full_Teams::register_hooks(); }
     if ( class_exists( 'GRSH_Alternates' ) )     { GRSH_Alternates::register_hooks(); }
     if ( class_exists( 'GRSH_History_Import' ) ) { GRSH_History_Import::register_hooks(); }
     if ( class_exists( 'GRSH_History_API' ) )    { GRSH_History_API::register_routes_on_init(); }
@@ -172,7 +192,7 @@ function grsh_register_roles(): void {
         'grsh_sync_import' => true,
         'grsh_send_email'  => true,
     ] );
-    add_role( 'grsh_captain',  __( 'GRSH Captain',   'grsh' ), [ 'read' => true, 'grsh_view_roster' => true ] );
+    add_role( 'grsh_captain',  __( 'GRSH Captain',   'grsh' ), [ 'read' => true, 'grsh_view_roster' => true, 'grsh_manage_own_roster' => true ] );
     add_role( 'grsh_readonly', __( 'GRSH Read Only', 'grsh' ), [ 'read' => true, 'grsh_view_roster' => true ] );
 
     $admin = get_role( 'administrator' );
@@ -214,6 +234,7 @@ function grsh_register_admin_menu(): void {
         'grsh-tm-dashboard'      => __( 'Dashboard',      'grsh' ),
         'grsh-tm-players'        => __( 'Players',        'grsh' ),
         'grsh-tm-rosters'        => __( 'Rosters',        'grsh' ),
+        'grsh-tm-full-teams'     => __( 'Full Team Rosters', 'grsh' ),
         'grsh-tm-draft'          => __( 'Draft',          'grsh' ),
         'grsh-tm-alternates'     => __( 'Alternates',     'grsh' ),
         'grsh-tm-history'        => __( 'History',        'grsh' ),

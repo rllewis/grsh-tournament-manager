@@ -5,6 +5,7 @@ module.exports = {
     mode: 'production',
     entry: {
         'grsh-admin': path.resolve(__dirname, 'src', 'main.jsx'),
+        'grsh-captain': path.resolve(__dirname, 'src', 'captain-main.jsx'),
     },
     output: {
         path: path.resolve(__dirname, 'dist'),

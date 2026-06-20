@@ -1,6 +1,7 @@
 import Dashboard     from "./pages/Dashboard";
 import Players       from "./pages/Players";
 import Rosters       from "./pages/Rosters";
+import FullTeamRosters from "./pages/FullTeamRosters";
 import Draft         from "./pages/Draft";
 import Alternates    from "./pages/Alternates";
 import History       from "./pages/History";
@@ -12,6 +13,7 @@ const PAGES = {
   "grsh-tm-dashboard":      Dashboard,
   "grsh-tm-players":        Players,
   "grsh-tm-rosters":        Rosters,
+  "grsh-tm-full-teams":     FullTeamRosters,
   "grsh-tm-draft":          Draft,
   "grsh-tm-alternates":     Alternates,
   "grsh-tm-history":        History,
