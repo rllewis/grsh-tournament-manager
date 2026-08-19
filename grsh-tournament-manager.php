@@ -75,6 +75,7 @@ $grsh_includes = [
     'class-grsh-alternates.php',      // Alternates REST routes
     'class-grsh-reports.php',         // Reports REST routes
     'class-grsh-history-import.php',  // CSV history import + all /history/* REST routes
+    'class-grsh-score-sheets.php',    // Batch print-ready game score sheets, rosters auto-filled
 ];
 
 foreach ( $grsh_includes as $grsh_file ) {
@@ -166,6 +167,7 @@ function grsh_bootstrap(): void {
     if ( class_exists( 'GRSH_History_API' ) )    { GRSH_History_API::register_routes_on_init(); }
     if ( class_exists( 'GRSH_Settings' ) )       { GRSH_Settings::register_hooks(); }
     if ( class_exists( 'GRSH_Reports' ) )        { GRSH_Reports::register_hooks(); }
+    if ( class_exists( 'GRSH_Score_Sheets' ) )   { GRSH_Score_Sheets::register_hooks(); }
 
     // Admin-only: menu, notices, assets.
     add_action( 'admin_menu',            'grsh_register_admin_menu' );
