@@ -53,13 +53,16 @@ const errBox = { fontFamily: "'DM Mono',monospace", fontSize: 11, color: "#991B1
   background: "#FEF2F2", border: "1px solid #FCA5A5", borderRadius: 6, padding: "6px 10px", margin: "8px 0" };
 
 // ─── List view ───────────────────────────────────────────────────────────────
-function TeamRow({ team, onSelect }) {
+function TeamRow({ team, onSelect, checked, onToggleCheck }) {
   const band = BAND_COLOR[team.parity_action] || BAND_COLOR.balanced;
   const understaffed = team.player_count < team.min_players;
   return (
     <div onClick={() => onSelect(team.id)} style={{ display: "flex", alignItems: "center", gap: 14,
       padding: "12px 16px", background: "#fff", border: "1px solid #E8E6DF", borderRadius: 10,
       marginBottom: 8, cursor: "pointer" }}>
+      <input type="checkbox" checked={checked} onClick={(e) => e.stopPropagation()}
+        onChange={() => onToggleCheck(team.id)}
+        style={{ width: 16, height: 16, flexShrink: 0, cursor: "pointer" }} />
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontFamily: "'Fraunces',serif", fontSize: 14, fontWeight: 700, color: "#1a1a2e" }}>
           {team.name}
@@ -263,17 +266,104 @@ function TeamDetail({ teamId, onBack }) {
   );
 }
 
+// ─── Print modal ─────────────────────────────────────────────────────────────
+// Fetches full roster detail (list endpoint only returns summaries) and
+// prints only this element — @media print isolates it via visibility
+// rather than relying on the browser to rasterize whatever's on screen.
+function PrintRostersModal({ teams, onClose }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 1000,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <style>{`
+        @media print {
+          body * { visibility: hidden; }
+          .grsh-print-area, .grsh-print-area * { visibility: visible; }
+          .grsh-print-area { position: absolute; top: 0; left: 0; width: 100%;
+            max-height: none !important; overflow: visible !important;
+            box-shadow: none !important; border-radius: 0 !important; }
+          .grsh-print-hide { display: none !important; }
+          .grsh-print-team { page-break-inside: avoid; }
+        }
+      `}</style>
+      <div className="grsh-print-area" style={{ background: "#fff", borderRadius: 14, maxWidth: 640,
+        width: "100%", maxHeight: "85vh", overflow: "auto", boxShadow: "0 24px 60px rgba(0,0,0,.22)" }}>
+        <div className="grsh-print-hide" style={{ padding: "18px 22px 14px", borderBottom: "1px solid #F0EEE8",
+          display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontFamily: "'Fraunces',serif", fontSize: 17, fontWeight: 700, color: "#1a1a2e" }}>
+            Print preview — {teams.length} team{teams.length === 1 ? "" : "s"}
+          </span>
+          <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 14,
+            color: "#aaa", cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ padding: "18px 22px" }}>
+          {teams.map((t) => (
+            <div key={t.id} className="grsh-print-team" style={{ marginBottom: 22 }}>
+              <div style={{ fontFamily: "'Fraunces',serif", fontSize: 15, fontWeight: 700, color: "#1a1a2e", marginBottom: 2 }}>
+                {t.name}
+              </div>
+              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: "#aaa", marginBottom: 8 }}>
+                {t.division_label} · Captain: {t.captain_name || "—"}
+              </div>
+              {(t.players || []).map((p) => (
+                <div key={p.roster_id} style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: "#333",
+                  padding: "4px 0", borderBottom: "1px solid #F9F8F4", display: "flex", gap: 12 }}>
+                  <span style={{ width: 30, color: "#aaa" }}>{p.jersey_number !== null ? `#${p.jersey_number}` : ""}</span>
+                  <span style={{ flex: 1 }}>{p.first_name} {p.last_name}{p.is_captain ? " (C)" : ""}</span>
+                  <span style={{ width: 60 }}>{POSITION_LABEL[p.position] || "—"}</span>
+                  <span style={{ width: 34 }}>{p.skill_tier_reported}</span>
+                </div>
+              ))}
+              {(!t.players || t.players.length === 0) && (
+                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: "#ccc" }}>No players on roster</div>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="grsh-print-hide" style={{ padding: "14px 22px 20px", borderTop: "1px solid #F0EEE8", display: "flex", gap: 10 }}>
+          <button onClick={onClose} style={{ flex: 1, fontFamily: "'DM Mono',monospace", fontSize: 12,
+            background: "#F6F5F0", border: "1px solid #E8E6DF", color: "#666", padding: 9, borderRadius: 8, cursor: "pointer" }}>
+            Cancel
+          </button>
+          <button onClick={() => window.print()} style={{ flex: 2, ...btnPrimary, padding: 9 }}>
+            ⎙ Print {teams.length} roster{teams.length === 1 ? "" : "s"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main component ─────────────────────────────────────────────────────────
 export default function FullTeamRosters() {
   const [teams, setTeams] = useState(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(null);
+  const [checkedIds, setCheckedIds] = useState([]);
+  const [printTeams, setPrintTeams] = useState(null);
+  const [printLoading, setPrintLoading] = useState(false);
+  const [printError, setPrintError] = useState("");
 
   const load = useCallback(() => {
     apiFetch("/admin/full-teams").then(setTeams).catch((e) => setError(e.message));
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  // Print — the list endpoint only returns team summaries (no player
+  // rosters), so fetch full detail per selected team before printing.
+  const toggleCheck = (id) => {
+    setCheckedIds((ids) => (ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]));
+  };
+  const toggleCheckAll = () => {
+    if (!teams) return;
+    setCheckedIds((ids) => (ids.length === teams.length ? [] : teams.map((t) => t.id)));
+  };
+  const handlePrintSelected = () => {
+    setPrintError(""); setPrintLoading(true);
+    Promise.all(checkedIds.map((id) => apiFetch(`/admin/full-teams/${id}`)))
+      .then((results) => { setPrintTeams(results); setPrintLoading(false); })
+      .catch((e) => { setPrintError(e.message); setPrintLoading(false); });
+  };
 
   const page = { fontFamily: "'Fraunces',Georgia,serif", background: "#F6F5F0",
     minHeight: "100vh", padding: "20px 24px 60px" };
@@ -288,21 +378,46 @@ export default function FullTeamRosters() {
 
   return (
     <div style={page}>
-      <h1 style={{ fontFamily: "'Fraunces',serif", fontSize: 24, fontWeight: 700, color: "#1a1a2e", margin: "0 0 4px" }}>
-        Full Team Rosters
-      </h1>
-      <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: "#aaa", margin: "0 0 18px" }}>
-        Captain-registered (pre-formed) teams — separate from the draft pool.
-      </p>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start",
+        flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+        <div>
+          <h1 style={{ fontFamily: "'Fraunces',serif", fontSize: 24, fontWeight: 700, color: "#1a1a2e", margin: "0 0 4px" }}>
+            Full Team Rosters
+          </h1>
+          <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: "#aaa", margin: 0 }}>
+            Captain-registered (pre-formed) teams — separate from the draft pool.
+          </p>
+        </div>
+        {teams && teams.length > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6,
+              fontFamily: "'DM Mono',monospace", fontSize: 11, color: "#888", cursor: "pointer" }}>
+              <input type="checkbox" checked={checkedIds.length === teams.length} onChange={toggleCheckAll}
+                style={{ width: 14, height: 14, cursor: "pointer" }} />
+              Select all
+            </label>
+            <button disabled={checkedIds.length === 0 || printLoading} onClick={handlePrintSelected}
+              style={{ ...btnPrimary, opacity: (checkedIds.length === 0 || printLoading) ? 0.5 : 1 }}>
+              {printLoading ? "Loading…" : `⎙ Print selected (${checkedIds.length})`}
+            </button>
+          </div>
+        )}
+      </div>
 
       {error && <div style={errBox}>{error}</div>}
+      {printError && <div style={errBox}>{printError}</div>}
       {!teams && !error && <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: "#aaa" }}>Loading…</p>}
       {teams && teams.length === 0 && (
         <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: "#aaa" }}>
           No full-team registrations yet this season.
         </p>
       )}
-      {teams && teams.map((t) => <TeamRow key={t.id} team={t} onSelect={setSelected} />)}
+      {teams && teams.map((t) => (
+        <TeamRow key={t.id} team={t} onSelect={setSelected}
+          checked={checkedIds.includes(t.id)} onToggleCheck={toggleCheck} />
+      ))}
+
+      {printTeams && <PrintRostersModal teams={printTeams} onClose={() => setPrintTeams(null)} />}
     </div>
   );
 }
