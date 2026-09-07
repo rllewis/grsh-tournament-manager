@@ -253,19 +253,28 @@ export default function Settings() {
             <Toggle value={cfg.public_rosters} onChange={v=>set("public_rosters",v)} label="Public roster pages" sub="Allow players to view rosters without logging in"/>
           </FieldGroup>
           <FieldGroup label="User roles">
+            {/* FIXED 2026-08-19: this used to be a hand-typed grid that never
+                matched the plugin's actual role capabilities (grsh_register_roles()
+                in grsh-tournament-manager.php) and had no save/load wiring at all —
+                editing it, if it had been editable, would have done nothing. It's
+                now generated from the real capability list, and labeled read-only
+                so nobody expects clicking it to change anything. */}
+            <p style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:"#888", margin:"0 0 10px" }}>
+              Reference only — roles and permissions are set in the plugin's code, not here.
+            </p>
             <div style={{ overflowX:"auto" }}>
               <table style={{ width:"100%", borderCollapse:"collapse" }}>
-                <thead><tr>{["Role","Sync import","Edit roster","Run draft","Send email","View reports"].map(h=><th key={h} style={styles.th}>{h}</th>)}</tr></thead>
+                <thead><tr>{["Role","Sync import","Edit roster","Run draft","Send email","View roster","Manage own roster"].map(h=><th key={h} style={styles.th}>{h}</th>)}</tr></thead>
                 <tbody>
                   {[
-                    {role:"Super Admin",sync:true,edit:true,draft:true,email:true,reports:true},
-                    {role:"Committee",sync:true,edit:true,draft:true,email:true,reports:true},
-                    {role:"Captain",sync:false,edit:false,draft:false,email:false,reports:false},
-                    {role:"Read Only",sync:false,edit:false,draft:false,email:false,reports:true},
+                    {role:"Administrator",sync:true,edit:true,draft:true,email:true,view:true,own:true},
+                    {role:"Committee",sync:true,edit:true,draft:true,email:true,view:true,own:false},
+                    {role:"Captain",sync:false,edit:false,draft:false,email:false,view:true,own:true},
+                    {role:"Read Only",sync:false,edit:false,draft:false,email:false,view:true,own:false},
                   ].map(r=>(
                     <tr key={r.role} style={{ borderBottom:"1px solid #F3F2ED" }}>
                       <td style={styles.td}><span style={{ fontFamily:"'Fraunces',serif", fontSize:13, fontWeight:600, color:"#1a1a2e" }}>{r.role}</span></td>
-                      {[r.sync,r.edit,r.draft,r.email,r.reports].map((v,i)=>(
+                      {[r.sync,r.edit,r.draft,r.email,r.view,r.own].map((v,i)=>(
                         <td key={i} style={{ ...styles.td, textAlign:"center" }}>
                           <span style={{ fontSize:14, color:v?"#1D9E75":"#D3D1C7" }}>{v?"✓":"—"}</span>
                         </td>
@@ -275,6 +284,11 @@ export default function Settings() {
                 </tbody>
               </table>
             </div>
+            <p style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:"#888", margin:"10px 0 0" }}>
+              Note: the GRSH admin menu itself currently requires a full WordPress Administrator account.
+              A Committee or Read Only account that isn't also a WP Administrator won't see this menu yet —
+              ask Lorenzo if that needs to change.
+            </p>
           </FieldGroup>
         </div>
       )}

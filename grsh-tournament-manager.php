@@ -70,12 +70,17 @@ $grsh_includes = [
     'class-grsh-rosters.php',         // GET/POST/PATCH/DELETE /rosters — needed by Draft + Rosters pages
     'class-grsh-captain-roster.php',  // Front-end self-service full-team roster registration
     'class-grsh-captain-frontend.php',// Captain shortcode + asset enqueue
+    'class-grsh-captain-provision.php', // Shared name+email → WP account + team (used by Invite + Signup)
+    'class-grsh-captain-invite.php',  // Admin "Invite a Captain" tool
+    'class-grsh-captain-signup.php',  // Public [grsh_captain_signup] self-service form
     'class-grsh-captain-sync.php',    // Tahoe Champions Cup: syncs WPForms 2273 → full_team
     'class-grsh-admin-full-teams.php',// Board view/edit/override for full-team rosters
     'class-grsh-alternates.php',      // Alternates REST routes
     'class-grsh-reports.php',         // Reports REST routes
     'class-grsh-history-import.php',  // CSV history import + all /history/* REST routes
     'class-grsh-score-sheets.php',    // Batch print-ready game score sheets, rosters auto-filled
+    'class-grsh-team-deposit.php',    // Full-team $500 deposit + balance reminder (fee_total set by staff)
+    'class-grsh-welcome-packet.php',  // Print-ready captain welcome packet (Invite Captain Round 3)
 ];
 
 foreach ( $grsh_includes as $grsh_file ) {
@@ -119,6 +124,9 @@ function grsh_activate(): void {
 register_activation_hook( GRSH_PLUGIN_FILE, 'grsh_activate' );
 
 function grsh_deactivate(): void {
+    if ( class_exists( 'GRSH_Team_Deposit' ) ) {
+        GRSH_Team_Deposit::unschedule();
+    }
     flush_rewrite_rules();
 }
 register_deactivation_hook( GRSH_PLUGIN_FILE, 'grsh_deactivate' );
@@ -160,6 +168,11 @@ function grsh_bootstrap(): void {
     if ( class_exists( 'GRSH_Rosters' ) )        { GRSH_Rosters::register_hooks(); }
     if ( class_exists( 'GRSH_Captain_Roster' ) )   { GRSH_Captain_Roster::register_hooks(); }
     if ( class_exists( 'GRSH_Captain_Frontend' ) ) { GRSH_Captain_Frontend::register_hooks(); }
+    // GRSH_Captain_Provision is a static-only helper (no hooks of its own) —
+    // it just needs to be loaded before Invite/Signup call it, which the
+    // $grsh_includes order above guarantees.
+    if ( class_exists( 'GRSH_Captain_Invite' ) )   { GRSH_Captain_Invite::register_hooks(); }
+    if ( class_exists( 'GRSH_Captain_Signup' ) )   { GRSH_Captain_Signup::register_hooks(); }
     if ( class_exists( 'GRSH_Captain_Sync' ) )     { GRSH_Captain_Sync::register_hooks(); }
     if ( class_exists( 'GRSH_Admin_Full_Teams' ) ) { GRSH_Admin_Full_Teams::register_hooks(); }
     if ( class_exists( 'GRSH_Alternates' ) )     { GRSH_Alternates::register_hooks(); }
@@ -168,6 +181,8 @@ function grsh_bootstrap(): void {
     if ( class_exists( 'GRSH_Settings' ) )       { GRSH_Settings::register_hooks(); }
     if ( class_exists( 'GRSH_Reports' ) )        { GRSH_Reports::register_hooks(); }
     if ( class_exists( 'GRSH_Score_Sheets' ) )   { GRSH_Score_Sheets::register_hooks(); }
+    if ( class_exists( 'GRSH_Team_Deposit' ) )   { GRSH_Team_Deposit::register_hooks(); }
+    if ( class_exists( 'GRSH_Welcome_Packet' ) ) { GRSH_Welcome_Packet::register_hooks(); }
 
     // Admin-only: menu, notices, assets.
     add_action( 'admin_menu',            'grsh_register_admin_menu' );

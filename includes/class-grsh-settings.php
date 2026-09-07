@@ -168,6 +168,22 @@ class GRSH_Settings {
         $out['email_roster']         = ! empty( $raw['email_roster'] );
         $out['email_payment']        = ! empty( $raw['email_payment'] );
         $out['email_alternate']      = ! empty( $raw['email_alternate'] );
+        $out['email_team_balance']   = ! empty( $raw['email_team_balance'] );
+        $out['email_team_deposit_nudge'] = ! empty( $raw['email_team_deposit_nudge'] );
+
+        // Team deposit / balance (added 1.3.0). 1.4.0: board locked the 2027
+        // fee model — every full team gets the same early/late tiered total,
+        // decided automatically by class-grsh-team-deposit.php from when the
+        // deposit is paid vs team_fee_early_cutoff_date. No staff action
+        // needed for the normal case; the PATCH /teams/{id}/fee route still
+        // exists as a manual override for real exceptions only.
+        $out['team_deposit_amount']          = isset( $raw['team_deposit_amount'] )          ? (float) $raw['team_deposit_amount']          : 500.00;
+        $out['team_fee_early_amount']        = isset( $raw['team_fee_early_amount'] )        ? (float) $raw['team_fee_early_amount']        : 1750.00;
+        $out['team_fee_late_amount']         = isset( $raw['team_fee_late_amount'] )         ? (float) $raw['team_fee_late_amount']         : 2000.00;
+        $out['team_fee_early_cutoff_date']   = isset( $raw['team_fee_early_cutoff_date'] )   ? sanitize_text_field( $raw['team_fee_early_cutoff_date'] ) : '2027-01-06';
+        $out['team_balance_due_date']        = isset( $raw['team_balance_due_date'] )        ? sanitize_text_field( $raw['team_balance_due_date'] )      : '2027-03-08';
+        $out['team_deposit_nudge_days']      = isset( $raw['team_deposit_nudge_days'] )      ? absint( $raw['team_deposit_nudge_days'] )    : 10;
+        $out['team_balance_reminder_days']   = isset( $raw['team_balance_reminder_days'] )    ? absint( $raw['team_balance_reminder_days'] ) : 14;
 
         // Access
         $out['public_rosters']        = ! empty( $raw['public_rosters'] );
@@ -268,6 +284,17 @@ class GRSH_Settings {
             'email_roster'          => true,
             'email_payment'         => true,
             'email_alternate'       => true,
+            'email_team_balance'    => true,
+            'email_team_deposit_nudge' => true,
+            // Team deposit / balance — see sanitize() for the 1.4.0 locked
+            // fee model (early/late tiers decided by deposit timing).
+            'team_deposit_amount'          => 500.00,
+            'team_fee_early_amount'        => 1750.00,
+            'team_fee_late_amount'         => 2000.00,
+            'team_fee_early_cutoff_date'   => '2027-01-06',
+            'team_balance_due_date'        => '2027-03-08',
+            'team_deposit_nudge_days'      => 10,
+            'team_balance_reminder_days'   => 14,
             'public_rosters'        => false,
             'sandbagging_auto_flag' => true,
             '_last_saved_by'        => 0,

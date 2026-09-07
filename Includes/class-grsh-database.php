@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class GRSH_Database {
 
-    const DB_VERSION     = '1.2.1';
+    const DB_VERSION     = '1.4.0';
     const DB_VERSION_KEY = 'grsh_db_version';
 
     /**
@@ -43,6 +43,14 @@ class GRSH_Database {
      * it is run explicitly and guarded so it only fires once.
      *
      * Added in 1.2.0 — full-team (captain-registered) roster support.
+     * Added in 1.3.0 — team deposit/balance columns on wp_grsh_teams
+     * (fee_total, deposit_amount, deposit_paid_at, balance_due,
+     * balance_paid_at, balance_reminder_sent_at, payment_status).
+     * Added in 1.4.0 — board locked the 2027 fee model (early/late tiers
+     * decided automatically from deposit timing, see class-grsh-team-
+     * deposit.php): fee_tier (records which tier applied) and
+     * deposit_nudge_sent_at (idempotency for the new pre-deposit
+     * early-bird reminder email) added to wp_grsh_teams.
      */
     public static function maybe_upgrade(): void {
         $installed = get_option( self::DB_VERSION_KEY, '0' );
@@ -88,6 +96,71 @@ class GRSH_Database {
                  MODIFY form_id INT UNSIGNED DEFAULT NULL"
             );
         }
+
+        // 1.3.0 — team deposit/balance tracking (full_team registrations only).
+        // fee_total is nullable: the board fee model isn't locked yet, so a team
+        // can have a deposit on file with no known total/balance until staff (or
+        // a future settings default) sets fee_total via the admin PATCH route.
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'fee_total',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN fee_total DECIMAL(8,2) DEFAULT NULL
+                 COMMENT 'Total team registration fee — null until staff sets it (fee model not locked as of 1.3.0)'
+             AFTER draft_locked"
+        );
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'deposit_amount',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN deposit_amount DECIMAL(8,2) DEFAULT NULL AFTER fee_total"
+        );
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'deposit_paid_at',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN deposit_paid_at DATETIME DEFAULT NULL AFTER deposit_amount"
+        );
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'balance_due',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN balance_due DECIMAL(8,2) DEFAULT NULL
+                 COMMENT 'fee_total - deposit_amount, recomputed whenever either changes'
+             AFTER deposit_paid_at"
+        );
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'balance_paid_at',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN balance_paid_at DATETIME DEFAULT NULL AFTER balance_due"
+        );
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'balance_reminder_sent_at',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN balance_reminder_sent_at DATETIME DEFAULT NULL AFTER balance_paid_at"
+        );
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'payment_status',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN payment_status ENUM('unpaid','deposit_paid','paid_in_full')
+                 NOT NULL DEFAULT 'unpaid' AFTER balance_reminder_sent_at"
+        );
+        self::add_index_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'idx_payment_status',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD KEY idx_payment_status (payment_status)"
+        );
+
+        // 1.4.0 — fee model locked: early/late tier + deposit-nudge idempotency.
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'fee_tier',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN fee_tier ENUM('early','late','manual') DEFAULT NULL
+                 COMMENT 'Which fee tier applied — early/late decided automatically from deposit timing, manual = staff PATCH override'
+             AFTER fee_total"
+        );
+        self::add_column_if_missing(
+            "{$wpdb->prefix}grsh_teams", 'deposit_nudge_sent_at',
+            "ALTER TABLE {$wpdb->prefix}grsh_teams
+             ADD COLUMN deposit_nudge_sent_at DATETIME DEFAULT NULL
+                 COMMENT 'Pre-deposit early-bird reminder — sent once' AFTER balance_reminder_sent_at"
+        );
 
         update_option( self::DB_VERSION_KEY, self::DB_VERSION );
     }
@@ -374,12 +447,27 @@ class GRSH_Database {
                 draft_order         TINYINT UNSIGNED DEFAULT NULL,
                 draft_locked        TINYINT(1) NOT NULL DEFAULT 0,
 
+                -- Deposit / balance (full_team registrations; added 1.3.0,
+                -- fee tiers locked in 1.4.0 — see class-grsh-team-deposit.php)
+                fee_total                  DECIMAL(8,2) DEFAULT NULL
+                                    COMMENT 'Set automatically when deposit is paid (early/late tier); null until then',
+                fee_tier                   ENUM('early','late','manual') DEFAULT NULL,
+                deposit_amount              DECIMAL(8,2) DEFAULT NULL,
+                deposit_paid_at             DATETIME DEFAULT NULL,
+                balance_due                  DECIMAL(8,2) DEFAULT NULL,
+                balance_paid_at             DATETIME DEFAULT NULL,
+                balance_reminder_sent_at    DATETIME DEFAULT NULL,
+                deposit_nudge_sent_at       DATETIME DEFAULT NULL,
+                payment_status               ENUM('unpaid','deposit_paid','paid_in_full')
+                                    NOT NULL DEFAULT 'unpaid',
+
                 created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
                                         ON UPDATE CURRENT_TIMESTAMP,
 
                 PRIMARY KEY         (id),
                 KEY                 idx_season_division (season_id, division),
+                KEY                 idx_payment_status (payment_status),
 
                 CONSTRAINT fk_team_season
                     FOREIGN KEY (season_id)

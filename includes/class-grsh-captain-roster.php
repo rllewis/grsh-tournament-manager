@@ -159,28 +159,79 @@ class GRSH_Captain_Roster {
     // -------------------------------------------------------------------------
 
     public static function create_team( WP_REST_Request $request ): WP_REST_Response {
-        global $wpdb;
         $season_id = self::get_season_id();
-
-        if ( self::get_my_team( $season_id ) ) {
-            return new WP_REST_Response( [ 'error' => 'You already have a team this season.' ], 409 );
-        }
-
-        $body     = $request->get_json_params();
-        $name     = sanitize_text_field( $body['name'] ?? '' );
-        $division = sanitize_key( $body['division'] ?? '' );
-
-        if ( ! $name ) {
-            return new WP_REST_Response( [ 'error' => 'Team name is required.' ], 400 );
-        }
-        $valid_divisions = array_column( GRSH_Settings::get_active_divisions(), 'key' );
-        if ( ! in_array( $division, $valid_divisions, true ) ) {
-            return new WP_REST_Response( [ 'error' => 'Choose a valid division.' ], 400 );
-        }
+        $body      = (array) $request->get_json_params();
 
         $player_id = self::get_or_create_self_player();
         if ( ! $player_id ) {
             return new WP_REST_Response( [ 'error' => 'Could not link your account to a player record.' ], 500 );
+        }
+
+        $result = self::create_team_for_player(
+            $player_id,
+            $season_id,
+            (string) ( $body['name'] ?? '' ),
+            (string) ( $body['division'] ?? '' )
+        );
+
+        if ( isset( $result['error'] ) ) {
+            return new WP_REST_Response( [ 'error' => $result['error'] ], $result['status'] ?? 400 );
+        }
+
+        return new WP_REST_Response( $result, 201 );
+    }
+
+    /**
+     * Core team-creation logic, extracted 2026-08-19 so it has exactly
+     * one caller-independent implementation. Used by:
+     *   - create_team() above (player resolved from the logged-in user)
+     *   - GRSH_Captain_Provision (player resolved from a brand-new
+     *     account — used by both the admin "Invite a Captain" tool and
+     *     the public [grsh_captain_signup] form, since neither has a
+     *     logged-in captain yet when this runs)
+     * Same validation, same "already has a team" guard, either way —
+     * matches the existing add_player_to_team() / remove_player_from_roster()
+     * pattern in this file (shared core, never silently diverges by caller).
+     *
+     * @return array Either the formatted team (success) or
+     *               ['error' => string, 'status' => int] (failure).
+     */
+    public static function create_team_for_player( int $player_id, int $season_id, string $name, string $division ): array {
+        global $wpdb;
+
+        $existing_team_id = $wpdb->get_var( $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}grsh_teams
+             WHERE season_id = %d AND team_type = 'full_team' AND captain_player_id = %d LIMIT 1",
+            $season_id, $player_id
+        ) );
+        if ( $existing_team_id ) {
+            // Surface which team, so callers (the admin Invite Captain
+            // tool especially) can link straight to it instead of leaving
+            // staff to go hunt for it manually. Added 2026-09-01.
+            $existing = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, name, division FROM {$wpdb->prefix}grsh_teams WHERE id = %d",
+                (int) $existing_team_id
+            ), ARRAY_A );
+            return [
+                'error'         => 'This captain already has a team this season.',
+                'status'        => 409,
+                'existing_team' => $existing ? [
+                    'id'       => (int) $existing['id'],
+                    'name'     => (string) $existing['name'],
+                    'division' => (string) $existing['division'],
+                ] : null,
+            ];
+        }
+
+        $name     = sanitize_text_field( trim( $name ) );
+        $division = sanitize_key( $division );
+
+        if ( ! $name ) {
+            return [ 'error' => 'Team name is required.', 'status' => 400 ];
+        }
+        $valid_divisions = array_column( GRSH_Settings::get_active_divisions(), 'key' );
+        if ( ! in_array( $division, $valid_divisions, true ) ) {
+            return [ 'error' => 'Choose a valid division.', 'status' => 400 ];
         }
 
         $wpdb->insert( "{$wpdb->prefix}grsh_teams", [
@@ -193,7 +244,7 @@ class GRSH_Captain_Roster {
             'draft_locked'      => 0,
         ] );
 
-        return new WP_REST_Response( self::format_team( (int) $wpdb->insert_id, $season_id ), 201 );
+        return self::format_team( (int) $wpdb->insert_id, $season_id );
     }
 
     private static function get_or_create_self_player(): ?int {
