@@ -53,8 +53,21 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class GRSH_Team_Deposit {
 
-    const FORM_ID = 0;
+    const FORM_ID = 5181; // 2027-team-registration-form-v3-production, confirmed zero real submissions as of 2026-09-14
+    const TEST_FORM_ID = 5178; // '2027 Team Registration Form | TEST' — pre-built $1 QA clone (this org's "Test C"), confirmed to exist 2026-09-14. Charges a real $1 via PayPal but is treated as a test submission end-to-end below: logged only, never written to grsh_teams' financial columns. This is the recommended board-testing path — see the branch in on_deposit_form_submit() below. Do NOT just add this as a second normal FORM_ID: its own field description confirms the backend would otherwise record a fake $500 deposit_amount (pulled from Settings, not from what PayPal actually charged) into the real table.
     const DAILY_CRON_HOOK = 'grsh_team_payment_reminders_daily';
+
+    // Committee / Internal Test FIELD path (2026-09-14) — SUPERSEDED as of
+    // the same day once TEST_FORM_ID (above) was confirmed to already
+    // exist as a separate $1 QA clone form. Recommendation is to use
+    // TEST_FORM_ID for board testing instead of building this field on
+    // the live form — it keeps the test path off the live form entirely,
+    // so a real captain can never see or misclick a free-bypass option.
+    // Left in place, inert (REGISTRATION_TYPE_FIELD_ID stays null), in
+    // case a field-level test option is ever wanted in addition. If it's
+    // never built, this does nothing — safe to ignore.
+    const REGISTRATION_TYPE_FIELD_ID = null;
+    const INTERNAL_TEST_VALUE        = 'Committee / Internal Test';
 
     public static function register_hooks(): void {
         add_action( 'wpforms_process_complete', [ __CLASS__, 'on_deposit_form_submit' ], 10, 4 );
@@ -82,10 +95,12 @@ class GRSH_Team_Deposit {
 
     /**
      * Fires for every WPForms submission sitewide — must self-filter to
-     * self::FORM_ID, same pattern as GRSH_Captain_Sync::on_form_submit().
+     * self::FORM_ID (or self::TEST_FORM_ID), same pattern as
+     * GRSH_Captain_Sync::on_form_submit().
      */
     public static function on_deposit_form_submit( array $fields, array $entry, array $form_data, int $entry_id ): void {
-        if ( ! self::FORM_ID || (int) ( $form_data['id'] ?? 0 ) !== self::FORM_ID ) {
+        $submitted_form_id = (int) ( $form_data['id'] ?? 0 );
+        if ( ! in_array( $submitted_form_id, [ self::FORM_ID, self::TEST_FORM_ID ], true ) ) {
             return;
         }
 
@@ -94,6 +109,33 @@ class GRSH_Team_Deposit {
             self::log_audit(
                 'team_deposit_no_team_found', 'team', null, null, null,
                 'Deposit form submitted (entry ' . $entry_id . ') but no full_team could be resolved for the logged-in user — deposit NOT recorded. Check manually.'
+            );
+            return;
+        }
+
+        // Test paths — logged only, never written to the team's real
+        // financial columns. Two ways in, either is sufficient:
+        //   1. The whole submission came through the separate $1 QA
+        //      clone form (TEST_FORM_ID) — the recommended path.
+        //   2. A "Committee / Internal Test" field was selected on the
+        //      live form (REGISTRATION_TYPE_FIELD_ID) — only reachable
+        //      if that field is ever added to the live form; as of
+        //      2026-09-14 it hasn't been.
+        // Checked before the idempotency guard below on purpose: a board
+        // tester should be able to submit this more than once (e.g.
+        // retesting after a fix) without tripping the "already paid"
+        // duplicate-ignore branch that's meant for real deposits.
+        $is_test_form  = ( $submitted_form_id === self::TEST_FORM_ID );
+        $is_test_field = self::REGISTRATION_TYPE_FIELD_ID
+            && self::field_value( $fields, self::REGISTRATION_TYPE_FIELD_ID ) === self::INTERNAL_TEST_VALUE;
+
+        if ( $is_test_form || $is_test_field ) {
+            $reason = $is_test_form
+                ? 'Submitted via the $1 QA TEST clone form (form ' . self::TEST_FORM_ID . '), entry ' . $entry_id . '.'
+                : 'Committee / Internal Test field selected on the live form, entry ' . $entry_id . '.';
+            self::log_audit(
+                'team_deposit_internal_test', 'team', (int) $team['id'], null, null,
+                $reason . ' Team "' . ( $team['team_name'] ?? '' ) . '" — no PayPal-mode dependency, no fee_total/fee_tier/deposit_paid_at/balance_due/payment_status written, no confirmation email sent.'
             );
             return;
         }
@@ -140,6 +182,14 @@ class GRSH_Team_Deposit {
         // page, and the next email they'd hear from us is the balance
         // reminder much closer to the deadline.
         self::send_deposit_confirmation_email( (int) $team['id'], $team, $fee_total, $fee_tier, $balance_due, $deposit_amount, $settings );
+    }
+
+    /**
+     * Same pattern as GRSH_Captain_Sync::field_value() — WPForms passes
+     * $fields keyed by field ID, each entry holding a 'value' key.
+     */
+    private static function field_value( array $fields, string $field_id ) {
+        return $fields[ $field_id ]['value'] ?? null;
     }
 
     /**

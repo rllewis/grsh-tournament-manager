@@ -23,6 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class GRSH_Sync_Engine {
 
     const FORM_ID  = 5047;
+    const TEST_FORM_ID = 5210; // '2027 Player Registration Test' — $1 QA clone (Tech Tribe / Lorenzo, confirmed imported 2026-09-14). Real $1 PayPal charge per position, but logged only below — never synced into wp_grsh_players/wp_grsh_registrations, since GRSH_Field_Mapper reads the submitted field values directly and doesn't care what PayPal actually charged, same risk class as the team deposit sync had.
     const SEASON   = 2027;
 
     private GRSH_Field_Mapper $mapper;
@@ -73,8 +74,25 @@ class GRSH_Sync_Engine {
         int   $entry_id
     ): void {
 
-        // Only process our registration form
-        if ( (int) $form_data['id'] !== self::FORM_ID ) {
+        // Only process our registration form (real or the $1 test clone)
+        $submitted_form_id = (int) $form_data['id'];
+        if ( ! in_array( $submitted_form_id, [ self::FORM_ID, self::TEST_FORM_ID ], true ) ) {
+            return;
+        }
+
+        // Test clone — logged only, never synced into the real player /
+        // registration tables. Checked before the already-imported guard
+        // below on purpose: a tester should be able to resubmit after a
+        // fix without that guard silently swallowing the retry.
+        if ( $submitted_form_id === self::TEST_FORM_ID ) {
+            $this->log_audit(
+                'registration_internal_test',
+                'registration',
+                null,
+                null,
+                null,
+                "Submitted via the \$1 QA TEST clone form (form " . self::TEST_FORM_ID . "), entry {$entry_id} — not synced to wp_grsh_players/wp_grsh_registrations."
+            );
             return;
         }
 

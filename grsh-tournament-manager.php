@@ -81,6 +81,7 @@ $grsh_includes = [
     'class-grsh-score-sheets.php',    // Batch print-ready game score sheets, rosters auto-filled
     'class-grsh-team-deposit.php',    // Full-team $500 deposit + balance reminder (fee_total set by staff)
     'class-grsh-welcome-packet.php',  // Print-ready captain welcome packet (Invite Captain Round 3)
+    'class-grsh-waiver-page.php',     // Standalone token-gated roster-player waiver signing page
 ];
 
 foreach ( $grsh_includes as $grsh_file ) {
@@ -183,6 +184,7 @@ function grsh_bootstrap(): void {
     if ( class_exists( 'GRSH_Score_Sheets' ) )   { GRSH_Score_Sheets::register_hooks(); }
     if ( class_exists( 'GRSH_Team_Deposit' ) )   { GRSH_Team_Deposit::register_hooks(); }
     if ( class_exists( 'GRSH_Welcome_Packet' ) ) { GRSH_Welcome_Packet::register_hooks(); }
+    if ( class_exists( 'GRSH_Waiver_Page' ) )    { GRSH_Waiver_Page::register_hooks(); }
 
     // Admin-only: menu, notices, assets.
     add_action( 'admin_menu',            'grsh_register_admin_menu' );

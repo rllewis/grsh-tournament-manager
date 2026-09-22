@@ -435,6 +435,27 @@ class GRSH_Captain_Roster {
 
         self::recalculate_team_scores( (int) $team['id'] );
 
+        // Send the player their own waiver link — never the captain's
+        // problem to relay. Only for a registration that isn't already
+        // signed, so re-adding a returning player who signed a prior
+        // season/team doesn't spam them with a redundant email.
+        $already_signed = $wpdb->get_var( $wpdb->prepare(
+            "SELECT signed_at FROM {$wpdb->prefix}grsh_registrations WHERE id = %d", $registration_id
+        ) );
+        if ( ! $already_signed && class_exists( 'GRSH_Waiver_Page' ) ) {
+            wp_mail(
+                $email,
+                __( 'Sign your waiver — Gold Rush Senior Hockey', 'grsh' ),
+                sprintf(
+                    /* translators: 1: player first name, 2: team name, 3: waiver link */
+                    __( "Hi %1\$s,\n\n%2\$s's captain has added you to their 2027 roster. Before you can play, please sign your waiver here:\n\n%3\$s\n\nThis link is unique to you — please don't forward it.", 'grsh' ),
+                    $first_name,
+                    $team['name'],
+                    GRSH_Waiver_Page::build_url( (int) $registration_id )
+                )
+            );
+        }
+
         return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 201 );
     }
 
@@ -579,7 +600,7 @@ class GRSH_Captain_Roster {
             "SELECT ro.id AS roster_id, ro.jersey_number, ro.is_captain,
                     p.id AS player_id, p.first_name, p.last_name, p.email,
                     p.position, p.skill_tier_reported, p.years_experience,
-                    r.age
+                    r.age, r.id AS registration_id, r.signed_at
              FROM {$wpdb->prefix}grsh_rosters ro
              JOIN {$wpdb->prefix}grsh_players p ON p.id = ro.player_id
              JOIN {$wpdb->prefix}grsh_registrations r ON r.id = ro.registration_id
@@ -600,6 +621,7 @@ class GRSH_Captain_Roster {
             'age'                 => $row['age'] !== null ? (int) $row['age'] : null,
             'jersey_number'       => $row['jersey_number'] !== null ? (int) $row['jersey_number'] : null,
             'is_captain'          => (bool) $row['is_captain'],
+            'waiver_signed'       => ! empty( $row['signed_at'] ),
         ], $rows );
 
         $goalie_count = count( array_filter( $players, fn( $p ) => $p['position'] === 'goaltender' ) );
@@ -620,6 +642,10 @@ class GRSH_Captain_Roster {
         }
         if ( $goalie_count < GRSH_Scoring::FULL_TEAM_GOALIE_MIN ) {
             $gaps[] = 'a goalie';
+        }
+        $unsigned = count( array_filter( $players, fn( $p ) => ! $p['waiver_signed'] ) );
+        if ( $unsigned > 0 ) {
+            $gaps[] = "{$unsigned} player" . ( $unsigned === 1 ? '' : 's' ) . ' still need to sign their waiver';
         }
 
         $division_label = $team['division'];
