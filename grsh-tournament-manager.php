@@ -5,7 +5,7 @@
  * Description:       Gold Rush Senior Hockey — Tournament Management Platform.
  *                    Player registration sync, roster management, snake draft,
  *                    auto-balance, historical tracking, and communications.
- * Version:           1.1.0
+ * Version:           1.6.0
  * Requires at least: 6.4
  * Requires PHP:      8.1
  * Author:            Tech Tribe Consulting
@@ -36,7 +36,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'GRSH_VERSION',     '1.1.0' );
+define( 'GRSH_VERSION',     '1.6.0' );
 define( 'GRSH_PLUGIN_FILE', __FILE__ );
 define( 'GRSH_PLUGIN_DIR',  plugin_dir_path( __FILE__ ) );
 define( 'GRSH_PLUGIN_URL',  plugin_dir_url( __FILE__ ) );
@@ -358,7 +358,7 @@ function grsh_activation_notice(): void {
     ?>
     <div class="notice notice-success is-dismissible">
         <p>
-            <strong><?php esc_html_e( 'GRSH Tournament Manager v1.1.0 activated.', 'grsh' ); ?></strong>
+            <strong><?php esc_html_e( 'GRSH Tournament Manager v1.6.0 activated.', 'grsh' ); ?></strong>
             <?php esc_html_e( 'Database tables created. Season 2027 is ready.', 'grsh' ); ?>
             <a href="<?php echo esc_url( admin_url( 'admin.php?page=grsh-tm-dashboard' ) ); ?>">
                 <?php esc_html_e( 'Go to Dashboard →', 'grsh' ); ?>

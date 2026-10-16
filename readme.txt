@@ -4,7 +4,7 @@ Tags: hockey, tournament, roster, draft
 Requires at least: 6.4
 Tested up to: 6.7
 Requires PHP: 8.1
-Stable tag: 1.1.0
+Stable tag: 1.6.0
 License: Proprietary
 
 Gold Rush Senior Hockey — Tournament Management Platform.

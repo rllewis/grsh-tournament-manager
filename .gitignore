@@ -1,1 +1,8 @@
 node_modules/
+
+# Release zips are built from git, never committed
+*.zip
+# Retired copies go in git history, not the plugin root
+*-old*.php
+*_old*.php
+*.old*.php
