@@ -76,7 +76,13 @@ $grsh_includes = [
     'class-grsh-captain-sync.php',    // Tahoe Champions Cup: syncs WPForms 2273 → full_team
     'class-grsh-admin-full-teams.php',// Board view/edit/override for full-team rosters
     'class-grsh-alternates.php',      // Alternates REST routes
+    'class-grsh-renewals.php',        // Renewal invites for returning players (email + tracked link)
+    'class-grsh-sub-requests.php',    // Alternates: sub requests, meta, log
+    'class-grsh-draft.php',           // Server-side snake draft (picks saved, captain phone links, publish)
+    'class-grsh-history-tools.php',   // History page: data checks, fix-in-place edits, duplicate candidates
+    'class-grsh-dashboard.php',       // GET /dashboard — real numbers for the Dashboard page + tournament date
     'class-grsh-reports.php',         // Reports REST routes
+    'class-grsh-reports-tools.php',   // Reports page: live overview, exports, reminders, snapshots, share links
     'class-grsh-history-import.php',  // CSV history import + all /history/* REST routes
     'class-grsh-score-sheets.php',    // Batch print-ready game score sheets, rosters auto-filled
     'class-grsh-team-deposit.php',    // Full-team $500 deposit + balance reminder (fee_total set by staff)
@@ -177,10 +183,16 @@ function grsh_bootstrap(): void {
     if ( class_exists( 'GRSH_Captain_Sync' ) )     { GRSH_Captain_Sync::register_hooks(); }
     if ( class_exists( 'GRSH_Admin_Full_Teams' ) ) { GRSH_Admin_Full_Teams::register_hooks(); }
     if ( class_exists( 'GRSH_Alternates' ) )     { GRSH_Alternates::register_hooks(); }
+    if ( class_exists( 'GRSH_Renewals' ) )       { GRSH_Renewals::register_hooks(); }
+    if ( class_exists( 'GRSH_Sub_Requests' ) )   { GRSH_Sub_Requests::register_hooks(); }
+    if ( class_exists( 'GRSH_Draft' ) )          { GRSH_Draft::register_hooks(); }
+    if ( class_exists( 'GRSH_Dashboard' ) )      { GRSH_Dashboard::register_hooks(); }
+    if ( class_exists( 'GRSH_History_Tools' ) )  { GRSH_History_Tools::register_hooks(); }
     if ( class_exists( 'GRSH_History_Import' ) ) { GRSH_History_Import::register_hooks(); }
     if ( class_exists( 'GRSH_History_API' ) )    { GRSH_History_API::register_routes_on_init(); }
     if ( class_exists( 'GRSH_Settings' ) )       { GRSH_Settings::register_hooks(); }
     if ( class_exists( 'GRSH_Reports' ) )        { GRSH_Reports::register_hooks(); }
+    if ( class_exists( 'GRSH_Reports_Tools' ) )  { GRSH_Reports_Tools::register_hooks(); }
     if ( class_exists( 'GRSH_Score_Sheets' ) )   { GRSH_Score_Sheets::register_hooks(); }
     if ( class_exists( 'GRSH_Team_Deposit' ) )   { GRSH_Team_Deposit::register_hooks(); }
     if ( class_exists( 'GRSH_Welcome_Packet' ) ) { GRSH_Welcome_Packet::register_hooks(); }
@@ -300,12 +312,7 @@ function grsh_enqueue_admin_assets( string $hook ): void {
         true
     );
 
-    wp_enqueue_style(
-        'grsh-admin',
-        GRSH_PLUGIN_URL . 'dist/grsh-admin.css',
-        [],
-        $asset['version']
-    );
+    // CSS is bundled into grsh-admin.js (style-loader), so no separate stylesheet is enqueued.
 
     wp_localize_script( 'grsh-admin', 'grshConfig', [
         'apiUrl'    => esc_url_raw( rest_url( 'grsh/v1' ) ),

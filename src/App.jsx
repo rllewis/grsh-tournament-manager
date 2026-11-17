@@ -8,6 +8,8 @@ import History       from "./pages/History";
 import Reports       from "./pages/Reports";
 import Settings      from "./pages/Settings";
 import HistoryImport from "./pages/HistoryImport";
+import ErrorBoundary from "./components/ErrorBoundary";
+import NoticeToggle   from "./components/NoticeToggle";
 
 const PAGES = {
   "grsh-tm-dashboard":      Dashboard,
@@ -29,7 +31,10 @@ export default function App() {
 
   return (
     <div style={{ background:"#F6F5F0", minHeight:"100vh" }}>
-      <Page />
+      <NoticeToggle />
+      <ErrorBoundary label="This page" key={page}>
+        <Page />
+      </ErrorBoundary>
     </div>
   );
 }

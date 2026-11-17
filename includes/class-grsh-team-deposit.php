@@ -258,7 +258,7 @@ class GRSH_Team_Deposit {
          */
         $body = apply_filters( 'grsh_team_deposit_confirmation_body', $body, $team, $captain, $fee_total, $fee_tier, $balance_due );
 
-        $sent = wp_mail( $captain['email'], $subject, $body );
+        $sent = wp_mail( $captain['email'], $subject, $body, class_exists( 'GRSH_Settings' ) ? GRSH_Settings::mail_headers() : [] );
 
         self::log_audit(
             'team_deposit_confirmation_sent', 'team', $team_id, null,
@@ -387,7 +387,7 @@ class GRSH_Team_Deposit {
          */
         $body = apply_filters( 'grsh_team_deposit_nudge_body', $body, $team, $captain );
 
-        $sent = wp_mail( $captain['email'], $subject, $body );
+        $sent = wp_mail( $captain['email'], $subject, $body, class_exists( 'GRSH_Settings' ) ? GRSH_Settings::mail_headers() : [] );
 
         if ( $sent ) {
             $wpdb->update(
@@ -473,7 +473,7 @@ class GRSH_Team_Deposit {
          */
         $body = apply_filters( 'grsh_team_balance_reminder_body', $body, $team, $captain );
 
-        $sent = wp_mail( $captain['email'], $subject, $body );
+        $sent = wp_mail( $captain['email'], $subject, $body, class_exists( 'GRSH_Settings' ) ? GRSH_Settings::mail_headers() : [] );
 
         if ( $sent ) {
             $wpdb->update(

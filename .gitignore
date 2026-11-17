@@ -6,3 +6,4 @@ node_modules/
 *-old*.php
 *_old*.php
 *.old*.php
+tests/js/.build/

@@ -38,6 +38,7 @@ const POSITION_COLOR = {
   goaltender:{ bg:"#FCE8E8",color:"#7A1818" },
 };
 const STATUS_COLOR = {
+  returning:     { bg:"#EEF2FF",color:"#3730A3" },
   registered:    { bg:"#F3F4F6",color:"#374151" },
   approved:      { bg:"#E6F4EA",color:"#1E6B3A" },
   draft_eligible:{ bg:"#E0F0FF",color:"#1A4F8A" },
@@ -62,9 +63,17 @@ const TIER_COLOR = (t) => {
 const TIERS = ["A1","A2","A3","B1","B2","B3","C1","C2","R1","R2","R3"];
 const ALL_DIVISIONS = ["gold_open","45a","senior_b","senior_c","womens"];
 const ALL_POSITIONS = ["defenseman","center","winger","goaltender"];
-const ALL_STATUSES  = ["registered","approved","draft_eligible","assigned","withdrawn"];
+const ALL_STATUSES  = ["returning","registered","approved","draft_eligible","assigned","withdrawn"];
 const ALL_PAYMENTS  = ["paid","pending","waived","refunded"];
 const PAGE_SIZE = 50;
+const CURRENT_YEAR = 2027;
+// Attention-queue predicates (key → who is affected)
+const QUEUE_FILTERS = {
+  unpaid_on_team: (p)=>p.registered_this_season!==false&&["approved","draft_eligible","assigned"].includes(p.status)&&p.payment_status==="pending",
+  incomplete:     (p)=>p.registered_this_season!==false&&(!p.position||!p.division_requested),
+  sandbagging:    (p)=>!!p.sandbagging_flag,
+  duplicates:     (p,ctx)=>ctx.dupIds.has(p.id),
+};
 
 // WOW 1: Natural language search parser
 const NL_PATTERNS = [
@@ -89,7 +98,7 @@ const NL_PATTERNS = [
   { re:/over (\d+)/i,     handler:(m,p)=>parseInt(p.age||0)>parseInt(m[1]) },
   { re:/under (\d+)/i,    handler:(m,p)=>parseInt(p.age||0)<parseInt(m[1]) },
   { re:/score.*?(\d+)/i,  handler:(m,p)=>computeScore(p.skill_tier_reported,p.years_experience,p.committee_score_adjustment)>=parseFloat(m[1]) },
-  { re:/incomplete/i,     handler:(_,p)=>!p.position||!p.division_requested||!p.payment_status },
+  { re:/incomplete/i,     handler:(_,p)=>p.registered_this_season!==false&&(!p.position||!p.division_requested||!p.payment_status) },
   { re:/sub|alternate/i,  handler:(_,p)=>p.player_type==="sub" },
 ];
 function nlSearch(query, players) {
@@ -113,11 +122,13 @@ const NL_SUGGESTIONS = [
 ];
 
 // WOW 3: Duplicate detector
-function detectDuplicates(players) {
+function detectDuplicates(players, dismissed=[]) {
   const pairs = [];
+  const skip = new Set(dismissed);
   for (let i=0;i<players.length;i++) {
     for (let j=i+1;j<players.length;j++) {
       const a=players[i], b=players[j];
+      if (skip.has(Math.min(a.id,b.id)+"-"+Math.max(a.id,b.id))) continue;
       const sameName  = a.first_name===b.first_name&&a.last_name===b.last_name;
       const sameAge   = a.age===b.age;
       const emailSim  = a.email.split("@")[0].replace(/\W/g,"").includes(b.email.split("@")[0].replace(/\W/g,"").slice(0,4));
@@ -397,9 +408,24 @@ function DraftPreviewModal({ players, divisions, onClose }) {
   );
 }
 
-// WOW 5: Duplicate detector modal
-function DuplicateModal({ players, onClose }) {
-  const dupes=useMemo(()=>detectDuplicates(players),[players]);
+// WOW 5: Duplicate detector modal — merge + dismiss are real actions
+function DuplicateModal({ players, dismissed, onClose, onMerge, onDismiss }) {
+  const dupes=useMemo(()=>detectDuplicates(players,dismissed),[players,dismissed]);
+  const [keep,setKeep]=useState({});      // pairKey -> id to keep
+  const [busy,setBusy]=useState(null);
+  const [err,setErr]=useState({});
+  const score=p=>(p.history_count||0)*10+(p.registered_this_season?5:0)+(p.last_played_year||0)/10000;
+  const pairKey=(a,b)=>Math.min(a,b)+"-"+Math.max(a,b);
+  const doMerge=async(a,b)=>{
+    const k=pairKey(a.id,b.id);
+    const keepId=keep[k]||(score(a)>=score(b)?a.id:b.id);
+    const removeId=keepId===a.id?b.id:a.id;
+    setBusy(k); setErr(e=>({...e,[k]:""}));
+    const msg=await onMerge(keepId,removeId);
+    setBusy(null);
+    if(msg) setErr(e=>({...e,[k]:msg}));
+  };
+  const btn={ fontFamily:"'DM Mono',monospace",fontSize:11,padding:"5px 14px",borderRadius:6,cursor:"pointer" };
   return (
     <div style={{ position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:2000,
       display:"flex",alignItems:"center",justifyContent:"center",padding:"20px" }}>
@@ -419,36 +445,56 @@ function DuplicateModal({ players, onClose }) {
               <p style={{ fontFamily:"'Fraunces',serif",fontSize:16,fontWeight:700,color:"#166534",margin:"0 0 4px" }}>No duplicates found</p>
               <p style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#aaa",margin:0 }}>All player records appear unique.</p>
             </div>
-          ):dupes.map(([aid,bid,reason],i)=>{
-            const a=players.find(p=>p.id===aid),b=players.find(p=>p.id===bid);
-            if(!a||!b) return null;
-            return (
-              <div key={i} style={{ border:"1px solid #FDE68A",borderRadius:10,
-                padding:"12px 14px",marginBottom:10,background:"#FFFBEB" }}>
-                <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#92400E",
-                  fontWeight:500,marginBottom:8 }}>⧉ {reason}</div>
-                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>
-                  {[a,b].map(p=>(
-                    <div key={p.id} style={{ background:"#fff",borderRadius:6,padding:"8px 10px" }}>
-                      <div style={{ fontFamily:"'Fraunces',serif",fontSize:13,fontWeight:700,color:"#1a1a2e" }}>
-                        {p.first_name} {p.last_name}
-                      </div>
-                      <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#888" }}>{p.email}</div>
-                      <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#888" }}>Age {p.age} · {DIVISION_LABEL[p.division_requested]||p.division_requested}</div>
-                    </div>
-                  ))}
+          ):(<>
+            <p style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#888",margin:"0 0 12px",lineHeight:1.5 }}>
+              Same name does not always mean same person. Merge only when both records are the same human
+              (e.g. two email addresses). Merging moves history, registrations and rosters onto the record you keep;
+              it is refused automatically if both have a row for the same season.
+            </p>
+            {dupes.map(([aid,bid,reason])=>{
+              const a=players.find(p=>p.id===aid),b=players.find(p=>p.id===bid);
+              if(!a||!b) return null;
+              const k=pairKey(aid,bid);
+              const keepId=keep[k]||(score(a)>=score(b)?a.id:b.id);
+              return (
+                <div key={k} style={{ border:"1px solid #FDE68A",borderRadius:10,
+                  padding:"12px 14px",marginBottom:10,background:"#FFFBEB" }}>
+                  <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#92400E",
+                    fontWeight:500,marginBottom:8 }}>⧉ {reason}</div>
+                  <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>
+                    {[a,b].map(p=>(
+                      <label key={p.id} style={{ background:"#fff",borderRadius:6,padding:"8px 10px",cursor:"pointer",
+                        border:keepId===p.id?"2px solid #1a1a2e":"2px solid transparent",display:"block" }}>
+                        <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:2 }}>
+                          <input type="radio" name={"keep-"+k} checked={keepId===p.id}
+                            onChange={()=>setKeep(x=>({...x,[k]:p.id}))}/>
+                          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:keepId===p.id?"#166534":"#aaa" }}>
+                            {keepId===p.id?"KEEP":"merge away"}</span>
+                        </div>
+                        <div style={{ fontFamily:"'Fraunces',serif",fontSize:13,fontWeight:700,color:"#1a1a2e" }}>
+                          {p.first_name} {p.last_name}
+                        </div>
+                        <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#888",wordBreak:"break-all" }}>{p.email}</div>
+                        <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#888" }}>
+                          {p.history_count||0} season{(p.history_count||0)!==1?"s":""} of history
+                          {p.last_played_year?` · last ${p.last_played_year}`:""}
+                          {p.registered_this_season?" · registered 2027":""}
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                  {err[k]&&<div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#991B1B",marginTop:8 }}>{err[k]}</div>}
+                  <div style={{ display:"flex",gap:8,marginTop:10 }}>
+                    <button disabled={busy===k} onClick={()=>doMerge(a,b)}
+                      style={{ ...btn,background:"#1a1a2e",color:"#D4A017",border:"none",opacity:busy===k?.6:1 }}>
+                      {busy===k?"Merging…":"Merge into selected"}</button>
+                    <button disabled={busy===k} onClick={()=>onDismiss(aid,bid)}
+                      style={{ ...btn,background:"#F6F5F0",border:"1px solid #E8E6DF",color:"#888" }}>Not a duplicate</button>
+                  </div>
                 </div>
-                <div style={{ display:"flex",gap:8,marginTop:10 }}>
-                  <button style={{ fontFamily:"'DM Mono',monospace",fontSize:11,
-                    background:"#1a1a2e",color:"#D4A017",border:"none",
-                    padding:"5px 14px",borderRadius:6,cursor:"pointer" }}>Merge records</button>
-                  <button style={{ fontFamily:"'DM Mono',monospace",fontSize:11,
-                    background:"#F6F5F0",border:"1px solid #E8E6DF",color:"#888",
-                    padding:"5px 14px",borderRadius:6,cursor:"pointer" }}>Not a duplicate</button>
-                </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </>)}
         </div>
       </div>
     </div>
@@ -565,6 +611,205 @@ const DEFAULT_VIEWS = [
   { name:"Goalies",           filters:{ filterPos:"goaltender" }},
 ];
 
+
+// ─── Renewal funnel helpers ───────────────────────────────────────────────────
+// Stage of a returning player (someone with history) in the renewal funnel.
+const RENEW_STAGES = [
+  { k:"not_invited", label:"Not invited", color:"#6B7280" },
+  { k:"invited",     label:"Invited",     color:"#1A4F8A" },
+  { k:"opened",      label:"Opened",      color:"#7C3AED" },
+  { k:"registered",  label:"Registered",  color:"#B45309" },
+  { k:"paid",        label:"Paid",        color:"#166534" },
+];
+function renewStage(p,invites){
+  if(!p.last_played_year) return null;                       // not part of the returning cohort
+  if(p.registered_this_season!==false) return (p.payment_status==="paid"||p.payment_status==="waived")?"paid":"registered";
+  const i=invites[p.id];
+  if(!i) return "not_invited";
+  return i.opened_at?"opened":"invited";
+}
+
+// Renewal invite composer
+function RenewalInviteModal({ targets, settings, onClose, onSent }) {
+  const [url,setUrl]=useState(settings?.registration_url||"");
+  const [subject,setSubject]=useState(settings?.subject||"");
+  const [body,setBody]=useState(settings?.body||"");
+  const [sending,setSending]=useState(false);
+  const [result,setResult]=useState(null);
+  const [error,setError]=useState("");
+  const sample=targets[0];
+  const fill=(t)=>t.replace(/\{first_name\}/g,sample?.first_name||"Alex").replace(/\{season\}/g,CURRENT_YEAR).replace(/\{link\}/g,url?`${url}${url.includes("?")?"&":"?"}grsh_renew=…`:"[registration link]");
+  const send=async()=>{
+    setSending(true); setError("");
+    try{
+      const res=await fetch(`${API}/renewals/send`,{method:"POST",headers:{"Content-Type":"application/json","X-WP-Nonce":NONCE},
+        body:JSON.stringify({player_ids:targets.map(t=>t.id),registration_url:url,subject,body})});
+      const d=await res.json();
+      if(!res.ok) setError(d?.error||d?.message||"Send failed."); else { setResult(d); onSent&&onSent(d); }
+    }catch(e){ setError("Network error — nothing was confirmed sent. Check the Renewal funnel before retrying."); }
+    setSending(false);
+  };
+  const lbl={ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa",textTransform:"uppercase",letterSpacing:".08em",marginBottom:4,display:"block" };
+  const inp={ fontFamily:"'DM Mono',monospace",fontSize:12,width:"100%",background:"#F6F5F0",border:"1px solid #E8E6DF",borderRadius:6,padding:"8px 10px",color:"#333",outline:"none",boxSizing:"border-box" };
+  return (
+    <div role="dialog" aria-modal="true" aria-label="Send renewal invites" style={{ position:"fixed",inset:0,background:"rgba(20,20,40,.45)",zIndex:100000,display:"flex",alignItems:"center",justifyContent:"center" }} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{ background:"#fff",borderRadius:14,width:620,maxWidth:"94vw",maxHeight:"90vh",overflowY:"auto",padding:22,boxShadow:"0 20px 60px rgba(0,0,0,.25)" }}>
+        <div style={{ fontFamily:"'Fraunces',serif",fontSize:20,fontWeight:700,color:"#1a1a2e" }}>Invite {targets.length} returning player{targets.length!==1?"s":""} to register</div>
+        <p style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#888",margin:"4px 0 14px" }}>Each player gets a personal link. Their name, email and phone are pre-filled on the registration form.</p>
+        {result?(
+          <div>
+            <div style={{ background:"#E6F4EA",border:"1px solid #BBF7D0",borderRadius:8,padding:"10px 14px",fontFamily:"'DM Mono',monospace",fontSize:12,color:"#166534" }}>✓ Sent {result.sent} invite{result.sent!==1?"s":""}.</div>
+            {result.skipped?.length>0&&<div style={{ marginTop:10,fontFamily:"'DM Mono',monospace",fontSize:11,color:"#92400E" }}>Skipped {result.skipped.length}: {result.skipped.slice(0,6).map(x=>`${x.name} (${x.reason})`).join(", ")}{result.skipped.length>6?"…":""}</div>}
+            {result.failed?.length>0&&<div style={{ marginTop:10,fontFamily:"'DM Mono',monospace",fontSize:11,color:"#991B1B" }}>Mail failed for {result.failed.length}: {result.failed.slice(0,6).map(x=>x.name).join(", ")}. Check your site's email setup (SMTP plugin) before retrying.</div>}
+            <div style={{ textAlign:"right",marginTop:16 }}><button onClick={onClose} style={{ ...pageBtn,background:"#1a1a2e",color:"#D4A017" }}>Done</button></div>
+          </div>
+        ):(
+          <>
+            <label style={lbl} htmlFor="rn-url">Registration page URL</label>
+            <input id="rn-url" value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://grsht.com/register/" style={{ ...inp,marginBottom:12 }}/>
+            <label style={lbl} htmlFor="rn-subj">Subject</label>
+            <input id="rn-subj" value={subject} onChange={e=>setSubject(e.target.value)} style={{ ...inp,marginBottom:12 }}/>
+            <label style={lbl} htmlFor="rn-body">Message — keep {"{link}"}; {"{first_name}"} and {"{season}"} are filled in per player</label>
+            <textarea id="rn-body" value={body} onChange={e=>setBody(e.target.value)} rows={9} style={{ ...inp,resize:"vertical",marginBottom:12 }}/>
+            <div style={{ background:"#FAFAF8",border:"1px dashed #E8E6DF",borderRadius:8,padding:"10px 12px",fontFamily:"'DM Mono',monospace",fontSize:11,color:"#555",whiteSpace:"pre-wrap" }}>
+              <div style={{ color:"#aaa",fontSize:9,textTransform:"uppercase",marginBottom:4 }}>Preview for {sample?`${sample.first_name} ${sample.last_name}`:"—"}</div>
+              <strong>{fill(subject)}</strong>{"\n\n"}{fill(body)}
+            </div>
+            {error&&<div role="alert" style={{ marginTop:10,background:"#FEE2E2",border:"1px solid #FCA5A5",borderRadius:8,padding:"8px 12px",fontFamily:"'DM Mono',monospace",fontSize:11,color:"#991B1B" }}>{error}</div>}
+            <div style={{ display:"flex",justifyContent:"flex-end",gap:8,marginTop:16 }}>
+              <button onClick={onClose} style={pageBtn}>Cancel</button>
+              <button onClick={send} disabled={sending||!targets.length} style={{ ...pageBtn,background:"#1a1a2e",color:"#D4A017",opacity:sending?0.6:1 }}>{sending?"Sending…":`Send ${targets.length} invite${targets.length!==1?"s":""}`}</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Renewal funnel strip: Not invited → Invited → Opened → Registered → Paid
+function RenewalFunnel({ counts, total, active, onPick, onInvite, inviteTargets }) {
+  return (
+    <div style={{ background:"#fff",border:"1px solid #E8E6DF",borderRadius:12,padding:"14px 16px",marginBottom:14 }}>
+      <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,gap:10,flexWrap:"wrap" }}>
+        <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa",textTransform:"uppercase",letterSpacing:".08em" }}>
+          Renewal funnel {CURRENT_YEAR} · {total} returning players
+        </div>
+        <button onClick={onInvite} disabled={!inviteTargets}
+          style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#1a1a2e",color:"#D4A017",border:"none",padding:"7px 14px",borderRadius:8,cursor:inviteTargets?"pointer":"default",opacity:inviteTargets?1:0.45 }}>
+          ✉ Invite {inviteTargets||0} to register
+        </button>
+      </div>
+      <div style={{ display:"flex",height:8,borderRadius:99,overflow:"hidden",background:"#F0EEE8",marginBottom:10 }} aria-hidden="true">
+        {RENEW_STAGES.map(st=>counts[st.k]>0&&<div key={st.k} style={{ width:`${(counts[st.k]/Math.max(total,1))*100}%`,background:st.color,opacity:active&&active!==st.k?0.3:1 }}/>)}
+      </div>
+      <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>
+        {RENEW_STAGES.map(st=>(
+          <button key={st.k} onClick={()=>onPick(active===st.k?"":st.k)} aria-pressed={active===st.k}
+            style={{ display:"flex",alignItems:"center",gap:8,background:active===st.k?"#1a1a2e":"#fff",border:`1px solid ${active===st.k?"#1a1a2e":"#E8E6DF"}`,borderRadius:99,padding:"5px 14px",cursor:"pointer" }}>
+            <span style={{ width:8,height:8,borderRadius:"50%",background:st.color }}/>
+            <span style={{ fontFamily:"'Fraunces',serif",fontSize:16,fontWeight:700,color:active===st.k?"#D4A017":st.color,lineHeight:1 }}>{counts[st.k]||0}</span>
+            <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:active===st.k?"#D4A017":"#888",textTransform:"uppercase",letterSpacing:".06em" }}>{st.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Attention queue: what needs a human today, one click to the exact players
+const SEV = { high:{ bg:"#FEF2F2",bd:"#FCA5A5",fg:"#991B1B",dot:"#DC2626" }, med:{ bg:"#FFFBEB",bd:"#FDE68A",fg:"#92400E",dot:"#D97706" }, info:{ bg:"#EFF6FF",bd:"#BFDBFE",fg:"#1E40AF",dot:"#2563EB" } };
+function AttentionQueue({ items, activeKey, onAction, onClear, open, setOpen }) {
+  return (
+    <div style={{ background:"#fff",border:"1px solid #E8E6DF",borderRadius:12,marginBottom:14,overflow:"hidden" }}>
+      <button onClick={()=>setOpen(o=>!o)} aria-expanded={open}
+        style={{ width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",background:"transparent",border:"none",padding:"12px 16px",cursor:"pointer" }}>
+        <span style={{ fontFamily:"'Fraunces',serif",fontSize:15,fontWeight:700,color:"#1a1a2e" }}>
+          Needs attention {items.length>0&&<span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#FEE2E2",color:"#991B1B",padding:"1px 9px",borderRadius:99,marginLeft:6 }}>{items.length}</span>}
+        </span>
+        <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#aaa" }}>{open?"Hide ▲":"Show ▼"}</span>
+      </button>
+      {open&&(
+        <div style={{ padding:"0 16px 14px",display:"flex",flexDirection:"column",gap:6 }}>
+          {items.length===0&&<div style={{ fontFamily:"'DM Mono',monospace",fontSize:12,color:"#166534",background:"#E6F4EA",borderRadius:8,padding:"10px 14px" }}>✓ All clear — nothing needs a decision right now.</div>}
+          {items.map(it=>{
+            const c=SEV[it.sev]||SEV.info; const on=activeKey===it.key;
+            return (
+              <div key={it.key} style={{ display:"flex",alignItems:"center",gap:10,background:c.bg,border:`1px solid ${on?c.fg:c.bd}`,borderRadius:8,padding:"8px 12px" }}>
+                <span style={{ width:8,height:8,borderRadius:"50%",background:c.dot,flexShrink:0 }}/>
+                <span style={{ flex:1,fontFamily:"'DM Mono',monospace",fontSize:12,color:c.fg }}><strong>{it.count}</strong> {it.text}</span>
+                {on
+                  ? <button onClick={onClear} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#fff",border:`1px solid ${c.fg}`,color:c.fg,padding:"4px 10px",borderRadius:6,cursor:"pointer" }}>Clear ✕</button>
+                  : <button onClick={()=>onAction(it)} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#fff",border:`1px solid ${c.bd}`,color:c.fg,padding:"4px 10px",borderRadius:6,cursor:"pointer" }}>{it.cta||"Show"} →</button>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Division balance meter: what does this tier/division choice do to the division?
+function BalanceMeter({ player, tier, allPlayers }) {
+  const div=player.division_assigned||player.division_requested;
+  if(!div||player.registered_this_season===false||!allPlayers?.length) return null;
+  const inDiv=(p)=>(p.division_assigned||p.division_requested)===div&&p.registered_this_season!==false;
+  const mates=allPlayers.filter(p=>p.id!==player.id&&inDiv(p));
+  const mateScores=mates.map(p=>computeScore(p.skill_tier_assigned||p.skill_tier_reported,p.years_experience,p.committee_score_adjustment));
+  const savedTier=player.skill_tier_assigned||player.skill_tier_reported;
+  const mine=(t)=>computeScore(t||savedTier,player.years_experience,player.committee_score_adjustment);
+  const avg=(a)=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0;
+  const before=avg([...mateScores,mine(savedTier)]);
+  const myScore=mine(tier);
+  const after=avg([...mateScores,myScore]);
+  const delta=after-before;
+  const rank=[...mateScores,myScore].sort((a,b)=>b-a).indexOf(myScore)+1;
+  const count=mates.length+1;
+  const cap=DIV_CAPS[div]||30;
+  const goalies=mates.filter(p=>p.position==="goaltender").length+(player.position==="goaltender"?1:0);
+  const letters=["A","B","C","R"];
+  const dist=letters.map(L=>({L,n:mates.filter(p=>(p.skill_tier_assigned||p.skill_tier_reported||"")[0]===L).length+(((tier||savedTier||"")[0]===L)?1:0)}));
+  const maxN=Math.max(1,...dist.map(d=>d.n));
+  const mono={ fontFamily:"'DM Mono',monospace" };
+  return (
+    <div style={{ background:"#FAFAF8",border:"1px solid #E8E6DF",borderRadius:10,padding:"10px 12px",marginBottom:12 }}>
+      <div style={{ ...mono,fontSize:9,color:"#bbb",textTransform:"uppercase",marginBottom:6 }}>Division balance · {DIVISION_LABEL[div]||div}</div>
+      <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:8 }}>
+        <div style={{ flex:1,height:6,background:"#E8E6DF",borderRadius:99,overflow:"hidden" }}>
+          <div style={{ width:`${Math.min(100,(count/cap)*100)}%`,height:"100%",background:count>cap?"#DC2626":count/cap>0.85?"#D97706":"#166534" }}/>
+        </div>
+        <span style={{ ...mono,fontSize:11,color:count>cap?"#991B1B":"#555" }}>{count}/{cap}</span>
+      </div>
+      <div style={{ display:"flex",gap:14,flexWrap:"wrap",marginBottom:8 }}>
+        <div>
+          <div style={{ ...mono,fontSize:9,color:"#bbb" }}>AVG SCORE</div>
+          <div style={{ ...mono,fontSize:12,color:"#1a1a2e" }}>{before.toFixed(1)} → <strong>{after.toFixed(1)}</strong>
+            {Math.abs(delta)>=0.05&&<span style={{ color:delta>0?"#166534":"#991B1B",marginLeft:4 }}>{delta>0?"▲":"▼"}{Math.abs(delta).toFixed(1)}</span>}
+          </div>
+        </div>
+        <div>
+          <div style={{ ...mono,fontSize:9,color:"#bbb" }}>RANK IN DIVISION</div>
+          <div style={{ ...mono,fontSize:12,color:"#1a1a2e" }}>#{rank} of {count}</div>
+        </div>
+        <div>
+          <div style={{ ...mono,fontSize:9,color:"#bbb" }}>GOALIES</div>
+          <div style={{ ...mono,fontSize:12,color:goalies===0?"#991B1B":"#1a1a2e" }}>{goalies}{goalies===0&&" — none yet"}</div>
+        </div>
+      </div>
+      <div style={{ display:"flex",alignItems:"flex-end",gap:6,height:34 }} aria-label="Skill tier mix">
+        {dist.map(d=>(
+          <div key={d.L} style={{ flex:1,textAlign:"center" }}>
+            <div style={{ height:Math.max(2,(d.n/maxN)*22),background:(tier||savedTier||"")[0]===d.L?"#1a1a2e":"#CBD5E1",borderRadius:3,marginBottom:2 }}/>
+            <div style={{ ...mono,fontSize:9,color:"#888" }}>{d.L}{d.n}</div>
+          </div>
+        ))}
+      </div>
+      {mates.length===0&&<div style={{ ...mono,fontSize:10,color:"#aaa",marginTop:6 }}>Only registrant in this division so far.</div>}
+    </div>
+  );
+}
+
 // Player drawer
 function PlayerDrawer({ player, onClose, onSave, allPlayers }) {
   const [tier,   setTier]   = useState(player.skill_tier_assigned||player.skill_tier_reported||"");
@@ -577,7 +822,7 @@ function PlayerDrawer({ player, onClose, onSave, allPlayers }) {
   const score=computeScore(player.skill_tier_reported,player.years_experience,player.committee_score_adjustment);
   const initials=`${player.first_name[0]}${player.last_name[0]}`;
   const tc=TIER_COLOR(tier);
-  const missingFields=[!player.position&&"Position",!player.division_requested&&"Division",!player.payment_status&&"Payment",!player.age&&"Age"].filter(Boolean);
+  const missingFields=[!player.position&&"Position",!player.division_requested&&"Division",(player.registered_this_season!==false&&!player.payment_status)&&"Payment",(player.registered_this_season!==false&&!player.age)&&"Age"].filter(Boolean);
   const handleClose=()=>{ if(isDirty&&!window.confirm("Discard unsaved changes?")) return; onClose(); };
   const handleSave=()=>{ onSave({...player,skill_tier_assigned:tier,notes,status}); setIsDirty(false); };
   const handleTierChange=(t)=>{ setUndoTier(tier); markDirty(setTier)(t); };
@@ -688,6 +933,7 @@ function PlayerDrawer({ player, onClose, onSave, allPlayers }) {
             <TierScale value={tier} onChange={handleTierChange} />
             {undoTier&&<button onClick={handleUndoTier} style={{ fontFamily:"'DM Mono',monospace",fontSize:10,background:"#FEF3C7",border:"1px solid #FDE68A",color:"#92400E",padding:"3px 10px",borderRadius:6,cursor:"pointer",marginTop:6 }}>↩ Undo tier change</button>}
           </div>
+          <BalanceMeter player={player} tier={tier} allPlayers={allPlayers}/>
           <div style={{ marginBottom:12 }}>
             <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:"#bbb",textTransform:"uppercase",marginBottom:4 }}>Workflow status</div>
             <StatusStepper value={status} onChange={markDirty(setStatus)} />
@@ -749,7 +995,7 @@ function PlayerDrawer({ player, onClose, onSave, allPlayers }) {
 
       {/* Sticky action bar */}
       <div style={{ display:"flex",gap:10,padding:"14px 18px",borderTop:"1px solid #F0EEE8",background:"#fff",flexShrink:0 }}>
-        <a href={`/wp-admin/admin.php?page=grsh-tm-history`}
+        <a href={`/wp-admin/admin.php?page=grsh-tm-history&search=${encodeURIComponent(player.email||"")}`}
           style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#1a1a2e",
             textDecoration:"none",border:"1px solid #E8E6DF",padding:"8px 12px",
             borderRadius:8,display:"flex",alignItems:"center",gap:4 }}>📋 History</a>
@@ -783,6 +1029,15 @@ export default function Players() {
   const [sortKey,  setSortKey]  = useState("score");       // #1 default sort by score
   const [sortDir,  setSortDir]  = useState("desc");
   const [page,     setPage]     = useState(1);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
+  const [scope,    setScope]    = useState("all");   // all | registered | returning
+  const scopeInit = useRef(false);
+  const [invites,     setInvites]     = useState({});
+  const [renewSettings,setRenewSettings]=useState(null);
+  const [showInvite,  setShowInvite]  = useState(false);
+  const [funnel,      setFunnel]      = useState("");      // renewal funnel stage filter
+  const [queueKey,    setQueueKey]    = useState("");      // attention-queue filter
+  const [queueOpen,   setQueueOpen]   = useState(true);
   const [selectedIds,   setSelectedIds]   = useState(new Set());
   const [hoveredRow,    setHoveredRow]    = useState(null);
   const [inlineTierRow, setInlineTierRow] = useState(null); // #15 inline tier edit
@@ -799,6 +1054,7 @@ export default function Players() {
   const [showJersey,    setShowJersey]    = useState(false);  // #8
   const [showDraftPrev, setShowDraftPrev] = useState(false);  // WOW 4
   const [showDupes,     setShowDupes]     = useState(false);  // WOW 5
+  const [dismissedDupes,setDismissedDupes]=useState([]);
   const [showEmail,     setShowEmail]     = useState(false);  // WOW 6
   const [showShortcuts, setShowShortcuts] = useState(false);  // #23
   const [showPipeline,  setShowPipeline]  = useState(true);   // #14 pipeline
@@ -833,12 +1089,28 @@ export default function Players() {
     return()=>clearInterval(t);
   },[liveCount]);
 
+  // Default the scope to current-season registrants once data arrives (if there are any).
+  useEffect(()=>{
+    if(scopeInit.current||!players.length) return;
+    scopeInit.current=true;
+    if(players.some(x=>x.registered_this_season!==false)&&players.some(x=>x.registered_this_season===false)) setScope("registered");
+  },[players]);
+
+  // Renewal invite status (silent on failure: the funnel then shows everyone as "not invited")
+  const loadInvites=()=>{
+    fetch(`${API}/renewals`,{headers:{"X-WP-Nonce":NONCE}})
+      .then(r=>r.ok?r.json():null)
+      .then(d=>{ if(d){ setInvites(d.invites||{}); setRenewSettings(d.settings||null); } })
+      .catch(()=>{});
+  };
+  useEffect(()=>{ loadInvites(); },[]);
+
   // Fetch players
   useEffect(()=>{
     setLoading(true);
     fetch(`${API}/players`,{headers:{"X-WP-Nonce":NONCE}})
       .then(r=>r.ok?r.json():null)
-      .then(d=>{ setPlayers(Array.isArray(d)?d:MOCK_PLAYERS); setLoading(false); })
+      .then(d=>{ setPlayers(Array.isArray(d)?d:(Array.isArray(d?.players)?d.players:MOCK_PLAYERS)); if(Array.isArray(d?.dismissed_duplicates)) setDismissedDupes(d.dismissed_duplicates); setLoading(false); })
       .catch(()=>{ setPlayers(MOCK_PLAYERS); setLoading(false); });
   },[]);
 
@@ -878,7 +1150,9 @@ export default function Players() {
   },[players]);
 
   // Duplicates — WOW 5
-  const dupeCount = useMemo(()=>detectDuplicates(players).length,[players]);
+  const dupeCount = useMemo(()=>detectDuplicates(players,dismissedDupes).length,[players,dismissedDupes]);
+
+  const dupIds = useMemo(()=>{ const s=new Set(); detectDuplicates(players,dismissedDupes).forEach(([a,b])=>{s.add(a);s.add(b);}); return s; },[players,dismissedDupes]);
 
   // Filter
   const filtered = useMemo(()=>{
@@ -886,6 +1160,12 @@ export default function Players() {
     if(search){
       p = isNL ? nlSearch(search,p) : p.filter(x=>`${x.first_name} ${x.last_name} ${x.email} ${x.skill_tier_reported}`.toLowerCase().includes(search.toLowerCase()));
     }
+    if(funnel){ p=p.filter(x=>renewStage(x,invites)===funnel); }
+    else {
+      if(scope==='registered') p=p.filter(x=>x.registered_this_season!==false);
+      if(scope==='returning')  p=p.filter(x=>x.registered_this_season===false);
+    }
+    if(queueKey&&QUEUE_FILTERS[queueKey]) p=p.filter(x=>QUEUE_FILTERS[queueKey](x,{invites,dupIds}));
     if(filterDiv)     p=p.filter(x=>x.division_requested===filterDiv);
     if(filterPos)     p=p.filter(x=>x.position===filterPos);
     if(filterStatus)  p=p.filter(x=>x.status===filterStatus);
@@ -904,23 +1184,68 @@ export default function Players() {
       return sortDir==="asc"?(av>bv?1:-1):(av<bv?1:-1);
     });
     return p;
-  },[players,search,isNL,filterDiv,filterPos,filterStatus,filterPayment,filterType,filterWarn,sortKey,sortDir]);
+  },[players,search,isNL,filterDiv,filterPos,filterStatus,filterPayment,filterType,filterWarn,scope,funnel,queueKey,invites,dupIds,sortKey,sortDir]);
+
+  const regCount = useMemo(()=>players.filter(x=>x.registered_this_season!==false).length,[players]);
+  const retCount = players.length-regCount;
 
   // Stats (dynamic to filter — #20)
   const stats = useMemo(()=>({
     total:   filtered.length,
-    paid:    filtered.filter(p=>p.payment_status==="paid").length,
-    unpaid:  filtered.filter(p=>p.payment_status==="pending").length,
+    paid:    filtered.filter(p=>p.registered_this_season!==false&&p.payment_status==="paid").length,
+    unpaid:  filtered.filter(p=>p.registered_this_season!==false&&p.payment_status==="pending").length,
     subs:    filtered.filter(p=>p.player_type==="sub").length,
     goalies: filtered.filter(p=>p.position==="goaltender").length,
     warnings:filtered.filter(p=>p.sandbagging_flag).length,
   }),[filtered]);
 
-  const totalPages = Math.max(1,Math.ceil(filtered.length/PAGE_SIZE));
-  const paginated  = filtered.slice((page-1)*PAGE_SIZE,page*PAGE_SIZE);
+  const funnelCounts = useMemo(()=>{
+    const c={not_invited:0,invited:0,opened:0,registered:0,paid:0};
+    players.forEach(p=>{ const st=renewStage(p,invites); if(st) c[st]++; });
+    return c;
+  },[players,invites]);
+  const cohortTotal = Object.values(funnelCounts).reduce((a,b)=>a+b,0);
+
+  // Invite targets: selected returning players (if any), otherwise everyone not yet invited
+  const inviteTargets = useMemo(()=>{
+    const pool=players.filter(p=>renewStage(p,invites)==="not_invited"&&p.email);
+    if(selectedIds.size>0){
+      const sel=players.filter(p=>selectedIds.has(p.id)&&p.registered_this_season===false&&p.email);
+      if(sel.length) return sel;
+    }
+    return pool;
+  },[players,invites,selectedIds]);
+
+  const queueItems = useMemo(()=>{
+    const items=[]; const n=(f)=>players.filter(f).length;
+    const unpaid=n(QUEUE_FILTERS.unpaid_on_team);
+    if(unpaid) items.push({key:"unpaid_on_team",sev:"high",count:unpaid,text:`player${unpaid!==1?"s are":" is"} on a team but ha${unpaid!==1?"ven't":"sn't"} paid`});
+    capWarnings.forEach(([div,c])=>items.push({key:`cap_${div}`,sev:"high",count:c-(DIV_CAPS[div]||30),text:`over capacity in ${DIVISION_LABEL[div]||div} (${c}/${DIV_CAPS[div]||30})`,div,cta:"Show division"}));
+    const inc=n(QUEUE_FILTERS.incomplete);
+    if(inc) items.push({key:"incomplete",sev:"med",count:inc,text:`registrant${inc!==1?"s":""} missing a division or position`});
+    if(dupeCount) items.push({key:"duplicates",sev:"med",count:dupeCount,text:`possible duplicate record${dupeCount!==1?"s":""}`,cta:"Review"});
+    const sb=n(QUEUE_FILTERS.sandbagging);
+    if(sb) items.push({key:"sandbagging",sev:"med",count:sb,text:`sandbagging flag${sb!==1?"s":""} to review`});
+    if(funnelCounts.opened) items.push({key:"funnel_opened",sev:"info",count:funnelCounts.opened,text:`opened their renewal invite but haven't registered`,funnel:"opened",cta:"Nudge"});
+    if(funnelCounts.not_invited) items.push({key:"invite_all",sev:"info",count:funnelCounts.not_invited,text:`returning player${funnelCounts.not_invited!==1?"s":""} not invited yet`,invite:true,cta:"Invite"});
+    const order={high:0,med:1,info:2};
+    return items.sort((a,b)=>order[a.sev]-order[b.sev]);
+  },[players,capWarnings,dupeCount,funnelCounts]);
+
+  const runQueueAction=(it)=>{
+    if(it.invite){ setShowInvite(true); return; }
+    if(it.key==="duplicates"){ setShowDupes(true); return; }
+    clearFilters(); setFunnel("");
+    if(it.funnel){ setFunnel(it.funnel); return; }
+    if(it.div){ setScope("registered"); setFilterDiv(it.div); setQueueKey(""); return; }
+    setScope("registered"); setQueueKey(it.key);
+  };
+
+  const totalPages = Math.max(1,Math.ceil(filtered.length/pageSize));
+  const paginated  = filtered.slice((page-1)*pageSize,page*pageSize);
 
   const handleSort=(key)=>{ if(sortKey===key)setSortDir(d=>d==="asc"?"desc":"asc"); else{setSortKey(key);setSortDir("desc");} };
-  const clearFilters=()=>{ setSearch("");setFilterDiv("");setFilterPos("");setFilterStatus("");setFilterPayment("");setFilterType("");setFilterWarn(false);setPage(1);setActiveView(null); };
+  const clearFilters=()=>{ setSearch("");setFilterDiv("");setFilterPos("");setFilterStatus("");setFilterPayment("");setFilterType("");setFilterWarn(false);setFunnel("");setQueueKey("");setPage(1);setActiveView(null); };
   const applyView=(view)=>{ clearFilters(); Object.entries(view.filters).forEach(([k,v])=>{ const setters={filterDiv:setFilterDiv,filterPos:setFilterPos,filterStatus:setFilterStatus,filterPayment:setFilterPayment,filterType:setFilterType,filterWarn:setFilterWarn}; setters[k]?.(v); }); setActiveView(view.name); };
 
   const handleSave=async(updated)=>{
@@ -1021,7 +1346,24 @@ export default function Players() {
 
       {/* WOW 4, 5 modals */}
       {showDraftPrev&&<DraftPreviewModal players={players} divisions={ALL_DIVISIONS} onClose={()=>setShowDraftPrev(false)}/>}
-      {showDupes&&<DuplicateModal players={players} onClose={()=>setShowDupes(false)}/>}
+      {showInvite&&<RenewalInviteModal targets={inviteTargets} settings={renewSettings} onClose={()=>setShowInvite(false)} onSent={loadInvites}/>}
+      {showDupes&&<DuplicateModal players={players} dismissed={dismissedDupes} onClose={()=>setShowDupes(false)}
+        onMerge={async(keepId,removeId)=>{
+          try{
+            const res=await fetch(`${API}/players/merge`,{method:"POST",headers:{"X-WP-Nonce":NONCE,"Content-Type":"application/json"},body:JSON.stringify({keep_id:keepId,remove_id:removeId})});
+            const d=await res.json().catch(()=>({}));
+            if(!res.ok) return d?.error||d?.message||"Merge failed.";
+            setPlayers(ps=>ps.filter(p=>p.id!==removeId));
+            showToast("✓ Records merged");
+            return "";
+          }catch(e){ return "Network error — nothing was changed."; }
+        }}
+        onDismiss={async(a,b)=>{
+          try{
+            const res=await fetch(`${API}/players/not-duplicate`,{method:"POST",headers:{"X-WP-Nonce":NONCE,"Content-Type":"application/json"},body:JSON.stringify({a,b})});
+            if(res.ok) setDismissedDupes(l=>[...l,Math.min(a,b)+"-"+Math.max(a,b)]);
+          }catch{}
+        }}/>}
       {showEmail&&<BatchEmailModal players={selectedIds.size>0?players.filter(p=>selectedIds.has(p.id)):filtered} onClose={()=>setShowEmail(false)} onSend={handleSendEmail}/>}
 
       {/* #23 Shortcut card */}
@@ -1048,10 +1390,10 @@ export default function Players() {
           {isOffline&&<div style={{ background:"#FEF3C7",border:"1px solid #FDE68A",borderRadius:8,padding:"8px 14px",marginBottom:10,fontFamily:"'DM Mono',monospace",fontSize:11,color:"#92400E",fontWeight:500 }}>⚡ Offline mode — {offlineChanges>0?`${offlineChanges} change${offlineChanges!==1?"s":""} queued for sync`:"changes will sync when back online"}</div>}
 
           {/* WOW 2: Live feed */}
-          {liveCount!==null&&liveCount!==players.length&&(
+          {liveCount!==null&&liveCount>players.length&&(
             <div style={{ background:"#E0F0FF",border:"1px solid #93C5FD",borderRadius:8,padding:"8px 14px",marginBottom:10,fontFamily:"'DM Mono',monospace",fontSize:11,color:"#1A4F8A",fontWeight:500,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
               ← {liveCount-players.length} new registration{liveCount-players.length!==1?"s":""} detected
-              <button style={{ fontFamily:"'DM Mono',monospace",fontSize:10,background:"#1A4F8A",color:"#fff",border:"none",padding:"3px 10px",borderRadius:4,cursor:"pointer" }}>Reload →</button>
+              <button onClick={()=>window.location.reload()} style={{ fontFamily:"'DM Mono',monospace",fontSize:10,background:"#1A4F8A",color:"#fff",border:"none",padding:"3px 10px",borderRadius:4,cursor:"pointer" }}>Reload →</button>
             </div>
           )}
 
@@ -1069,7 +1411,7 @@ export default function Players() {
               <div style={{ display:"inline-block",fontFamily:"'DM Mono',monospace",fontSize:10,fontWeight:500,letterSpacing:".1em",textTransform:"uppercase",background:"#1a1a2e",color:"#D4A017",padding:"3px 12px",borderRadius:99,marginBottom:6 }}>Season 2027</div>
               <h1 style={{ fontFamily:"'Fraunces',serif",fontSize:26,fontWeight:700,color:"#1a1a2e",margin:"0 0 3px",letterSpacing:"-.5px" }}>Players</h1>
               <p style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#aaa",margin:0 }}>
-                Player pool · {players.length} registered
+                Player pool · {regCount} registered{retCount>0&&` · ${retCount} returning`}
                 {/* #24 empty state sync prompt */}
                 {players.length===0&&<a href="#" style={{ marginLeft:8,color:"#1a1a2e",fontWeight:600 }}>Sync from WPForms →</a>}
               </p>
@@ -1148,6 +1490,35 @@ export default function Players() {
                 })}
               </div>
             </div>
+          )}
+
+          {/* Attention queue: what needs a human today */}
+          <AttentionQueue items={queueItems} activeKey={queueKey||(funnel?"funnel_"+funnel:"")}
+            onAction={runQueueAction} onClear={()=>{setQueueKey("");setFunnel("");setPage(1);}} open={queueOpen} setOpen={setQueueOpen}/>
+
+          {/* Scope switcher: who are we looking at? */}
+          {retCount>0&&(
+            <div role="tablist" aria-label="Player scope" style={{ display:"inline-flex",gap:2,background:"#EFEDE6",padding:3,borderRadius:10,marginBottom:12 }}>
+              {[
+                {k:"registered",label:`Registered ${CURRENT_YEAR}`,n:regCount},
+                {k:"returning", label:"Returning (not yet registered)",n:retCount},
+                {k:"all",       label:"All",n:players.length},
+              ].map(t=>(
+                <button key={t.k} role="tab" aria-selected={scope===t.k}
+                  onClick={()=>{setScope(t.k);setPage(1);}}
+                  style={{ fontFamily:"'DM Mono',monospace",fontSize:11,border:"none",cursor:"pointer",padding:"6px 14px",borderRadius:8,
+                    background:scope===t.k?"#1a1a2e":"transparent",color:scope===t.k?"#D4A017":"#555" }}>
+                  {t.label} <span style={{ opacity:.7 }}>{t.n}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Renewal funnel: only when there is a returning cohort */}
+          {cohortTotal>0&&scope!=="registered"&&(
+            <RenewalFunnel counts={funnelCounts} total={cohortTotal} active={funnel}
+              onPick={(k)=>{setFunnel(k);setQueueKey("");setPage(1);}}
+              onInvite={()=>setShowInvite(true)} inviteTargets={inviteTargets.length}/>
           )}
 
           {/* Stats bar — #20 dynamic */}
@@ -1275,8 +1646,8 @@ export default function Players() {
           {/* Results */}
           <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8 }}>
             <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#888" }}>
-              Showing <strong>{Math.min((page-1)*PAGE_SIZE+1,filtered.length)}–{Math.min(page*PAGE_SIZE,filtered.length)}</strong> of <strong>{filtered.length}</strong> players
-              {filtered.length<players.length&&<span style={{ color:"#aaa" }}> · {players.length-filtered.length} hidden by filters</span>}
+              Showing <strong>{filtered.length?(page-1)*pageSize+1:0}–{Math.min(page*pageSize,filtered.length)}</strong> of <strong>{filtered.length}</strong> players
+              {filtered.length<players.length&&<span style={{ color:"#aaa" }}> · {players.length-filtered.length} hidden by {scope!=="all"?"scope/filters":"filters"}</span>}
             </span>
             {selected&&<span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa" }}>↑↓ navigate · Esc close</span>}
           </div>
@@ -1337,7 +1708,7 @@ export default function Players() {
                       onClick={()=>{ setSelected(p); setInlineTierRow(null); }}
                       onKeyDown={e=>e.key==="Enter"&&setSelected(p)}
                       style={{ background:isSelected?"#EEF2FF":p.sandbagging_flag?"#FFFBEB":"transparent",
-                        borderLeft:`3px solid ${isSelected?"#1a1a2e":p.sandbagging_flag?"#F59E0B":p.payment_status==="pending"?"#FDE68A":"transparent"}`,
+                        borderLeft:`3px solid ${isSelected?"#1a1a2e":p.sandbagging_flag?"#F59E0B":(p.registered_this_season!==false&&p.payment_status==="pending")?"#FDE68A":"transparent"}`,
                         cursor:"pointer",transition:"background .1s" }}>
 
                       <td style={TD} onClick={e=>{ e.stopPropagation(); setSelectedIds(prev=>{const n=new Set(prev);n.has(p.id)?n.delete(p.id):n.add(p.id);return n;}); }}>
@@ -1418,12 +1789,17 @@ export default function Players() {
 
                       {/* #18 payment with hierarchy */}
                       {visibleCols.includes("payment")&&<td style={TD}>
-                        <Pill {...payc} small>{p.payment_status||"—"}</Pill>
+                        {p.registered_this_season===false
+                          ? <span title={p.last_played_year?`Played and paid in ${p.last_played_year}. ${CURRENT_YEAR} registration not open or not yet submitted.`:"Not registered for this season"}
+                              style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:p.last_played_year?"#4B5563":"#9CA3AF",background:"#F3F4F6",padding:"2px 8px",borderRadius:99,whiteSpace:"nowrap" }}>
+                              {p.last_played_year?`✓ Paid ’${String(p.last_played_year).slice(-2)}`:"—"}
+                            </span>
+                          : <Pill {...payc} small>{p.payment_status||"—"}</Pill>}
                         {p.comms?.some(c=>c.toLowerCase().includes("payment"))&&<div style={{ fontFamily:"'DM Mono',monospace",fontSize:8,color:"#aaa",marginTop:2 }}>reminded</div>}
                       </td>}
 
                       {visibleCols.includes("status")&&<td style={TD}>
-                        <Pill {...sc} small>{(p.status||"unknown").replace(/_/g," ")}</Pill>
+                        <Pill {...sc} small>{p.registered_this_season===false?`${invites[p.id]?(invites[p.id].opened_at?"opened invite":"invited"):"returning"}${p.last_played_year?` · played ’${String(p.last_played_year).slice(-2)}`:""}`:(p.status||"unknown").replace(/_/g," ")}</Pill>
                       </td>}
 
                       {/* Row arrow on hover */}
@@ -1437,17 +1813,30 @@ export default function Players() {
           </div>
 
           {/* Pagination */}
-          {!loading&&filtered.length>PAGE_SIZE&&(
-            <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 4px" }}>
-              <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#888" }}>
-                Page {page} of {totalPages} · {filtered.length} players
-              </span>
-              <div style={{ display:"flex",gap:6 }}>
+          {!loading&&filtered.length>25&&(()=>{
+            const nums=[]; const add=(n)=>nums.push(n);
+            for(let i=1;i<=totalPages;i++){ if(i===1||i===totalPages||Math.abs(i-page)<=1) add(i); else if(nums[nums.length-1]!=="…") add("…"); }
+            return (
+            <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 4px",gap:12,flexWrap:"wrap" }}>
+              <label style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#888",display:"flex",alignItems:"center",gap:6 }}>
+                Rows per page
+                <select value={pageSize} onChange={e=>{setPageSize(Number(e.target.value));setPage(1);}}
+                  style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#F6F5F0",border:"1px solid #E8E6DF",borderRadius:6,padding:"4px 6px" }}>
+                  {[25,50,100,250].map(n=><option key={n} value={n}>{n}</option>)}
+                </select>
+              </label>
+              <nav aria-label="Pagination" style={{ display:"flex",gap:4,alignItems:"center" }}>
+                <button style={{ ...pageBtn,opacity:page===1?0.4:1 }} disabled={page===1} onClick={()=>setPage(1)} aria-label="First page">«</button>
                 <button style={{ ...pageBtn,opacity:page===1?0.4:1 }} disabled={page===1} onClick={()=>setPage(p=>p-1)}>← Prev</button>
+                {nums.map((n,i)=> n==="…"
+                  ? <span key={"e"+i} style={{ color:"#aaa",padding:"0 4px" }}>…</span>
+                  : <button key={n} aria-current={n===page?"page":undefined} onClick={()=>setPage(n)}
+                      style={{ ...pageBtn,padding:"6px 10px",background:n===page?"#1a1a2e":"#fff",color:n===page?"#D4A017":"#555" }}>{n}</button>)}
                 <button style={{ ...pageBtn,opacity:page===totalPages?0.4:1 }} disabled={page===totalPages} onClick={()=>setPage(p=>p+1)}>Next →</button>
-              </div>
-            </div>
-          )}
+                <button style={{ ...pageBtn,opacity:page===totalPages?0.4:1 }} disabled={page===totalPages} onClick={()=>setPage(totalPages)} aria-label="Last page">»</button>
+              </nav>
+            </div>);
+          })()}
 
         </div>{/* end table side */}
 

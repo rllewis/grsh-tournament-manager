@@ -364,9 +364,21 @@ class GRSH_Field_Mapper {
                 ? reset( $raw_values )
                 : $raw_values;
 
-            // Apply subkey (name field)
-            if ( isset( $map['subkey'] ) && is_array( $raw ) ) {
-                $raw = $raw[ $map['subkey'] ] ?? null;
+            // Apply subkey (name field).
+            // The sync engine passes name fields as ['value'=>'First Last','first'=>..,'last'=>..],
+            // so read the dedicated subkey from the field struct first. Without this, both
+            // first_name and last_name received the full name ("Brian Farley Brian Farley").
+            if ( isset( $map['subkey'] ) ) {
+                $struct = $entry['fields'][ $map['field_id'] ?? '' ] ?? null;
+                if ( is_array( $struct ) && isset( $struct[ $map['subkey'] ] ) && $struct[ $map['subkey'] ] !== '' ) {
+                    $raw = $struct[ $map['subkey'] ];
+                } elseif ( is_array( $raw ) ) {
+                    $raw = $raw[ $map['subkey'] ] ?? null;
+                } elseif ( is_string( $raw ) && $raw !== '' ) {
+                    // Plain "First Last" string: split on first space.
+                    $parts = explode( ' ', trim( $raw ), 2 );
+                    $raw   = $map['subkey'] === 'first' ? ( $parts[0] ?? '' ) : ( $parts[1] ?? '' );
+                }
             }
 
             // Apply transform

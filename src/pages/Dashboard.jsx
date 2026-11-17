@@ -1,837 +1,368 @@
-import { useState, useEffect, useRef } from "react";
+// Dashboard.jsx — v3
+// Every number on this page comes from the server (GET /dashboard and GET /sync/status). There is no mock data:
+// if something cannot be measured it shows "—", and if a request fails the card says so and offers a retry.
+//
+// Includes: do-this-next card · readiness with counts and an explanation · click-through everywhere ·
+//           last-sync status · tournament date + milestones · per-division capacity, goalies, stage and links ·
+//           real flags, recent registrations and activity · print summary · refreshes when you return to the tab.
+
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { readiness, BAND, bandFor, fmtPct, ago, daysUntil, prettyDate, actionLabel, nextActions, fillState, num } from "../lib/dashboardEngine";
 
 const API   = window.grshConfig?.apiUrl || "/wp-json/grsh/v1";
 const NONCE = window.grshConfig?.nonce  || "";
-const USER  = window.grshConfig?.userDisplay || "Committee";
 
-// ─── Data fetchers ────────────────────────────────────────────────────────────
-async function apiFetch(path, opts = {}) {
+const F_HEAD = "'Fraunces',Georgia,serif";
+const F_NUM  = "'DM Mono',monospace";
+const F_UI   = "system-ui,-apple-system,'Segoe UI',Roboto,sans-serif";
+const INK = "#1a1a2e", MUTED = "#555566", SOFT = "#6b6b7b", LINE = "#E2E0D8", PAPER = "#F6F5F0", GOLD = "#D4A017", WHITE = "#fff";
+
+const adminUrl = (page, params = "") => `/wp-admin/admin.php?page=${page}${params ? (params[0] === "?" ? "&" + params.slice(1) : params) : ""}`;
+
+async function api(path, opts = {}) {
   try {
-    const r = await fetch(`${API}${path}`, { headers: { "X-WP-Nonce": NONCE }, ...opts });
-    return r.ok ? r.json() : null;
-  } catch { return null; }
+    const r = await fetch(`${API}${path}`, { credentials: "same-origin", ...opts, headers: { "Content-Type": "application/json", "X-WP-Nonce": NONCE, ...(opts.headers || {}) } });
+    let json = null; try { json = await r.json(); } catch (e) { /* not JSON */ }
+    if (!r.ok) return { ok: false, error: (json && (json.error || json.message)) || `The server answered ${r.status}.`, status: r.status };
+    return { ok: true, data: json };
+  } catch (e) { return { ok: false, error: "Could not reach the server. Check your connection." }; }
 }
 
-// ─── Mock data ────────────────────────────────────────────────────────────────
-const MOCK_STATUS = {
-  season:2027, total_entries:84, total_imported:81, unsynced:3,
-  unpaid:7, subs:12, warnings:2, goalies:15,
-  approved:68, draft_eligible:52, teams_created:4, season_status:"open",
-  last_synced:"8 min ago", tournament_date:"2027-04-09",
-  cap_per_division:30,
+const card = { background: WHITE, border: `1px solid ${LINE}`, borderRadius: 12 };
+const btn = (kind = "ghost", extra = {}) => ({
+  fontFamily: F_UI, fontSize: 14, fontWeight: 600, padding: "8px 14px", borderRadius: 8, cursor: "pointer", lineHeight: 1.2, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6,
+  border: kind === "primary" ? `1px solid ${INK}` : `1px solid ${LINE}`, background: kind === "primary" ? INK : WHITE, color: kind === "primary" ? WHITE : INK, ...extra,
+});
+const SEV = { high: { bg: "#FEE2E2", color: "#991B1B", label: "Urgent" }, medium: { bg: "#FEF3C7", color: "#92400E", label: "Soon" }, low: { bg: "#E0F2FE", color: "#075985", label: "When ready" } };
+const STAGE = { draft: { label: "Drafting", bg: "#F3F4F6", color: "#4B5563" }, locked: { label: "Locked", bg: "#FEF3C7", color: "#92400E" }, published: { label: "Published", bg: "#DCFCE7", color: "#166534" } };
+
+function Card({ title, right, children, id, error, onRetry, pad = true }) {
+  return (
+    <section id={id} style={{ ...card, marginBottom: 16, overflow: "hidden" }}>
+      {(title || right) && <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "12px 18px", borderBottom: `1px solid ${LINE}` }}>
+        <h2 style={{ margin: 0, fontFamily: F_UI, fontSize: 15, fontWeight: 700, color: INK }}>{title}</h2>{right}
+      </div>}
+      {error ? <div role="alert" style={{ padding: 16, color: "#991B1B", fontSize: 14 }}>{error} {onRetry && <button style={btn("ghost", { marginLeft: 8, padding: "4px 10px" })} onClick={onRetry}>Retry</button>}</div>
+        : <div style={pad ? { padding: 18 } : {}}>{children}</div>}
+    </section>
+  );
+}
+
+function Gauge({ score, basis, total }) {
+  const band = BAND[bandFor(score)];
+  const r = 64, c = 2 * Math.PI * r, arc = c * 0.75, dash = score === null ? 0 : (score / 100) * arc;
+  return (
+    <div style={{ textAlign: "center", flexShrink: 0, width: 190 }}>
+      <svg width="170" height="150" viewBox="0 0 170 150" role="img" aria-label={score === null ? "Readiness not measurable yet" : `Readiness ${score} out of 100, ${band.label}`}>
+        <g transform="rotate(135 85 85)">
+          <circle cx="85" cy="85" r={r} fill="none" stroke="#EEECE4" strokeWidth="12" strokeDasharray={`${arc} ${c - arc}`} strokeLinecap="round" />
+          <circle cx="85" cy="85" r={r} fill="none" stroke={band.ring} strokeWidth="12" strokeDasharray={`${dash} ${c - dash}`} strokeLinecap="round" />
+        </g>
+        <text x="85" y="88" textAnchor="middle" style={{ fontFamily: F_HEAD, fontSize: 40, fontWeight: 700, fill: band.color }}>{score === null ? "—" : score}</text>
+        <text x="85" y="108" textAnchor="middle" style={{ fontFamily: F_NUM, fontSize: 12, fill: SOFT }}>{score === null ? "" : "out of 100"}</text>
+      </svg>
+      <div style={{ fontFamily: F_UI, fontWeight: 700, fontSize: 14, color: band.color, marginTop: -6 }}>{band.label}</div>
+      <div style={{ fontFamily: F_UI, fontSize: 12, color: SOFT, marginTop: 2 }}>{basis === 0 ? "Nothing to measure yet" : `Based on ${basis} of ${total} measures`}</div>
+    </div>
+  );
+}
+
+const ROW_LINK = { registration: "grsh-tm-players", payments: "grsh-tm-players", approvals: "grsh-tm-players", rosters: "grsh-tm-rosters" };
+const ROW_NOTE = {
+  registration: (r, m) => (m ? `${r.have} registered · minimum needed ${r.of} · room for ${m.room} more` : ""),
+  payments: (r) => `${r.have} of ${r.of} paid or waived`,
+  approvals: (r) => `${r.have} of ${r.of} approved`,
+  rosters: (r) => `${r.have} of ${r.of} teams have enough players and a goalie`,
 };
-const MOCK_DIVISIONS = [
-  { name:"Gold Open",  slug:"gold_open", color:"#D4A017", registered:22, paid:20, subs:3, goalies:4, cap:30,
-    tiers:{ A:4, B:8, C:6, R:4 }, prior_year:20, unpaid:2 },
-  { name:"45A",        slug:"45a",       color:"#2196a8", registered:19, paid:17, subs:3, goalies:3, cap:24,
-    tiers:{ A:1, B:5, C:8, R:5 }, prior_year:21, unpaid:2 },
-  { name:"Senior B",   slug:"senior_b",  color:"#7B5EA7", registered:26, paid:25, subs:4, goalies:5, cap:32,
-    tiers:{ A:0, B:6, C:12, R:8 }, prior_year:24, unpaid:1 },
-  { name:"Senior C",   slug:"senior_c",  color:"#B05E3A", registered:17, paid:16, subs:2, goalies:3, cap:24,
-    tiers:{ A:0, B:2, C:8, R:7 }, prior_year:19, unpaid:1 },
-];
-const MOCK_WARNINGS = [
-  { id:1, type:"sandbagging", player:"Mike Hartley",  detail:"Tier A2 requested Senior C",  time:"2h ago", link:"grsh-tm-players" },
-  { id:2, type:"sandbagging", player:"Dave Kowalski", detail:"Tier B1 requested Senior B",  time:"5h ago", link:"grsh-tm-players" },
-];
-const MOCK_RECENT = [
-  { id:81, name:"Chris Fontaine",  type:"primary", division:"Gold Open", position:"Winger",     status:"paid",    time:"12m ago" },
-  { id:80, name:"Sarah Mitchell",  type:"primary", division:"45A",       position:"Defense",    status:"paid",    time:"34m ago" },
-  { id:79, name:"Tom Breslin",     type:"sub",     division:"Senior B",  position:"—",          status:"waived",  time:"1h ago"  },
-  { id:78, name:"Janet Ruiz",      type:"primary", division:"Senior C",  position:"Goaltender", status:"pending", time:"2h ago"  },
-  { id:77, name:"Paul Nguyen",     type:"primary", division:"Gold Open", position:"Center",     status:"paid",    time:"3h ago"  },
-];
-const MOCK_ACTIVITY = [
-  { action:"Tier override", detail:"A2→B1 · Mike Hartley", user:"Lorenzo", time:"2h ago" },
-  { action:"Player approved", detail:"Sarah Mitchell", user:"Lorenzo", time:"3h ago" },
-  { action:"Sync completed", detail:"3 new registrations", user:"System", time:"4h ago" },
-  { action:"Warning flagged", detail:"Dave Kowalski sandbagging", user:"System", time:"5h ago" },
-];
-const DIV_COLOR = { "Gold Open":"#D4A017","45A":"#2196a8","Senior B":"#7B5EA7","Senior C":"#B05E3A" };
-const STATUS_STYLE = {
-  paid:   { bg:"#E6F4EA",color:"#1E6B3A" },
-  pending:{ bg:"#FEF3C7",color:"#92400E" },
-  waived: { bg:"#EDE9FE",color:"#4C1D95" },
-};
+const ROW_NOTE_EMPTY = { registration: "Set teams and roster sizes in Settings to measure this.", payments: "No registered players yet.", approvals: "No registered players yet.", rosters: "No teams created yet." };
 
-// ─── Tournament Readiness Score — WOW FEATURE ────────────────────────────────
-function computeReadiness(status, divisions) {
-  const regPct = Math.min(100,
-    divisions.reduce((s,d)=>s+d.registered,0) /
-    Math.max(1, divisions.reduce((s,d)=>s+(d.cap||30),0)) * 100
-  );
-  const payPct = status.total_imported > 0
-    ? Math.round(((status.total_imported - status.unpaid) / status.total_imported) * 100) : 0;
-  const appPct = status.total_imported > 0
-    ? Math.round((status.approved / Math.max(1, status.total_imported)) * 100) : 0;
-  const rosterPct = status.teams_created > 0 ? Math.min(100,
-    (status.goalies / Math.max(1, status.teams_created)) >= 1 ? 100 : 50
-  ) : 0;
-  const score = Math.round(regPct*0.30 + payPct*0.25 + appPct*0.25 + rosterPct*0.20);
-  return {
-    score, regPct, payPct, appPct, rosterPct,
-    label: score >= 90?"Tournament ready":score>=70?"On track":score>=50?"Needs attention":"Getting started",
-    color: score>=90?"#166534":score>=70?"#1a1a2e":score>=50?"#92400E":"#991B1B",
-    ring:  score>=90?"#22c55e":score>=70?"#1a1a2e":score>=50?"#f59e0b":"#ef4444",
-  };
-}
-
-function ReadinessGauge({ score, ring, label, color, drivers, animating }) {
-  const r = 72, cx = 96, cy = 96;
-  const circ = 2 * Math.PI * r;
-  const dash  = (score / 100) * circ * 0.75;
-  const gap   = circ - dash;
-  const rotate = -225;
-
-  return (
-    <div style={{ display:"flex",alignItems:"center",gap:32,padding:"24px 28px",
-      background:"#fff",border:"1px solid #E8E6DF",borderRadius:16,marginBottom:24 }}>
-      {/* Gauge */}
-      <div style={{ position:"relative",flexShrink:0 }}>
-        <svg width="192" height="192" viewBox="0 0 192 192">
-          <circle cx={cx} cy={cy} r={r} fill="none" stroke="#F0EEE8" strokeWidth="12"
-            strokeDasharray={`${circ*0.75} ${circ*0.25}`}
-            strokeDashoffset={circ*0.375}
-            strokeLinecap="round"
-            transform={`rotate(${rotate} ${cx} ${cy})`}/>
-          <circle cx={cx} cy={cy} r={r} fill="none" stroke={ring} strokeWidth="12"
-            strokeDasharray={`${animating?0:dash} ${gap+circ*0.25}`}
-            strokeDashoffset={circ*0.375}
-            strokeLinecap="round"
-            transform={`rotate(${rotate} ${cx} ${cy})`}
-            style={{ transition:"stroke-dasharray 1.4s cubic-bezier(.4,0,.2,1)" }}/>
-          <text x={cx} y={cy-8} textAnchor="middle"
-            style={{ fontFamily:"'Fraunces',serif",fontSize:36,fontWeight:700,fill:color }}>
-            {animating?0:score}
-          </text>
-          <text x={cx} y={cx+18} textAnchor="middle"
-            style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fill:"#aaa" }}>
-            / 100
-          </text>
-        </svg>
-        <div style={{ position:"absolute",bottom:16,left:0,right:0,textAlign:"center",
-          fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:500,color }}>
-          {label}
-        </div>
-      </div>
-
-      {/* Drivers */}
-      <div style={{ flex:1 }}>
-        <div style={{ fontFamily:"'Fraunces',serif",fontSize:18,fontWeight:700,
-          color:"#1a1a2e",marginBottom:4 }}>Tournament Readiness</div>
-        <div style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#aaa",marginBottom:16 }}>
-          Composite score across 4 key metrics
-        </div>
-        <div style={{ display:"flex",flexDirection:"column",gap:10 }}>
-          {drivers.map(d => {
-            const dc = d.pct>=90?"#166534":d.pct>=70?"#1a1a2e":d.pct>=50?"#92400E":"#991B1B";
-            return (
-              <div key={d.label}>
-                <div style={{ display:"flex",justifyContent:"space-between",marginBottom:4 }}>
-                  <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#555" }}>
-                    {d.label}
-                  </span>
-                  <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:600,color:dc }}>
-                    {d.pct}%
-                    <span style={{ fontWeight:400,color:"#aaa",marginLeft:4 }}>({d.weight})</span>
-                  </span>
-                </div>
-                <div style={{ height:5,background:"#F0EEE8",borderRadius:99,overflow:"hidden" }}>
-                  <div style={{ height:"100%",background:dc,borderRadius:99,
-                    width:`${animating?0:d.pct}%`,transition:"width 1.4s cubic-bezier(.4,0,.2,1)" }}/>
-                </div>
-                {d.action && (
-                  <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#92400E",marginTop:2 }}>
-                    → {d.action}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Countdown chip ───────────────────────────────────────────────────────────
-function Countdown({ dateStr }) {
-  const days = Math.max(0, Math.ceil((new Date(dateStr)-new Date())/(1000*60*60*24)));
-  const urgent = days <= 30;
-  return (
-    <div style={{ display:"inline-flex",alignItems:"center",gap:6,
-      background:urgent?"#FEF3C7":"#F6F5F0",
-      border:`1px solid ${urgent?"#FDE68A":"#E8E6DF"}`,
-      borderRadius:99,padding:"4px 12px",cursor:"default" }}>
-      <span style={{ fontFamily:"'Fraunces',serif",fontSize:14,fontWeight:700,
-        color:urgent?"#92400E":"#1a1a2e" }}>{days}</span>
-      <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,
-        color:urgent?"#92400E":"#888" }}>days to tournament</span>
-    </div>
-  );
-}
-
-// ─── Priority banner ──────────────────────────────────────────────────────────
-function PriorityBanner({ status, warnings }) {
-  const items = [];
-  if (status.unpaid > 0)    items.push(`${status.unpaid} players unpaid`);
-  if (status.unsynced > 0)  items.push(`${status.unsynced} unsynced entries`);
-  if (warnings.length > 0)  items.push(`${warnings.length} sandbagging flags`);
-  if (items.length === 0) return (
-    <div style={{ background:"#F0FDF4",border:"1px solid #86EFAC",borderRadius:10,
-      padding:"10px 18px",marginBottom:16,
-      fontFamily:"'DM Mono',monospace",fontSize:12,color:"#166534" }}>
-      ✓ All clear — no items require attention today
-    </div>
-  );
-  return (
-    <div style={{ background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,
-      padding:"10px 18px",marginBottom:16,
-      display:"flex",alignItems:"center",gap:12,flexWrap:"wrap" }}>
-      <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#92400E",fontWeight:500 }}>
-        Needs attention:
-      </span>
-      {items.map((item,i) => (
-        <span key={i} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,
-          background:"#FEF3C7",color:"#92400E",padding:"2px 10px",
-          borderRadius:99,border:"1px solid #FDE68A" }}>
-          {item}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-// ─── Draft readiness pipeline ─────────────────────────────────────────────────
-function DraftPipeline({ status }) {
-  const steps = [
-    { label:"Registration",  done: status.season_status !== "open" || status.total_imported > 50,
-      link:"grsh-tm-players",    sub:`${status.total_imported} registered` },
-    { label:"Players approved", done: status.approved >= status.total_imported * 0.9,
-      link:"grsh-tm-players",    sub:`${status.approved||0} of ${status.total_imported}` },
-    { label:"Teams created",    done: status.teams_created > 0,
-      link:"grsh-tm-rosters",    sub:`${status.teams_created||0} teams` },
-    { label:"Draft complete",   done: false,
-      link:"grsh-tm-draft",      sub:"Not started" },
-  ];
-  return (
-    <div style={{ background:"#fff",border:"1px solid #E8E6DF",borderRadius:12,
-      padding:"16px 20px",marginBottom:24 }}>
-      <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa",
-        textTransform:"uppercase",letterSpacing:".08em",marginBottom:14 }}>
-        Draft readiness pipeline
-      </div>
-      <div style={{ display:"flex",alignItems:"center" }}>
-        {steps.map((step,i) => (
-          <div key={step.label} style={{ display:"flex",alignItems:"center",flex:i<steps.length-1?1:"none" }}>
-            <a href={`/wp-admin/admin.php?page=${step.link}`}
-              style={{ textDecoration:"none",display:"flex",flexDirection:"column",alignItems:"center",minWidth:100 }}>
-              <div style={{
-                width:28,height:28,borderRadius:"50%",
-                background:step.done?"#166534":"#F0EEE8",
-                border:`2px solid ${step.done?"#166534":"#D0CEC6"}`,
-                display:"flex",alignItems:"center",justifyContent:"center",
-                fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:600,
-                color:step.done?"#fff":"#bbb",marginBottom:4,
-              }}>{step.done?"✓":i+1}</div>
-              <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,
-                color:step.done?"#166534":"#888",fontWeight:step.done?600:400,
-                textAlign:"center",lineHeight:1.3 }}>{step.label}</div>
-              <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,
-                color:"#bbb",textAlign:"center" }}>{step.sub}</div>
-            </a>
-            {i < steps.length-1 && (
-              <div style={{ height:2,flex:1,margin:"0 8px",marginBottom:28,
-                background:step.done?"#22c55e":"#E8E6DF" }}/>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── First-run setup checklist ────────────────────────────────────────────────
-function SetupChecklist() {
-  return (
-    <div style={{ background:"#EEF2FF",border:"1px solid #C7D2FE",borderRadius:12,
-      padding:"20px 24px",marginBottom:24 }}>
-      <div style={{ fontFamily:"'Fraunces',serif",fontSize:16,fontWeight:700,
-        color:"#1a1a2e",marginBottom:4 }}>Welcome — let's get started</div>
-      <div style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#555",marginBottom:16 }}>
-        Complete these steps to prepare the 2027 tournament
-      </div>
-      {[
-        { n:1, label:"Import player history (2021–2025)",  link:"grsh-tm-history-import",   done:false },
-        { n:2, label:"Open WPForms registration form",     link:"grsh-tm-settings",         done:false },
-        { n:3, label:"Sync registrations from WPForms",    link:"grsh-tm-dashboard",         done:false },
-        { n:4, label:"Approve all registered players",     link:"grsh-tm-players",           done:false },
-        { n:5, label:"Create teams and run draft",         link:"grsh-tm-draft",             done:false },
-      ].map(step => (
-        <div key={step.n} style={{ display:"flex",alignItems:"center",gap:10,
-          padding:"8px 0",borderBottom:"1px solid #C7D2FE" }}>
-          <div style={{ width:22,height:22,borderRadius:"50%",
-            background:step.done?"#166534":"#E8E6DF",
-            display:"flex",alignItems:"center",justifyContent:"center",
-            fontFamily:"'DM Mono',monospace",fontSize:10,fontWeight:600,
-            color:step.done?"#fff":"#888",flexShrink:0 }}>
-            {step.done?"✓":step.n}
-          </div>
-          <a href={`/wp-admin/admin.php?page=${step.link}`}
-            style={{ fontFamily:"'DM Mono',monospace",fontSize:12,
-              color:"#1a1a2e",textDecoration:"none",flex:1 }}>
-            {step.label}
-          </a>
-          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa" }}>→</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ─── Main Dashboard ───────────────────────────────────────────────────────────
 export default function Dashboard() {
-  const [status,    setStatus]    = useState(MOCK_STATUS);
-  const [divisions, setDivisions] = useState(MOCK_DIVISIONS);
-  const [syncing,   setSyncing]   = useState(false);
-  const [syncResult,setSyncResult]= useState(null);
-  const [lastSync,  setLastSync]  = useState(MOCK_STATUS.last_synced);
-  const [gaugeAnim, setGaugeAnim] = useState(true);
-  const [showSearch,setShowSearch]= useState(false);
-  const [search,    setSearch]    = useState("");
-  const isFirstRun = status.total_imported === 0;
+  const [dash, setDash]       = useState(null);
+  const [dashErr, setDashErr] = useState("");
+  const [sync, setSync]       = useState(null);     // /sync/status
+  const [syncErr, setSyncErr] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [result, setResult]   = useState(null);
+  const [dateEdit, setDateEdit] = useState(false);
+  const [dateVal, setDateVal] = useState("");
+  const [dateMsg, setDateMsg] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const [fetchedAt, setFetchedAt] = useState(0);
+  const busy = useRef(false);
 
-  useEffect(() => {
-    apiFetch("/sync/status").then(d => { if(d) { setStatus(d); setLastSync(d.last_synced||"—"); }});
-    apiFetch("/history/division-breakdown").then(d => { if(d) setDivisions(d); });
-    setTimeout(()=>setGaugeAnim(false), 100);
+  const load = useCallback(async () => {
+    const [a, b] = await Promise.all([api("/dashboard"), api("/sync/status")]);
+    if (a.ok) { setDash(a.data); setDashErr(""); } else setDashErr(a.error);
+    if (b.ok) { setSync(b.data); setSyncErr(""); } else setSyncErr(b.error);
+    setFetchedAt(Date.now()); setLoading(false);
   }, []);
 
-  const handleSync = async () => {
-    setSyncing(true); setSyncResult(null);
-    const r = await apiFetch("/sync",{method:"POST"});
-    if(r) setSyncResult(r);
-    const d = await apiFetch("/sync/status");
-    if(d) { setStatus(d); setLastSync("just now"); }
-    setSyncing(false);
+  useEffect(() => { load(); }, [load]);
+  // refresh when you come back to the tab, so you never act on a view that is hours old
+  useEffect(() => {
+    const h = () => { if (document.visibilityState === "visible" && Date.now() - fetchedAt > 60000) load(); };
+    document.addEventListener("visibilitychange", h); return () => document.removeEventListener("visibilitychange", h);
+  }, [fetchedAt, load]);
+
+  const doSync = async () => {
+    if (busy.current) return;                 // a double click must not start a second import
+    busy.current = true; setSyncing(true); setResult(null);
+    const r = await api("/sync", { method: "POST" });
+    setResult(r.ok ? { ok: !(r.data.errors && r.data.errors.length), data: r.data } : { ok: false, error: r.error });
+    await load(); setSyncing(false); busy.current = false;
   };
 
-  const pct = status.total_entries > 0
-    ? Math.round((status.total_imported / status.total_entries) * 100) : 0;
+  const saveDate = async (v) => {
+    setDateMsg("");
+    const r = await api("/dashboard/tournament-date", { method: "POST", body: JSON.stringify({ date: v }) });
+    if (r.ok) { setDash(r.data); setDateEdit(false); } else setDateMsg(r.error);
+  };
 
-  const ready = computeReadiness(status, divisions);
+  const ready = useMemo(() => readiness(dash && dash.metrics), [dash]);
+  const actions = useMemo(() => nextActions(dash, { unsynced: sync ? sync.unsynced : null }), [dash, sync]);
+  const days = dash ? daysUntil(dash.tournament_date) : null;
+  const goTo = (page, params) => { window.location.href = adminUrl(page, params); };
 
-  const readinessDrivers = [
-    { label:"Registration fill rate", pct:Math.round(ready.regPct), weight:"30%",
-      action: ready.regPct < 80 ? "Registration not yet full" : null },
-    { label:"Payment completion",     pct:Math.round(ready.payPct), weight:"25%",
-      action: status.unpaid > 0 ? `${status.unpaid} players still unpaid` : null },
-    { label:"Player approvals",       pct:Math.round(ready.appPct), weight:"25%",
-      action: ready.appPct < 90 ? "Review players page" : null },
-    { label:"Roster readiness",       pct:Math.round(ready.rosterPct), weight:"20%",
-      action: status.teams_created === 0 ? "No teams created yet" : null },
+  if (loading) return <div style={{ padding: 40, fontFamily: F_UI, color: MUTED }}>Loading the dashboard…</div>;
+
+  const t = dash ? dash.totals : null;
+  const stats = [
+    { label: "Form entries", value: sync ? sync.total_entries : null, sub: "submitted in WPForms", page: "grsh-tm-players", color: INK, err: syncErr },
+    { label: "Waiting to import", value: sync ? sync.unsynced : null, sub: sync && sync.unsynced > 0 ? "press Sync to bring them in" : "everything is imported", color: sync && sync.unsynced > 0 ? "#6B21A8" : "#166534", err: syncErr, onClick: () => document.getElementById("sync-btn") && document.getElementById("sync-btn").focus() },
+    { label: "Registered players", value: t ? t.registered : null, sub: "counted toward the tournament", page: "grsh-tm-players", color: INK, err: dashErr },
+    { label: "Unpaid", value: t ? t.unpaid : null, sub: t && t.unpaid > 0 ? "payment still pending" : "nobody owes", page: "grsh-tm-players", color: t && t.unpaid > 0 ? "#92400E" : "#166534", err: dashErr },
+    { label: "Alternates", value: t ? t.alternates : null, sub: "signed up as subs", page: "grsh-tm-alternates", color: "#1E3A8A", err: dashErr },
+    { label: "Sandbagging flags", value: t ? t.sandbagging_flags : null, sub: t && t.sandbagging_flags > 0 ? "need a committee decision" : "none to review", page: "grsh-tm-players", color: t && t.sandbagging_flags > 0 ? "#991B1B" : "#166534", err: dashErr },
   ];
 
-  const navigate = (slug) => {
-    window.location.href = `/wp-admin/admin.php?page=${slug}`;
-  };
-
   return (
-    <div style={{ fontFamily:"'Fraunces',Georgia,serif",background:"#F6F5F0",
-      minHeight:"100vh",padding:"24px 28px 60px",maxWidth:1300 }}>
+    <div style={{ fontFamily: F_UI, color: INK, padding: "20px 24px 60px", maxWidth: 1300 }}>
       <style>{`
-        @keyframes spin{to{transform:rotate(360deg)}}
-        @media(max-width:768px){
-          .dash-stats{grid-template-columns:repeat(2,1fr)!important}
-          .dash-two-col{grid-template-columns:1fr!important}
-          .dash-div-grid{grid-template-columns:1fr 1fr!important}
-          .dash-header{flex-direction:column!important;gap:12px!important}
-        }
-        .metric-card:hover{background:#FAFAF8!important;cursor:pointer}
-        .div-card:hover{background:#FAFAF8!important;cursor:pointer}
-        .quick-btn:hover{background:#1a1a2e!important;color:#D4A017!important}
-        .warn-row:hover{background:#FFF7ED!important}
-        .recent-row:hover{background:#FAFAF8!important}
+        .grsh-card-link:hover{background:#FAFAF8!important}
+        .grsh-card-link:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid ${GOLD};outline-offset:2px}
+        @media(max-width:900px){.grsh-two{grid-template-columns:1fr!important}.grsh-ready{flex-direction:column!important;align-items:stretch!important}}
+        @media print{body *{visibility:hidden!important}.grsh-printable,.grsh-printable *{visibility:visible!important}.grsh-printable{position:absolute;left:0;top:0;width:100%}.grsh-noprint{display:none!important}}
       `}</style>
 
-      {/* ── HEADER — #2 #4 #13 #22 #28 compressed, descriptive, search ──── */}
-      <div className="dash-header" style={{ display:"flex",justifyContent:"space-between",
-        alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10 }}>
-        <div style={{ display:"flex",alignItems:"center",gap:12,flexWrap:"wrap" }}>
-          {/* #11 season status in pill */}
-          <div style={{ display:"inline-flex",alignItems:"center",gap:6,
-            background:"#1a1a2e",borderRadius:99,padding:"4px 12px" }}>
-            <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,
-              fontWeight:500,color:"#D4A017",letterSpacing:".08em" }}>
-              SEASON 2027
+      <div className="grsh-printable">
+        {/* header */}
+        <header style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+          <span style={{ background: INK, color: GOLD, fontFamily: F_NUM, fontSize: 12, letterSpacing: ".06em", borderRadius: 99, padding: "4px 12px" }}>
+            SEASON {dash ? dash.season.year : "—"}{dash && dash.season.status ? ` · ${dash.season.status.toUpperCase()}` : ""}
+          </span>
+          <h1 style={{ margin: 0, fontFamily: F_HEAD, fontSize: 28 }}>{dash ? `Season ${dash.season.year} Overview` : "Season Overview"}</h1>
+          {days !== null ? (
+            <span title={prettyDate(dash.tournament_date)} style={{ background: days <= 30 && days >= 0 ? "#FEF3C7" : PAPER, border: `1px solid ${LINE}`, borderRadius: 99, padding: "4px 12px", fontSize: 13 }}>
+              <b style={{ fontFamily: F_HEAD, fontSize: 16 }}>{Math.abs(days)}</b> day{Math.abs(days) === 1 ? "" : "s"} {days >= 0 ? "to" : "since"} the tournament
             </span>
-            <span style={{ width:6,height:6,borderRadius:"50%",
-              background:status.season_status==="open"?"#22c55e":"#aaa",
-              display:"inline-block" }}/>
-            <span style={{ fontFamily:"'DM Mono',monospace",fontSize:9,
-              color:"#D4A017",textTransform:"uppercase" }}>
-              {status.season_status||"open"}
+          ) : dash && <a href="#dates" className="grsh-noprint" style={{ fontSize: 13, color: "#92400E" }}>Set the tournament date</a>}
+          <span style={{ flex: 1 }} />
+          <div className="grsh-noprint" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13, color: dash && dash.sync_failures_7d > 0 ? "#991B1B" : SOFT }} id="sync">
+              {dash && dash.last_sync ? `Last import ${dash.last_sync.ok ? "succeeded" : "FAILED"} ${ago(dash.last_sync.at, dash.server_now)}${dash.last_sync.by ? ` (${dash.last_sync.by})` : ""}` : "No import has run yet"}
             </span>
+            <button id="sync-btn" style={btn("primary", { opacity: syncing ? 0.7 : 1 })} disabled={syncing} onClick={doSync}>{syncing ? "Importing…" : "Sync from WPForms"}</button>
+            <button style={btn()} onClick={() => window.print()}>Print summary</button>
           </div>
-          {/* #30 title renamed */}
-          <h1 style={{ fontFamily:"'Fraunces',serif",fontSize:24,fontWeight:700,
-            color:"#1a1a2e",margin:0 }}>Season 2027 Overview</h1>
-          {/* #5 countdown */}
-          <Countdown dateStr={status.tournament_date||"2027-04-09"} />
-        </div>
+        </header>
 
-        <div style={{ display:"flex",alignItems:"center",gap:8,flexWrap:"wrap" }}>
-          {/* #23 search */}
-          {showSearch && (
-            <input autoFocus value={search}
-              onChange={e=>setSearch(e.target.value)}
-              onBlur={()=>{if(!search)setShowSearch(false)}}
-              placeholder="Search players, registrations…"
-              onKeyDown={e=>{if(e.key==="Enter"&&search){navigate(`grsh-tm-players`);setShowSearch(false);}}}
-              style={{ fontFamily:"'DM Mono',monospace",fontSize:12,
-                background:"#fff",border:"1px solid #E8E6DF",borderRadius:8,
-                padding:"7px 12px",outline:"none",width:240,color:"#333" }}/>
+        <div role="status" aria-live="polite">
+          {result && (
+            <div style={{ ...card, padding: "10px 16px", marginBottom: 14, borderColor: result.ok ? "#86EFAC" : "#FCA5A5", background: result.ok ? "#F0FDF4" : "#FEF2F2", color: result.ok ? "#166534" : "#991B1B", fontSize: 14 }}>
+              {result.error ? `Import did not run: ${result.error}`
+                : result.ok ? (result.data.message && !result.data.imported ? result.data.message : `Import complete — ${num(result.data.imported) ?? 0} new registration${result.data.imported === 1 ? "" : "s"} added.`)
+                : `Import finished with problems — ${num(result.data.imported) ?? 0} added, ${num(result.data.skipped) ?? 0} skipped. See Recent activity for the reasons.`}
+            </div>
           )}
-          <button onClick={()=>setShowSearch(s=>!s)} style={{
-            fontFamily:"'DM Mono',monospace",fontSize:12,background:"#fff",
-            border:"1px solid #E8E6DF",color:"#666",padding:"7px 12px",
-            borderRadius:8,cursor:"pointer" }}>
-            ⌕
-          </button>
-          {/* #12 last synced + refresh */}
-          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa",
-            padding:"7px 0" }}>
-            Synced {lastSync}
-          </span>
-          {/* #4 button renamed */}
-          <button onClick={handleSync} disabled={syncing}
-            style={{ fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:500,
-              background:"#1a1a2e",color:"#D4A017",border:"none",
-              padding:"8px 16px",borderRadius:8,cursor:"pointer",
-              opacity:syncing?0.7:1,display:"flex",alignItems:"center",gap:6 }}>
-            <span style={{ display:"inline-block",
-              animation:syncing?"spin 1s linear infinite":"none" }}>⟳</span>
-            {syncing?"Syncing…":"Sync from WPForms"}
-          </button>
-          {/* #28 export dropdown */}
-          <button onClick={()=>navigate("grsh-tm-players")}
-            style={{ fontFamily:"'DM Mono',monospace",fontSize:12,background:"#F6F5F0",
-              border:"1px solid #E8E6DF",color:"#666",padding:"8px 12px",
-              borderRadius:8,cursor:"pointer" }}>↓ Export</button>
         </div>
-      </div>
 
-      {/* Sync result banner */}
-      {syncResult && (
-        <div style={{ border:`1px solid ${syncResult.errors?.length?"#FCA5A5":"#86EFAC"}`,
-          background:syncResult.errors?.length?"#FEF2F2":"#F0FDF4",
-          borderRadius:10,padding:"10px 18px",marginBottom:14,
-          fontFamily:"'DM Mono',monospace",fontSize:12,
-          color:syncResult.errors?.length?"#991B1B":"#166534" }}>
-          {syncResult.errors?.length
-            ? `Import completed with errors — ${syncResult.skipped} skipped.`
-            : `✓ Import complete — ${syncResult.imported} new registrations added.`}
-        </div>
-      )}
+        {dashErr && !dash && <Card title="Dashboard data" error={`The dashboard could not load: ${dashErr}`} onRetry={load} />}
 
-      {/* #1 priority banner */}
-      <PriorityBanner status={status} warnings={MOCK_WARNINGS} />
-
-      {/* #27 first-run setup checklist */}
-      {isFirstRun && <SetupChecklist />}
-
-      {/* ── WOW: TOURNAMENT READINESS GAUGE ─────────────────────────────── */}
-      <ReadinessGauge
-        score={ready.score}
-        ring={ready.ring}
-        label={ready.label}
-        color={ready.color}
-        drivers={readinessDrivers}
-        animating={gaugeAnim}
-      />
-
-      {/* ── STAT CARDS — #2 #3 #13 #14 #16 #25 zero-value collapse ─────── */}
-      <div className="dash-stats" style={{ display:"grid",
-        gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:20 }}>
-        {[
-          { label:"Total registered", value:status.total_entries,   sub:"form submissions",
-            accent:"#1a1a2e", link:"grsh-tm-players",  important:true },
-          { label:"Imported",         value:status.total_imported,  sub:`${pct}% synced`,
-            accent:"#166534", link:"grsh-tm-players",  important:true },
-          { label:"Unpaid",           value:status.unpaid,          sub:"payment pending",
-            accent:status.unpaid>0?"#92400E":"#166534",
-            link:"grsh-tm-players",  important:status.unpaid>0 },
-          { label:"Alternates",       value:status.subs,            sub:"registered",
-            accent:"#1E3A8A", link:"grsh-tm-alternates",important:true },
-          { label:"Unsynced",         value:status.unsynced,        sub:"awaiting sync",
-            accent:status.unsynced>0?"#6B21A8":"#166534",
-            link:"grsh-tm-dashboard",important:status.unsynced>0 },
-          { label:"Warnings",         value:status.warnings,        sub:"require review",
-            accent:status.warnings>0?"#991B1B":"#166534",
-            link:"grsh-tm-players",  important:status.warnings>0 },
-        ].map(m => (
-          m.value===0 && !m.important ? null :
-          <div key={m.label} className="metric-card"
-            onClick={()=>navigate(m.link)}
-            style={{ background:"#fff",border:"1px solid #E8E6DF",borderRadius:10,
-              padding:"14px 16px",cursor:"pointer",transition:"background .12s",
-              position:"relative",overflow:"hidden" }}>
-            <div style={{ position:"absolute",top:0,left:0,right:0,height:3,background:m.accent }}/>
-            <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa",
-              textTransform:"uppercase",letterSpacing:".07em",margin:"8px 0 4px" }}>{m.label}</div>
-            <div style={{ fontFamily:"'Fraunces',serif",fontSize:28,fontWeight:700,
-              color:m.accent,lineHeight:1,marginBottom:3 }}>{m.value}</div>
-            <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#bbb" }}>{m.sub}</div>
-            {/* #16 YoY delta placeholder */}
-            <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:"#ccc",marginTop:4 }}>
-              View →
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* #18 quick action shortcuts */}
-      <div style={{ display:"flex",gap:8,marginBottom:20,flexWrap:"wrap" }}>
-        <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa",
-          textTransform:"uppercase",letterSpacing:".07em",
-          display:"flex",alignItems:"center",marginRight:4 }}>Quick actions</div>
-        {[
-          { label:"Sync WPForms",   icon:"⟳", link:"grsh-tm-dashboard",    action:handleSync },
-          { label:"View warnings",  icon:"⚠", link:"grsh-tm-players"         },
-          { label:"Go to draft",    icon:"⬡", link:"grsh-tm-draft"           },
-          { label:"Export CSV",     icon:"↓", link:"grsh-tm-players"         },
-          { label:"Import history", icon:"↑", link:"grsh-tm-history-import"  },
-        ].map(q => (
-          <button key={q.label} className="quick-btn"
-            onClick={()=>q.action?q.action():navigate(q.link)}
-            style={{ fontFamily:"'DM Mono',monospace",fontSize:11,
-              background:"#fff",border:"1px solid #E8E6DF",color:"#555",
-              padding:"6px 14px",borderRadius:8,cursor:"pointer",
-              transition:"all .15s",display:"flex",alignItems:"center",gap:5 }}>
-            <span>{q.icon}</span>{q.label}
-          </button>
-        ))}
-      </div>
-
-      {/* #6 sync status (replaces progress bar) */}
-      <div style={{ background:"#fff",border:"1px solid #E8E6DF",borderRadius:12,
-        padding:"16px 22px",marginBottom:20 }}>
-        <div style={{ display:"flex",justifyContent:"space-between",
-          alignItems:"center",marginBottom:10 }}>
-          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#555",
-            textTransform:"uppercase",letterSpacing:".08em" }}>
-            WPForms sync status
-          </span>
-          <div style={{ display:"flex",alignItems:"center",gap:12 }}>
-            <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#aaa" }}>
-              Last synced {lastSync}
-            </span>
-            <span style={{ fontFamily:"'Fraunces',serif",fontSize:18,fontWeight:700,
-              color:"#1a1a2e" }}>{pct}%</span>
-          </div>
-        </div>
-        <div style={{ height:8,background:"#E8E6DF",borderRadius:99,overflow:"hidden",marginBottom:8 }}>
-          <div style={{ height:"100%",background:"#1a1a2e",borderRadius:99,
-            width:`${pct}%`,transition:"width .8s ease" }}/>
-        </div>
-        <div style={{ display:"flex",justifyContent:"space-between",
-          fontFamily:"'DM Mono',monospace",fontSize:11,color:"#aaa" }}>
-          <span>{status.total_imported} of {status.total_entries} entries imported</span>
-          {status.unsynced>0
-            ? <span style={{ color:"#92400E" }}>{status.unsynced} entries awaiting sync</span>
-            : <span style={{ color:"#166534" }}>✓ All entries synced</span>}
-        </div>
-      </div>
-
-      {/* #10 draft readiness pipeline */}
-      <DraftPipeline status={status} />
-
-      {/* ── TWO-COL: warnings + recent ──────────────────────────────────── */}
-      <div className="dash-two-col" style={{ display:"grid",
-        gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:20 }}>
-
-        {/* #17 warnings full-width treatment */}
-        <div style={{ background:"#fff",
-          border:`1px solid ${MOCK_WARNINGS.length>0?"#FCA5A5":"#86EFAC"}`,
-          borderLeft:`4px solid ${MOCK_WARNINGS.length>0?"#DC2626":"#22c55e"}`,
-          borderRadius:12,overflow:"hidden" }}>
-          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",
-            padding:"14px 18px",borderBottom:"1px solid #F0EEE8" }}>
-            <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:500,
-              textTransform:"uppercase",letterSpacing:".07em",
-              color:MOCK_WARNINGS.length>0?"#991B1B":"#166534" }}>
-              {MOCK_WARNINGS.length>0?"⚠ Active warnings":"✓ No warnings"}
-            </span>
-            {MOCK_WARNINGS.length>0 && (
-              <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,
-                background:"#FEF2F2",color:"#991B1B",padding:"2px 10px",
-                borderRadius:99,border:"1px solid #FCA5A5" }}>
-                {MOCK_WARNINGS.length}
-              </span>
-            )}
-          </div>
-          {MOCK_WARNINGS.length===0 ? (
-            <div style={{ padding:"20px 18px",fontFamily:"'DM Mono',monospace",
-              fontSize:12,color:"#166534",textAlign:"center" }}>
-              All players clear for 2027
-            </div>
-          ) : MOCK_WARNINGS.map(w => (
-            <div key={w.id} className="warn-row"
-              style={{ display:"flex",alignItems:"flex-start",gap:10,
-                padding:"12px 18px",borderBottom:"1px solid #F6F5F0",
-                cursor:"pointer",transition:"background .12s" }}
-              onClick={()=>navigate(w.link)}>
-              <div style={{ width:8,height:8,borderRadius:"50%",background:"#DC2626",
-                flexShrink:0,marginTop:5 }}/>
-              <div style={{ flex:1 }}>
-                <div style={{ fontFamily:"'Fraunces',serif",fontSize:13,fontWeight:600,
-                  color:"#1a1a2e",marginBottom:2 }}>{w.player}</div>
-                <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#888" }}>
-                  {w.detail}
+        {/* do this next */}
+        {dash && (
+          <section style={{ ...card, marginBottom: 16, padding: "14px 18px", borderLeft: `5px solid ${actions.length ? (actions[0].severity === "high" ? "#DC2626" : GOLD) : "#22c55e"}` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: SOFT, letterSpacing: ".06em", marginBottom: 6 }}>DO THIS NEXT</div>
+            {actions.length === 0 ? <div style={{ fontSize: 16, color: "#166534", fontWeight: 600 }}>Nothing needs your attention right now.</div> : (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 17, fontWeight: 700, flex: 1, minWidth: 240 }}>{actions[0].text}</span>
+                  <a className="grsh-noprint" style={btn("primary")} href={adminUrl(actions[0].page, actions[0].params.startsWith("#") ? "" : actions[0].params) + (actions[0].params.startsWith("#") ? actions[0].params : "")}>Go there →</a>
                 </div>
-              </div>
-              <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#bbb",
-                flexShrink:0 }}>{w.time}</div>
-            </div>
-          ))}
-        </div>
-
-        {/* #7 recent imports with empty state */}
-        <div style={{ background:"#fff",border:"1px solid #E8E6DF",
-          borderRadius:12,overflow:"hidden" }}>
-          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",
-            padding:"14px 18px",borderBottom:"1px solid #F0EEE8" }}>
-            <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:500,
-              textTransform:"uppercase",letterSpacing:".07em",color:"#444" }}>
-              Recent registrations
-            </span>
-            <button onClick={()=>navigate("grsh-tm-players")} style={{
-              fontFamily:"'DM Mono',monospace",fontSize:10,background:"transparent",
-              border:"none",color:"#1a1a2e",cursor:"pointer",textDecoration:"underline" }}>
-              View all →
-            </button>
-          </div>
-          {MOCK_RECENT.length===0 ? (
-            <div style={{ padding:"28px 18px",textAlign:"center" }}>
-              <div style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#aaa",
-                marginBottom:10 }}>No registrations yet</div>
-              <button onClick={handleSync} style={{ fontFamily:"'DM Mono',monospace",
-                fontSize:11,background:"#1a1a2e",color:"#D4A017",border:"none",
-                padding:"6px 14px",borderRadius:6,cursor:"pointer" }}>
-                Sync from WPForms
-              </button>
-            </div>
-          ) : MOCK_RECENT.map(r => (
-            <div key={r.id} className="recent-row"
-              style={{ display:"flex",alignItems:"center",gap:10,
-                padding:"10px 18px",borderBottom:"1px solid #F6F5F0",
-                cursor:"pointer",transition:"background .12s" }}>
-              <div style={{ width:32,height:32,borderRadius:"50%",background:"#1a1a2e",
-                color:"#D4A017",display:"flex",alignItems:"center",justifyContent:"center",
-                fontFamily:"'DM Mono',monospace",fontSize:10,fontWeight:500,flexShrink:0 }}>
-                {r.name.split(" ").map(n=>n[0]).join("").slice(0,2)}
-              </div>
-              <div style={{ flex:1,minWidth:0 }}>
-                <div style={{ fontFamily:"'Fraunces',serif",fontSize:13,fontWeight:600,
-                  color:"#1a1a2e",display:"flex",alignItems:"center",gap:5 }}>
-                  {r.name}
-                  {r.type==="sub" && (
-                    <span style={{ fontFamily:"'DM Mono',monospace",fontSize:8,
-                      background:"#EDE9FE",color:"#4C1D95",padding:"1px 5px",
-                      borderRadius:3 }}>ALT</span>
-                  )}
-                </div>
-                <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#888" }}>
-                  <span style={{ color:DIV_COLOR[r.division]||"#555",fontWeight:500 }}>
-                    {r.division}
-                  </span>
-                  {r.position!=="—"&&<> · {r.position}</>}
-                  {" · "}{r.time}
-                </div>
-              </div>
-              <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,fontWeight:500,
-                background:STATUS_STYLE[r.status]?.bg,color:STATUS_STYLE[r.status]?.color,
-                padding:"2px 8px",borderRadius:99 }}>{r.status}</span>
-            </div>
-          ))}
-        </div>
-
-      </div>
-
-      {/* ── DIVISION BREAKDOWN — #8 #9 #15 #19 #20 #24 #26 #29 ─────────── */}
-      <div style={{ background:"#fff",border:"1px solid #E8E6DF",
-        borderRadius:12,overflow:"hidden",marginBottom:20 }}>
-        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",
-          padding:"14px 20px",borderBottom:"1px solid #F0EEE8" }}>
-          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:500,
-            textTransform:"uppercase",letterSpacing:".07em",color:"#444" }}>
-            Division breakdown
-          </span>
-          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa" }}>
-            Click a division to filter players
-          </span>
-        </div>
-        <div className="dash-div-grid" style={{ display:"grid",
-          gridTemplateColumns:"repeat(4,1fr)" }}>
-          {divisions.map((d,i) => {
-            const payPct = Math.round((d.paid/d.registered)*100);
-            const fillPct = Math.round((d.registered/(d.cap||30))*100);
-            const payOk  = payPct >= 90;
-            const delta  = d.registered - (d.prior_year||d.registered);
-            const totalTier = d.tiers.A+d.tiers.B+d.tiers.C+d.tiers.R;
-            return (
-              <div key={d.name} className="div-card"
-                onClick={()=>navigate(`grsh-tm-players`)}
-                style={{ padding:"18px 18px 14px",cursor:"pointer",
-                  borderRight:i<divisions.length-1?"1px solid #F0EEE8":"none",
-                  transition:"background .12s",position:"relative",overflow:"hidden" }}>
-                <div style={{ position:"absolute",top:0,left:0,right:0,height:4,background:d.color }}/>
-                {/* #9 clickable division name */}
-                <div style={{ fontFamily:"'Fraunces',serif",fontSize:15,fontWeight:700,
-                  color:d.color,marginBottom:4,marginTop:4 }}>{d.name}</div>
-                {/* #15 fill vs cap */}
-                <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:"#aaa",marginBottom:12 }}>
-                  {d.registered} / {d.cap||30} cap
-                  {/* #16 YoY delta */}
-                  {delta!==0 && (
-                    <span style={{ marginLeft:6,
-                      color:delta>0?"#166534":"#991B1B",fontWeight:600 }}>
-                      {delta>0?"↑":"↓"}{Math.abs(delta)}
-                    </span>
-                  )}
-                </div>
-                {/* Stats grid */}
-                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 0",marginBottom:12 }}>
-                  {[
-                    [d.registered,"registered"],
-                    [d.paid,"paid"],
-                    [`${d.goalies}G`,"goalies"],
-                    [`${d.subs}`, "alternates"],
-                  ].map(([v,l]) => (
-                    <div key={l}>
-                      <div style={{ fontFamily:"'Fraunces',serif",fontSize:18,fontWeight:700,
-                        color:"#1a1a2e",lineHeight:1 }}>{v}</div>
-                      <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:"#aaa",
-                        textTransform:"uppercase",letterSpacing:".05em" }}>{l}</div>
-                    </div>
-                  ))}
-                </div>
-                {/* #20 payment bar with 95% target line */}
-                <div style={{ position:"relative",marginBottom:4 }}>
-                  <div style={{ height:6,background:"#F0EEE8",borderRadius:99,overflow:"hidden" }}>
-                    <div style={{ height:"100%",borderRadius:99,
-                      background:payOk?d.color:"#f59e0b",
-                      width:`${payPct}%`,transition:"width .8s ease" }}/>
-                  </div>
-                  {/* 95% target dashed line */}
-                  <div style={{ position:"absolute",top:-2,left:"95%",
-                    height:10,width:1,background:"#aaa",borderLeft:"1px dashed #aaa" }}/>
-                </div>
-                <div style={{ display:"flex",justifyContent:"space-between",
-                  fontFamily:"'DM Mono',monospace",fontSize:9 }}>
-                  <span style={{ color:payOk?"#166534":"#92400E",fontWeight:500 }}>
-                    {payPct}% paid {!payOk&&`· ${d.unpaid||d.registered-d.paid} unpaid`}
-                  </span>
-                  <span style={{ color:"#aaa" }}>95% target</span>
-                </div>
-                {/* #26 #29 tier distribution bar */}
-                <div style={{ marginTop:10 }}>
-                  <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:"#aaa",marginBottom:3 }}>
-                    Tier mix
-                  </div>
-                  <div style={{ display:"flex",height:6,borderRadius:99,overflow:"hidden",gap:1 }}>
-                    {[
-                      {count:d.tiers.A,color:"#FCE8E8",label:"A"},
-                      {count:d.tiers.B,color:"#FEF0E8",label:"B"},
-                      {count:d.tiers.C,color:"#FEF9E7",label:"C"},
-                      {count:d.tiers.R,color:"#E8F0FE",label:"R"},
-                    ].filter(t=>t.count>0).map(t => (
-                      <div key={t.label} title={`${t.label} tier: ${t.count} players`}
-                        style={{ flex:t.count,background:t.color,
-                          minWidth:t.count>0?4:0 }}/>
+                {actions.length > 1 && (
+                  <div style={{ marginTop: 10 }}>
+                    {(showAll ? actions.slice(1) : actions.slice(1, 4)).map((a) => (
+                      <a key={a.key} href={adminUrl(a.page, a.params.startsWith("#") ? "" : a.params) + (a.params.startsWith("#") ? a.params : "")} style={{ display: "flex", gap: 8, alignItems: "center", padding: "5px 0", color: INK, textDecoration: "none", fontSize: 14 }}>
+                        <span style={{ background: SEV[a.severity].bg, color: SEV[a.severity].color, borderRadius: 99, padding: "1px 8px", fontSize: 11, fontWeight: 700, minWidth: 64, textAlign: "center" }}>{SEV[a.severity].label}</span>{a.text}
+                      </a>
                     ))}
-                  </div>
-                  <div style={{ display:"flex",gap:8,marginTop:3 }}>
-                    {[
-                      {count:d.tiers.A,color:"#7A1818",label:"A"},
-                      {count:d.tiers.B,color:"#7A4518",label:"B"},
-                      {count:d.tiers.C,color:"#7A5A18",label:"C"},
-                      {count:d.tiers.R,color:"#1A3F8F",label:"R"},
-                    ].filter(t=>t.count>0).map(t=>(
-                      <span key={t.label} style={{ fontFamily:"'DM Mono',monospace",
-                        fontSize:8,color:t.color }}>{t.label}:{t.count}</span>
-                    ))}
-                  </div>
-                </div>
-                {/* #24 alternates available chip */}
-                {d.subs > 0 && (
-                  <div style={{ marginTop:8,display:"inline-block",
-                    fontFamily:"'DM Mono',monospace",fontSize:9,
-                    background:"#EDE9FE",color:"#4C1D95",
-                    padding:"2px 8px",borderRadius:99 }}>
-                    {d.subs} alternates available →
+                    {actions.length > 4 && <button className="grsh-noprint" style={{ ...btn("ghost"), padding: "3px 10px", fontSize: 13, marginTop: 6 }} onClick={() => setShowAll(!showAll)}>{showAll ? "Show fewer" : `Show all ${actions.length}`}</button>}
                   </div>
                 )}
+              </>
+            )}
+          </section>
+        )}
+
+        {/* readiness */}
+        {dash && (
+          <Card title="Tournament readiness" pad>
+            <div className="grsh-ready" style={{ display: "flex", gap: 28, alignItems: "center" }}>
+              <Gauge score={ready.score} basis={ready.basis} total={ready.total} />
+              <div style={{ flex: 1, display: "grid", gap: 14 }}>
+                {ready.rows.map((row) => {
+                  const m = dash.metrics[row.key];
+                  const col = row.pct === null ? SOFT : row.pct >= 90 ? "#166534" : row.pct >= 70 ? INK : row.pct >= 50 ? "#92400E" : "#991B1B";
+                  return (
+                    <a key={row.key} href={adminUrl(ROW_LINK[row.key])} className="grsh-card-link" style={{ textDecoration: "none", color: INK, display: "block", padding: "2px 4px", borderRadius: 6 }} title={`${row.label} — counts ${row.weight}% of the readiness score. Click to open.`}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, fontWeight: 600 }}>
+                        <span>{row.label}</span><span style={{ fontFamily: F_NUM, color: col }}>{fmtPct(row.pct)} <span style={{ color: SOFT, fontWeight: 400, fontSize: 12 }}>({row.weight}%)</span></span>
+                      </div>
+                      <div style={{ height: 8, background: "#EEECE4", borderRadius: 99, margin: "5px 0", overflow: "hidden" }}><div style={{ width: `${row.pct === null ? 0 : row.pct}%`, height: "100%", background: col }} /></div>
+                      <div style={{ fontSize: 13, color: SOFT }}>{m ? ROW_NOTE[row.key](m, row.key === "registration" ? m : null) : ROW_NOTE_EMPTY[row.key]}</div>
+                    </a>
+                  );
+                })}
               </div>
+            </div>
+            <details style={{ marginTop: 14, fontSize: 13, color: MUTED }}>
+              <summary style={{ cursor: "pointer", fontWeight: 600 }}>How is this calculated?</summary>
+              <p style={{ margin: "8px 0 0" }}>Each measure is a simple count: for example “7 of 7 paid”. The score is the weighted average of the measures that can be measured (registration 30%, payments 25%, approvals 25%, rosters 20%). A measure with nothing to count yet — like rosters before any team exists — is left out instead of counted as zero, and the score says how many measures it used. “Minimum needed” is the number of teams times the minimum roster size for each division, from Settings.</p>
+            </details>
+          </Card>
+        )}
+
+        {/* stat cards */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(180px,1fr))", gap: 10, marginBottom: 16 }}>
+          {stats.map((s) => {
+            const body = (
+              <>
+                <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 4, background: s.color }} />
+                <div style={{ fontSize: 13, color: SOFT, fontWeight: 600, marginTop: 6 }}>{s.label}</div>
+                <div style={{ fontFamily: F_HEAD, fontSize: 32, fontWeight: 700, color: s.err ? SOFT : s.color, lineHeight: 1.15 }}>{s.err ? "—" : num(s.value) === null ? "—" : s.value}</div>
+                <div style={{ fontSize: 12, color: s.err ? "#991B1B" : SOFT }}>{s.err ? "could not load" : s.sub}</div>
+              </>
             );
+            const st = { ...card, position: "relative", padding: "12px 14px", textDecoration: "none", color: INK, display: "block", textAlign: "left", cursor: "pointer", font: "inherit" };
+            return s.onClick
+              ? <button key={s.label} className="grsh-card-link" onClick={s.onClick} style={st}>{body}</button>
+              : <a key={s.label} className="grsh-card-link" href={adminUrl(s.page)} style={st}>{body}</a>;
           })}
         </div>
-      </div>
 
-      {/* #19 goalie summary callout */}
-      {(() => {
-        const total = divisions.reduce((s,d)=>s+d.goalies,0);
-        const perDiv = (total/Math.max(1,divisions.length)).toFixed(1);
-        const lowDivs = divisions.filter(d=>d.goalies<2).map(d=>d.name);
-        return (
-          <div style={{ background:lowDivs.length>0?"#FFFBEB":"#F0FDF4",
-            border:`1px solid ${lowDivs.length>0?"#FDE68A":"#86EFAC"}`,
-            borderRadius:10,padding:"10px 18px",marginBottom:20,
-            display:"flex",alignItems:"center",gap:12 }}>
-            <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,
-              color:lowDivs.length>0?"#92400E":"#166534" }}>
-              {lowDivs.length>0
-                ? `⚠ ${lowDivs.join(", ")} may be short on goalies — fewer than 2 registered`
-                : `✓ ${total} goalies across ${divisions.length} divisions (${perDiv} avg)`}
-            </span>
-          </div>
-        );
-      })()}
+        {/* dates */}
+        {dash && (
+          <Card id="dates" title="Key dates" right={!dateEdit && <button className="grsh-noprint" style={btn("ghost", { padding: "4px 10px", fontSize: 13 })} onClick={() => { setDateVal(dash.tournament_date); setDateEdit(true); }}>{dash.tournament_date ? "Change tournament date" : "Set tournament date"}</button>}>
+            {dateEdit && (
+              <div className="grsh-noprint" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+                <label style={{ fontSize: 14 }}>Tournament date <input type="date" value={dateVal} onChange={(e) => setDateVal(e.target.value)} style={{ marginLeft: 6, padding: 6, border: `1px solid ${LINE}`, borderRadius: 8 }} /></label>
+                <button style={btn("primary")} onClick={() => saveDate(dateVal)}>Save</button>
+                <button style={btn()} onClick={() => setDateEdit(false)}>Cancel</button>
+                {dash.tournament_date && <button style={btn()} onClick={() => saveDate("")}>Clear date</button>}
+                {dateMsg && <span role="alert" style={{ color: "#991B1B", fontSize: 13 }}>{dateMsg}</span>}
+              </div>
+            )}
+            {dash.milestones.length === 0 ? <div style={{ color: SOFT, fontSize: 14 }}>No dates set yet. Registration and draft dates come from Settings; the tournament date is set here.</div> : (
+              <ol style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: 8 }}>
+                {dash.milestones.map((m) => {
+                  const d = daysUntil(m.date), past = d !== null && d < 0;
+                  return (
+                    <li key={m.key} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14, opacity: past ? 0.6 : 1 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: 5, background: past ? "#22c55e" : d === 0 ? "#DC2626" : GOLD }} aria-hidden="true" />
+                      <b style={{ minWidth: 150 }}>{m.label}</b><span>{prettyDate(m.date)}</span>
+                      <span style={{ color: SOFT }}>{d === null ? "" : d === 0 ? "today" : past ? `${-d} day${d === -1 ? "" : "s"} ago` : `in ${d} day${d === 1 ? "" : "s"}`}</span>
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+          </Card>
+        )}
 
-      {/* #21 activity feed */}
-      <div style={{ background:"#fff",border:"1px solid #E8E6DF",
-        borderRadius:12,overflow:"hidden" }}>
-        <div style={{ padding:"14px 20px",borderBottom:"1px solid #F0EEE8",
-          display:"flex",justifyContent:"space-between",alignItems:"center" }}>
-          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:500,
-            textTransform:"uppercase",letterSpacing:".07em",color:"#444" }}>
-            Recent activity
-          </span>
-          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#aaa" }}>
-            Audit log
-          </span>
+        {/* divisions */}
+        {dash && (
+          <Card title="Divisions" pad={false} right={<span style={{ fontSize: 13, color: SOFT }}>Bar = registered. Marker = minimum needed.</span>}>
+            {dash.divisions.length === 0 ? <div style={{ padding: 18, color: SOFT }}>No divisions are switched on in Settings.</div> : (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(250px,1fr))" }}>
+                {dash.divisions.map((v) => {
+                  const f = fillState(v), tot = Object.values(v.tiers).reduce((a, b) => a + b, 0);
+                  const st = STAGE[v.stage] || STAGE.draft;
+                  const pctBar = f.cap ? Math.min(100, (f.have / f.cap) * 100) : 0, mark = f.cap ? (f.need / f.cap) * 100 : null;
+                  const goalieNeed = v.planned_teams;
+                  return (
+                    <div key={v.key} style={{ padding: "16px 18px", borderRight: `1px solid ${LINE}`, borderBottom: `1px solid ${LINE}`, borderTop: `4px solid ${v.color}` }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <h3 style={{ margin: 0, fontFamily: F_HEAD, fontSize: 18, color: v.color, flex: 1 }}>{v.label}</h3>
+                        <span style={{ background: st.bg, color: st.color, borderRadius: 99, padding: "2px 9px", fontSize: 12, fontWeight: 700 }}>{v.draft_status === "active" || v.draft_status === "paused" ? `Draft ${v.draft_status}` : st.label}</span>
+                      </div>
+                      <div style={{ fontSize: 14, margin: "8px 0 4px" }}><b style={{ fontFamily: F_HEAD, fontSize: 24 }}>{v.registered}</b> registered{f.need ? <span style={{ color: SOFT }}> · need {f.need}, room for {f.room} more</span> : <span style={{ color: SOFT }}> · set teams in Settings</span>}</div>
+                      {f.cap ? (
+                        <div style={{ position: "relative", height: 8, background: "#EEECE4", borderRadius: 99, margin: "6px 0 10px" }} title={`${f.have} registered; minimum ${f.need}; capacity ${f.cap}`}>
+                          <div style={{ width: `${pctBar}%`, height: "100%", borderRadius: 99, background: f.state === "short" ? "#f59e0b" : v.color }} />
+                          <div style={{ position: "absolute", top: -3, left: `${mark}%`, height: 14, width: 2, background: INK }} />
+                        </div>
+                      ) : null}
+                      {f.state === "short" && <div style={{ fontSize: 13, color: "#92400E" }}>{f.short} short of the minimum</div>}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 12px", fontSize: 13, margin: "10px 0" }}>
+                        <span><b>{v.paid}</b> of {v.registered} paid{v.unpaid > 0 ? <span style={{ color: "#92400E" }}> ({v.unpaid} owe)</span> : ""}</span>
+                        <span><b>{v.goalies}</b> goalie{v.goalies === 1 ? "" : "s"}{goalieNeed ? <span style={{ color: v.goalies < goalieNeed ? "#991B1B" : SOFT }}> (need {goalieNeed})</span> : ""}</span>
+                        <span><b>{v.subs}</b> alternate{v.subs === 1 ? "" : "s"}</span>
+                        <span><b>{v.teams}</b> of {v.planned_teams} team{v.planned_teams === 1 ? "" : "s"} · {v.rostered} rostered</span>
+                      </div>
+                      {tot > 0 && (
+                        <div aria-label="Skill tier mix" style={{ marginBottom: 10 }}>
+                          <div style={{ display: "flex", height: 8, borderRadius: 99, overflow: "hidden", gap: 1 }}>
+                            {[["A", "#E8A0A0"], ["B", "#EDBA94"], ["C", "#EAD08A"], ["R", "#9CB8EC"]].filter(([k]) => v.tiers[k] > 0).map(([k, c]) => <div key={k} title={`Tier ${k}: ${v.tiers[k]}`} style={{ flex: v.tiers[k], background: c, minWidth: 4 }} />)}
+                          </div>
+                          <div style={{ fontSize: 12, color: SOFT, marginTop: 3 }}>Tiers: {["A", "B", "C", "R"].filter((k) => v.tiers[k] > 0).map((k) => `${k} ${v.tiers[k]}`).join(" · ")}{v.tiers["?"] > 0 ? ` · unrated ${v.tiers["?"]}` : ""}</div>
+                        </div>
+                      )}
+                      <div className="grsh-noprint" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-rosters", `?division=${encodeURIComponent(v.key)}`)}>Rosters</a>
+                        <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-draft")}>Draft</a>
+                        <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-players")}>Players</a>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+        )}
+
+        <div className="grsh-two" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+          {/* flags */}
+          <Card title={dash && dash.flags.length ? `Sandbagging flags (${dash.totals.sandbagging_flags})` : "Sandbagging flags"} error={dashErr && !dash ? dashErr : ""} onRetry={load} pad={false}>
+            {dash && (dash.flags.length === 0 ? <div style={{ padding: 18, color: "#166534", fontSize: 14 }}>No flagged players.</div> : dash.flags.map((f) => (
+              <a key={f.id} href={adminUrl("grsh-tm-players")} className="grsh-card-link" style={{ display: "block", padding: "10px 18px", borderBottom: `1px solid ${LINE}`, textDecoration: "none", color: INK }}>
+                <b>{f.player}</b><div style={{ fontSize: 13, color: SOFT }}>Rated {f.tier || "?"}, asked for {String(f.division).replace(/_/g, " ")}</div>
+              </a>
+            )))}
+          </Card>
+          {/* recent registrations */}
+          <Card title="Recent registrations" error={syncErr && !sync ? syncErr : ""} onRetry={load} pad={false} right={<a href={adminUrl("grsh-tm-players")} style={{ fontSize: 13 }}>View all →</a>}>
+            {sync && ((sync.recent_imports || []).length === 0 ? <div style={{ padding: 18, color: SOFT, fontSize: 14 }}>No registrations yet.</div> : sync.recent_imports.map((r) => (
+              <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 18px", borderBottom: `1px solid ${LINE}`, fontSize: 14 }}>
+                <div style={{ flex: 1, minWidth: 0 }}><b>{r.name}</b>{r.type === "sub" && <span style={{ marginLeft: 6, fontSize: 11, background: "#EDE9FE", color: "#4C1D95", padding: "1px 6px", borderRadius: 4 }}>ALT</span>}<div style={{ fontSize: 12, color: SOFT }}>{String(r.division || "").replace(/_/g, " ")}{r.position && r.position !== "—" ? ` · ${r.position}` : ""}{r.time ? ` · ${r.time}` : ""}</div></div>
+                <span style={{ fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: r.status === "paid" ? "#DCFCE7" : r.status === "pending" ? "#FEF3C7" : "#EDE9FE", color: r.status === "paid" ? "#166534" : r.status === "pending" ? "#92400E" : "#4C1D95" }}>{r.status}</span>
+              </div>
+            )))}
+          </Card>
         </div>
-        {MOCK_ACTIVITY.map((a,i) => (
-          <div key={i} style={{ display:"flex",alignItems:"center",gap:12,
-            padding:"10px 20px",borderBottom:"1px solid #F9F8F4" }}>
-            <div style={{ width:28,height:28,borderRadius:"50%",background:"#F6F5F0",
-              display:"flex",alignItems:"center",justifyContent:"center",
-              fontFamily:"'DM Mono',monospace",fontSize:9,color:"#888",flexShrink:0 }}>
-              {a.user.slice(0,2).toUpperCase()}
-            </div>
-            <div style={{ flex:1 }}>
-              <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,
-                color:"#1a1a2e",fontWeight:500 }}>{a.action}</span>
-              <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#888" }}>
-                {" — "}{a.detail}
-              </span>
-            </div>
-            <div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,
-              color:"#bbb",flexShrink:0 }}>{a.time}</div>
-          </div>
-        ))}
-      </div>
 
+        {/* activity */}
+        {dash && (
+          <Card id="activity" title="Recent activity" right={<span style={{ fontSize: 13, color: SOFT }}>From the audit log</span>} pad={false}>
+            {dash.activity.length === 0 ? <div style={{ padding: 18, color: SOFT, fontSize: 14 }}>Nothing logged yet.</div> : dash.activity.map((a) => (
+              <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 18px", borderBottom: `1px solid ${LINE}`, fontSize: 14 }}>
+                <span style={{ width: 8, height: 8, borderRadius: 4, background: a.action === "sync_failed" ? "#DC2626" : "#D0CEC6" }} aria-hidden="true" />
+                <div style={{ flex: 1 }}><b>{actionLabel(a.action)}</b>{a.notes ? <span style={{ color: MUTED }}> — {a.notes}</span> : null}</div>
+                <span style={{ fontSize: 12, color: SOFT }}>{a.by ? `${a.by} · ` : ""}{ago(a.at, dash.server_now)}</span>
+              </div>
+            ))}
+          </Card>
+        )}
+      </div>
     </div>
   );
 }

@@ -615,6 +615,34 @@ class GRSH_Sync_Engine {
                 );
             }
 
+            // A returning player who registers as a sub this season must be flagged
+            // as an alternate, otherwise they never show on the Alternates page.
+            if ( $player_type === 'sub' ) {
+                $player_data['is_alternate'] = 1;
+            }
+
+            // Email is the match key, but people register with a spouse's, parent's
+            // or teammate's address. If the incoming last name is different from the
+            // name already on file for this email, do NOT rename the existing player
+            // (that is how one person's record ends up with another person's name).
+            // Keep the stored name and flag it for review instead.
+            $cur = $wpdb->get_row( $wpdb->prepare(
+                "SELECT first_name, last_name FROM {$wpdb->prefix}grsh_players WHERE id = %d",
+                $existing->id
+            ) );
+            if ( $cur && trim( (string) $cur->last_name ) !== '' && ! empty( $player_data['last_name'] )
+                && strtolower( trim( $cur->last_name ) ) !== strtolower( trim( $player_data['last_name'] ) ) ) {
+                $this->log_audit(
+                    'email_name_mismatch',
+                    'player',
+                    (int) $existing->id,
+                    [ 'name' => trim( $cur->first_name . ' ' . $cur->last_name ) ],
+                    [ 'name' => trim( ( $player_data['first_name'] ?? '' ) . ' ' . $player_data['last_name'] ) ],
+                    "Registration used {$email}, which is on file under a different name — name NOT overwritten. Check whether this is a shared email."
+                );
+                unset( $player_data['first_name'], $player_data['last_name'] );
+            }
+
             // Update mutable fields — preserve committee overrides
             $update_fields = array_intersect_key( $player_data, array_flip( [
                 'first_name', 'last_name', 'phone',

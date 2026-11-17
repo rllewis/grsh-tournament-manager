@@ -53,7 +53,7 @@ class GRSH_Alternates {
             "SELECT
                 p.id, p.first_name, p.last_name, p.email, p.phone,
                 p.position, p.skill_tier_reported, p.skill_tier_assigned,
-                p.jersey_size, p.notes, p.sandbagging_flag,
+                p.jersey_size, p.notes, p.sandbagging_flag, p.years_experience, p.is_goalie,
                 r.id AS registration_id, r.age, r.payment_status,
                 r.player_type, r.division_requested, r.status,
                 a.available_days, a.max_games_per_day, a.late_game_available,
@@ -63,21 +63,48 @@ class GRSH_Alternates {
                   ON r.player_id = p.id AND r.season_id = %d
              LEFT JOIN {$wpdb->prefix}grsh_availability a
                   ON a.player_id = p.id AND a.season_id = %d
-             WHERE p.is_alternate = 1
+             WHERE ( r.player_type = 'sub' OR p.is_alternate = 1 )
              ORDER BY a.times_activated DESC, p.last_name ASC",
             $season_id, $season_id
         ), ARRAY_A ) ?: [];
 
-        $alternates = array_map( function( $row ) {
+        // Reliability inputs: attendance from history, response rate from sub requests.
+        $att = [];
+        foreach ( $wpdb->get_results(
+            "SELECT player_id, SUM(games_attended) AS att, SUM(games_scheduled) AS sched
+               FROM {$wpdb->prefix}grsh_player_history GROUP BY player_id", ARRAY_A ) ?: [] as $a ) {
+            $att[ (int) $a['player_id'] ] = [ (int) $a['att'], (int) $a['sched'] ];
+        }
+        $resp = [];
+        $req_table = $wpdb->prefix . 'grsh_sub_requests';
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $req_table ) ) === $req_table ) {
+            foreach ( $wpdb->get_results( $wpdb->prepare(
+                "SELECT player_id, COUNT(*) AS asked,
+                        SUM(status IN ('yes','no')) AS answered, SUM(status='yes') AS yes
+                   FROM {$req_table} WHERE season_id = %d GROUP BY player_id", $season_id ), ARRAY_A ) ?: [] as $q ) {
+                $resp[ (int) $q['player_id'] ] = [ (int) $q['asked'], (int) $q['answered'], (int) $q['yes'] ];
+            }
+        }
+
+        $alternates = array_map( function( $row ) use ( $att, $resp ) {
             $avail_days = $row['available_days']
                 ? ( json_decode( $row['available_days'], true ) ?: [] ) : [];
             $div_elig   = $row['division_eligibility']
                 ? ( json_decode( $row['division_eligibility'], true ) ?: [] ) : [];
 
+            // Repair names saved as "First Last" in both columns by the older sync mapper.
+            $first = trim( (string) $row['first_name'] );
+            $last  = trim( (string) $row['last_name'] );
+            if ( $first !== '' && $first === $last && str_contains( $first, ' ' ) ) {
+                $parts = explode( ' ', $first, 2 );
+                $first = $parts[0];
+                $last  = $parts[1];
+            }
+
             return [
                 'id'                   => (int) $row['id'],
-                'first_name'           => $row['first_name'],
-                'last_name'            => $row['last_name'],
+                'first_name'           => $first,
+                'last_name'            => $last,
                 'email'                => $row['email'],
                 'phone'                => $row['phone'] ?? '',
                 'position'             => $row['position']             ?: null,
@@ -99,6 +126,13 @@ class GRSH_Alternates {
                 'times_activated'      => (int) ( $row['times_activated'] ?? 0 ),
                 'last_activated_at'    => $row['last_activated_at'] ?: null,
                 'registration_id'      => (int) $row['registration_id'],
+                'years_experience'     => $row['years_experience'] !== null ? (int) $row['years_experience'] : null,
+                'is_goalie'            => ( $row['position'] === 'goaltender' || (int) $row['is_goalie'] === 1 ),
+                'games_attended'       => $att[ (int) $row['id'] ][0] ?? null,
+                'games_scheduled'      => $att[ (int) $row['id'] ][1] ?? null,
+                'requests_sent'        => $resp[ (int) $row['id'] ][0] ?? 0,
+                'requests_answered'    => $resp[ (int) $row['id'] ][1] ?? 0,
+                'requests_yes'         => $resp[ (int) $row['id'] ][2] ?? 0,
             ];
         }, $rows );
 
@@ -130,90 +164,67 @@ class GRSH_Alternates {
             );
         }
 
-        // ── DUPLICATE GUARD ───────────────────────────────────────────────────
-        // Uses actual column names from wp_grsh_audit_logs:
-        //   wp_user_id (not player_id), season_id, action, after_value (JSON)
+        $user = wp_get_current_user();
+        $res  = self::record_activation( $player_id, $team, $division, $game_date, $reason, $notes,
+                    $user && $user->exists() ? $user->display_name : 'Committee' );
+
+        if ( ! empty( $res['duplicate'] ) ) {
+            return new WP_REST_Response( [
+                'activated' => false, 'duplicate' => true, 'log_id' => $res['log_id'],
+                'message'   => 'Activation already recorded for this player, team, division, and date.',
+            ], 409 );
+        }
+        if ( empty( $res['ok'] ) ) {
+            return new WP_REST_Response( [ 'activated' => false, 'error' => 'Database insert failed.' ], 500 );
+        }
+        return new WP_REST_Response( [ 'activated' => true, 'log_id' => $res['log_id'], 'player_id' => $player_id ], 200 );
+    }
+
+    /**
+     * Shared by the manual activate button and the email-reply flow.
+     * Returns [ ok, duplicate, log_id ].
+     */
+    public static function record_activation( int $player_id, string $team, string $division, string $game_date,
+                                              string $reason, string $notes, string $by ): array {
+        global $wpdb;
+        $season_id = self::get_season_id();
+
         $existing_id = $wpdb->get_var( $wpdb->prepare(
-            "SELECT id
-               FROM {$wpdb->prefix}grsh_audit_logs
-              WHERE wp_user_id = %d
-                AND season_id  = %d
-                AND action     = 'alternate_activated'
+            "SELECT id FROM {$wpdb->prefix}grsh_audit_logs
+              WHERE wp_user_id = %d AND season_id = %d AND action = 'alternate_activated'
                 AND JSON_UNQUOTE( JSON_EXTRACT( after_value, '$.date' ) )     = %s
                 AND JSON_UNQUOTE( JSON_EXTRACT( after_value, '$.division' ) ) = %s
                 AND JSON_UNQUOTE( JSON_EXTRACT( after_value, '$.team' ) )     = %s
               LIMIT 1",
-            $player_id,
-            $season_id,
-            $game_date,
-            $division,
-            $team
+            $player_id, $season_id, $game_date, $division, $team
         ) );
-
         if ( $existing_id ) {
-            return new WP_REST_Response(
-                [
-                    'activated' => false,
-                    'duplicate' => true,
-                    'log_id'    => (int) $existing_id,
-                    'message'   => 'Activation already recorded for this player, team, division, and date.',
-                ],
-                409
-            );
+            return [ 'ok' => false, 'duplicate' => true, 'log_id' => (int) $existing_id ];
         }
-        // ─────────────────────────────────────────────────────────────────────
 
-        // ── Increment times_activated in grsh_availability ────────────────────
-        $wpdb->query( $wpdb->prepare(
-            "UPDATE {$wpdb->prefix}grsh_availability
-                SET times_activated   = times_activated + 1,
-                    last_activated_at = %s
-              WHERE player_id = %d
-                AND season_id = %d",
-            current_time( 'mysql' ),
-            $player_id,
-            $season_id
-        ) );
-
-        // ── Insert audit log row ──────────────────────────────────────────────
-        // Column names match confirmed wp_grsh_audit_logs schema:
-        //   wp_user_id, season_id, action, object_type, object_id,
-        //   notes, after_value, (ip_address and created_at auto-fill)
-        $inserted = $wpdb->insert(
-            "{$wpdb->prefix}grsh_audit_logs",
-            [
-                'season_id'   => $season_id,
-                'wp_user_id'  => $player_id,
-                'action'      => 'alternate_activated',
-                'object_type' => 'registration',
-                'object_id'   => $player_id,
-                'notes'       => $notes,
-                'after_value' => wp_json_encode( [
-                    'team'     => $team,
-                    'division' => $division,
-                    'date'     => $game_date,
-                    'reason'   => $reason,
-                ] ),
-            ]
-        );
-
+        $inserted = $wpdb->insert( "{$wpdb->prefix}grsh_audit_logs", [
+            'season_id'    => $season_id,
+            'wp_user_id'   => $player_id,
+            'action'       => 'alternate_activated',
+            'object_type'  => 'registration',
+            'object_id'    => $player_id,
+            'notes'        => $notes,
+            'user_display' => $by,
+            'after_value'  => wp_json_encode( [ 'team' => $team, 'division' => $division, 'date' => $game_date, 'reason' => $reason ] ),
+        ] );
         if ( ! $inserted ) {
-            return new WP_REST_Response(
-                [ 'activated' => false, 'error' => 'Database insert failed.' ],
-                500
-            );
+            return [ 'ok' => false, 'duplicate' => false, 'log_id' => 0 ];
         }
-
         $log_id = (int) $wpdb->insert_id;
 
-        return new WP_REST_Response(
-            [
-                'activated' => true,
-                'log_id'    => $log_id,
-                'player_id' => $player_id,
-            ],
-            200
-        );
+        $wpdb->query( $wpdb->prepare(
+            "UPDATE {$wpdb->prefix}grsh_availability
+                SET times_activated = times_activated + 1, last_activated_at = %s
+              WHERE player_id = %d AND season_id = %d",
+            current_time( 'mysql' ), $player_id, $season_id
+        ) );
+
+        return [ 'ok' => true, 'duplicate' => false, 'log_id' => $log_id ];
     }
 
     // -------------------------------------------------------------------------

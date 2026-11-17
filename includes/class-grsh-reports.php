@@ -8,6 +8,11 @@
  * GET  /wp-json/grsh/v1/reports/summary           → season KPI summary card
  * POST /wp-json/grsh/v1/reports/board-meeting-pack → generate & stream board pack PDF
  *
+ * CHANGELOG v1.2.0
+ * - get_summary()/get_unpaid() now come from GRSH_Reports_Tools::data(): primary active registrations only,
+ *   the payment breakdown adds up, and "owed" is the player fee (not amount_paid on unpaid rows). Unknown = null.
+ * - Board pack prints "amount not set" instead of $0 when no fee is known.
+ *
  * CHANGELOG v1.1.0
  * - get_parity(): now seeds division list from GRSH_Settings::get_active_divisions()
  *   instead of deriving it from teams rows alone. Divisions with 0 teams (including
@@ -73,59 +78,20 @@ class GRSH_Reports {
     // -------------------------------------------------------------------------
 
     public static function get_summary( WP_REST_Request $request ): WP_REST_Response {
-        global $wpdb;
-        $season_id = self::get_season_id();
-
-        $reg = $wpdb->get_row( $wpdb->prepare(
-            "SELECT
-                COUNT(*)                                                   AS total,
-                SUM(CASE WHEN payment_status = 'paid'    THEN 1 ELSE 0 END) AS paid,
-                SUM(CASE WHEN payment_status IN ('pending','failed') AND player_type='primary' THEN 1 ELSE 0 END) AS outstanding,
-                SUM(CASE WHEN payment_status IN ('pending','failed') AND player_type='primary' THEN COALESCE(amount_paid,0) ELSE 0 END) AS outstanding_amount
-             FROM {$wpdb->prefix}grsh_registrations
-             WHERE season_id = %d",
-            $season_id
-        ), ARRAY_A );
-
-        // Teams without a confirmed goalie.
-        $uncovered_goalies = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*)
-             FROM {$wpdb->prefix}grsh_teams t
-             WHERE t.season_id = %d
-               AND (
-                   SELECT COUNT(*)
-                   FROM {$wpdb->prefix}grsh_rosters ro
-                   JOIN {$wpdb->prefix}grsh_players p ON p.id = ro.player_id
-                   WHERE ro.team_id = t.id AND ro.season_id = t.season_id AND p.is_goalie = 1
-               ) = 0",
-            $season_id
-        ) );
-
-        $goalie_total = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(DISTINCT p.id)
-             FROM {$wpdb->prefix}grsh_players p
-             JOIN {$wpdb->prefix}grsh_registrations r ON r.player_id = p.id AND r.season_id = %d
-             WHERE p.is_goalie = 1 AND r.player_type = 'primary'",
-            $season_id
-        ) );
-
-        // Sandbagging flags.
-        $sandbagging = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*)
-             FROM {$wpdb->prefix}grsh_players p
-             JOIN {$wpdb->prefix}grsh_registrations r ON r.player_id = p.id AND r.season_id = %d
-             WHERE p.sandbagging_flag = 1",
-            $season_id
-        ) );
-
+        // v1.2.0: one source of truth. Counts are primary, active registrations only, so
+        // registered = paid + waived + outstanding + refunded always adds up, and the amount
+        // owed comes from the player fee (null when no fee is known) instead of amount_paid.
+        $d = GRSH_Reports_Tools::data();
+        $p = $d['payments'];
         return new WP_REST_Response( [
-            'registered'         => (int) ( $reg['total']              ?? 0 ),
-            'paid'               => (int) ( $reg['paid']               ?? 0 ),
-            'outstanding'        => (int) ( $reg['outstanding']        ?? 0 ),
-            'outstanding_amount' => (float) ( $reg['outstanding_amount'] ?? 0 ),
-            'goalie_total'       => $goalie_total,
-            'teams_no_goalie'    => $uncovered_goalies,
-            'sandbagging_flags'  => $sandbagging,
+            'registered'         => (int) $d['totals']['registered'],
+            'paid'               => (int) $p['breakdown']['paid'],
+            'waived'             => (int) $p['breakdown']['waived'],
+            'outstanding'        => (int) $p['unpaid'],
+            'outstanding_amount' => $p['owed'],
+            'goalie_total'       => (int) $d['totals']['goalies'],
+            'teams_no_goalie'    => (int) $d['totals']['teams_no_goalie'],
+            'sandbagging_flags'  => (int) $d['totals']['sandbagging'],
             'generated_at'       => current_time( 'mysql' ),
         ], 200 );
     }
@@ -165,7 +131,7 @@ class GRSH_Reports {
         $reg_counts_raw = $wpdb->get_results( $wpdb->prepare(
             "SELECT division_requested AS div_key, COUNT(*) AS cnt
              FROM {$wpdb->prefix}grsh_registrations
-             WHERE season_id = %d AND player_type = 'primary'
+             WHERE season_id = %d AND player_type = 'primary' AND status NOT IN ('withdrawn','waitlist')
              GROUP BY division_requested",
             $season_id
         ), ARRAY_A ) ?: [];
@@ -237,41 +203,14 @@ class GRSH_Reports {
     // -------------------------------------------------------------------------
 
     public static function get_unpaid( WP_REST_Request $request ): WP_REST_Response {
-        global $wpdb;
-        $season_id = self::get_season_id();
-
-        $rows = $wpdb->get_results( $wpdb->prepare(
-            "SELECT
-                p.id,
-                CONCAT(p.first_name,' ',p.last_name) AS name,
-                r.division_requested AS division,
-                r.amount_paid        AS amount,
-                r.player_type        AS type,
-                DATEDIFF(NOW(), r.created_at) AS days_since
-             FROM {$wpdb->prefix}grsh_registrations r
-             JOIN {$wpdb->prefix}grsh_players p ON p.id = r.player_id
-             WHERE r.season_id = %d
-               AND r.payment_status IN ('pending','failed')
-               AND r.player_type = 'primary'
-             ORDER BY days_since DESC",
-            $season_id
-        ), ARRAY_A ) ?: [];
-
-        $unpaid = array_map( fn( $row ) => [
-            'id'         => (int) $row['id'],
-            'name'       => $row['name'],
-            'division'   => $row['division'] ?? '',
-            'amount'     => (float) ( $row['amount'] ?? 0 ),
-            'type'       => $row['type'] ?? 'primary',
-            'days_since' => (int) ( $row['days_since'] ?? 0 ),
-        ], $rows );
-
-        $total_owed = array_sum( array_column( $unpaid, 'amount' ) );
-
+        $d = GRSH_Reports_Tools::data();
+        $unpaid = array_map( function ( $u ) {
+            return [ 'id' => (int) $u['player_id'], 'name' => $u['name'], 'division' => $u['division'], 'amount' => $u['owes'], 'type' => 'primary', 'days_since' => (int) ( $u['days_waiting'] ?? 0 ) ];
+        }, $d['unpaid'] );
         return new WP_REST_Response( [
-            'players'     => $unpaid,
-            'count'       => count( $unpaid ),
-            'total_owed'  => round( $total_owed, 2 ),
+            'players'    => $unpaid,
+            'count'      => count( $unpaid ),
+            'total_owed' => $d['payments']['owed'],
         ], 200 );
     }
 
@@ -392,7 +331,9 @@ class GRSH_Reports {
         $registered   = (int) ( $summary['registered']         ?? 0 );
         $paid         = (int) ( $summary['paid']               ?? 0 );
         $outstanding  = (int) ( $summary['outstanding']        ?? 0 );
-        $owed         = number_format( (float) ( $summary['outstanding_amount'] ?? 0 ), 2 );
+        $owed_known   = isset( $summary['outstanding_amount'] ) && $summary['outstanding_amount'] !== null;
+        $owed         = $owed_known ? number_format( (float) $summary['outstanding_amount'], 2 ) : '';
+        $owed_txt     = $owed_known ? '$' . $owed : 'amount not set';
         $no_goalie    = (int) ( $summary['teams_no_goalie']    ?? 0 );
         $sandbagging  = (int) ( $summary['sandbagging_flags']  ?? 0 );
 
@@ -508,7 +449,7 @@ class GRSH_Reports {
     <strong>Action required:</strong>
     <?php
       $items = [];
-      if ( $outstanding > 0 ) $items[] = "{$outstanding} unpaid registrations (\${$owed} outstanding)";
+      if ( $outstanding > 0 ) $items[] = "{$outstanding} unpaid registrations ({$owed_txt} outstanding)";
       if ( $no_goalie > 0    ) $items[] = "{$no_goalie} teams without a confirmed goalie";
       if ( $sandbagging > 0  ) $items[] = "{$sandbagging} sandbagging flag(s) need committee review";
       echo esc_html( implode( ' · ', $items ) );
@@ -530,7 +471,7 @@ class GRSH_Reports {
     <div class="kpi <?php echo $outstanding > 0 ? 'urgent' : 'good'; ?>">
       <div class="kpi-label">Outstanding</div>
       <div class="kpi-value"><?php echo $outstanding; ?></div>
-      <div class="kpi-sub">$<?php echo $owed; ?> owed</div>
+      <div class="kpi-sub"><?php echo esc_html( $owed_txt ); ?> owed</div>
     </div>
     <div class="kpi <?php echo $no_goalie > 0 ? 'warn' : 'good'; ?>">
       <div class="kpi-label">Teams no goalie</div>
@@ -552,7 +493,7 @@ class GRSH_Reports {
     <p>
       <?php echo $season_label; ?> is currently
       <?php echo $registered > 0 ? 'underway with ' . $registered . ' registered players' : 'in the pre-registration phase'; ?>.
-      <?php if ( $outstanding > 0 ) echo "Payment collection is at " . ( $registered > 0 ? round( ( $paid / $registered ) * 100 ) : 0 ) . "% — {$outstanding} registrations ({$owed} USD) remain outstanding and should be followed up before the registration deadline."; ?>
+      <?php if ( $outstanding > 0 ) echo "Payment collection is at " . ( $registered > 0 ? round( ( $paid / $registered ) * 100 ) : 0 ) . "% — {$outstanding} registrations ({$owed_txt}) remain outstanding and should be followed up before the registration deadline."; ?>
       <?php if ( $no_goalie > 0 ) echo " {$no_goalie} team(s) currently have no confirmed goalie — the committee should prioritize goalie assignments before the draft date."; ?>
       <?php if ( $sandbagging > 0 ) echo " {$sandbagging} sandbagging flag(s) have been raised by the auto-detection system and require committee review prior to draft."; ?>
       <?php if ( $outstanding === 0 && $no_goalie === 0 && $sandbagging === 0 ) echo "All key indicators are healthy. No urgent action items for this meeting."; ?>
@@ -656,14 +597,14 @@ class GRSH_Reports {
   <?php else : ?>
     <p style="font-size:9.5pt;color:#5F5E5A;margin-bottom:12px">
       <?php echo count( $unpaid_players ); ?> player(s) &nbsp;&middot;&nbsp;
-      Total outstanding: <strong>$<?php echo number_format( (float)($unpaid['total_owed'] ?? 0), 2 ); ?></strong>
+      Total outstanding: <strong><?php echo ( $unpaid['total_owed'] ?? null ) === null ? 'amount not set' : '$' . number_format( (float) $unpaid['total_owed'], 2 ); ?></strong>
     </p>
     <table>
       <thead>
         <tr>
           <th>Player</th>
           <th>Division</th>
-          <th>Amount paid</th>
+          <th>Owes</th>
           <th>Days since reg.</th>
           <th>Recommended action</th>
         </tr>
@@ -677,7 +618,7 @@ class GRSH_Reports {
         <tr>
           <td><?php echo esc_html( $p['name'] ); ?></td>
           <td><?php echo esc_html( self::division_label( $p['division'] ) ); ?></td>
-          <td>$<?php echo number_format( (float)$p['amount'], 2 ); ?></td>
+          <td><?php echo $p['amount'] === null ? '&mdash;' : '$' . number_format( (float) $p['amount'], 2 ); ?></td>
           <td><?php echo $days; ?> days</td>
           <td style="color:<?php echo $action_color; ?>;font-weight:bold"><?php echo $action; ?></td>
         </tr>

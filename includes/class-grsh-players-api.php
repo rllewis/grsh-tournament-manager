@@ -46,6 +46,18 @@ class GRSH_Players {
             'permission_callback' => [ __CLASS__, 'check_permission' ],
         ] );
 
+        // Duplicate handling — registered BEFORE the /{id} route.
+        register_rest_route( 'grsh/v1', '/players/merge', [
+            'methods'             => 'POST',
+            'callback'            => [ __CLASS__, 'merge_players' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+        register_rest_route( 'grsh/v1', '/players/not-duplicate', [
+            'methods'             => 'POST',
+            'callback'            => [ __CLASS__, 'dismiss_duplicate' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
         register_rest_route( 'grsh/v1', '/players/(?P<id>\d+)', [
             'methods'             => 'PATCH',
             'callback'            => [ __CLASS__, 'update_player' ],
@@ -57,6 +69,154 @@ class GRSH_Players {
                 ],
             ],
         ] );
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /grsh/v1/players/not-duplicate   { a, b }
+    // Remembers that two records were reviewed and are different people.
+    // -------------------------------------------------------------------------
+    public static function dismiss_duplicate( WP_REST_Request $request ): WP_REST_Response {
+        $a = absint( $request->get_param( 'a' ) );
+        $b = absint( $request->get_param( 'b' ) );
+        if ( ! $a || ! $b || $a === $b ) {
+            return new WP_REST_Response( [ 'error' => 'Two different player ids are required.' ], 400 );
+        }
+        $key  = min( $a, $b ) . '-' . max( $a, $b );
+        $list = (array) get_option( 'grsh_dismissed_dupes', [] );
+        if ( ! in_array( $key, $list, true ) ) {
+            $list[] = $key;
+            update_option( 'grsh_dismissed_dupes', $list, false );
+        }
+        return new WP_REST_Response( [ 'ok' => true, 'key' => $key ], 200 );
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /grsh/v1/players/merge   { keep_id, remove_id }
+    //
+    // Folds the "remove" player into the "keep" player: every row that points at
+    // the removed player (history, registrations, rosters, availability, renewal
+    // invites, team captain, ...) is re-pointed at the kept player, empty fields
+    // on the kept player are filled from the removed one, the removed player's
+    // email is recorded in the kept player's notes, and the removed row is
+    // deleted. All-or-nothing: any database error rolls everything back.
+    //
+    // Refuses when both players have a history or registration row for the
+    // SAME season — that means they are two different people, not a duplicate.
+    // -------------------------------------------------------------------------
+    public static function merge_players( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+
+        $keep_id   = absint( $request->get_param( 'keep_id' ) );
+        $remove_id = absint( $request->get_param( 'remove_id' ) );
+        if ( ! $keep_id || ! $remove_id || $keep_id === $remove_id ) {
+            return new WP_REST_Response( [ 'error' => 'Choose two different players.' ], 400 );
+        }
+
+        $pt   = "{$wpdb->prefix}grsh_players";
+        $keep = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM $pt WHERE id = %d", $keep_id ), ARRAY_A );
+        $rem  = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM $pt WHERE id = %d", $remove_id ), ARRAY_A );
+        if ( ! $keep || ! $rem ) {
+            return new WP_REST_Response( [ 'error' => 'One of those players no longer exists. Reload the page.' ], 404 );
+        }
+
+        // Same-season guard.
+        foreach ( [ 'grsh_player_history' => 'history', 'grsh_registrations' => 'registration' ] as $tbl => $label ) {
+            $clash = $wpdb->get_col( $wpdb->prepare(
+                "SELECT a.season_id FROM {$wpdb->prefix}$tbl a
+                 JOIN {$wpdb->prefix}$tbl b ON b.season_id = a.season_id AND b.player_id = %d
+                 WHERE a.player_id = %d",
+                $keep_id, $remove_id
+            ) );
+            if ( $clash ) {
+                return new WP_REST_Response( [
+                    'error' => "Both records have a $label row for the same season. That means they are two different people, so they were not merged.",
+                ], 409 );
+            }
+        }
+
+        // Every table that references a player.
+        $refs = $wpdb->get_results( $wpdb->prepare(
+            "SELECT TABLE_NAME AS t, COLUMN_NAME AS c
+             FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME LIKE %s
+               AND COLUMN_NAME IN ('player_id','captain_player_id')
+               AND TABLE_NAME <> %s",
+            $wpdb->esc_like( $wpdb->prefix . 'grsh_' ) . '%',
+            "{$wpdb->prefix}grsh_audit_logs"
+        ), ARRAY_A );
+
+        $wpdb->suppress_errors( true );
+        $wpdb->query( 'START TRANSACTION' );
+        $moved  = [];
+        $failed = '';
+
+        foreach ( (array) $refs as $r ) {
+            $wpdb->query( $wpdb->prepare(
+                "UPDATE `{$r['t']}` SET `{$r['c']}` = %d WHERE `{$r['c']}` = %d",
+                $keep_id, $remove_id
+            ) );
+            if ( $wpdb->last_error ) {
+                $failed = $wpdb->last_error;
+                break;
+            }
+            if ( $wpdb->rows_affected ) {
+                $moved[ $r['t'] ] = (int) $wpdb->rows_affected;
+            }
+        }
+
+        if ( ! $failed ) {
+            // Fill gaps on the kept record; keep a trace of the removed identity.
+            $fill = [ 'phone', 'position', 'skill_tier_reported', 'years_experience',
+                      'jersey_size', 'tshirt_size', 'tshirt_type', 'current_league', 'wp_user_id' ];
+            $upd = [];
+            foreach ( $fill as $f ) {
+                if ( ( ! isset( $keep[ $f ] ) || $keep[ $f ] === '' || $keep[ $f ] === null )
+                     && isset( $rem[ $f ] ) && $rem[ $f ] !== '' && $rem[ $f ] !== null ) {
+                    $upd[ $f ] = $rem[ $f ];
+                }
+            }
+            $stamp = sprintf( 'Merged from #%d (%s %s, %s) on %s.',
+                $remove_id, $rem['first_name'], $rem['last_name'], $rem['email'], current_time( 'Y-m-d' ) );
+            $upd['notes'] = trim( ( $keep['notes'] ?? '' ) . "\n" . $stamp );
+            $wpdb->update( $pt, $upd, [ 'id' => $keep_id ] );
+            if ( $wpdb->last_error ) {
+                $failed = $wpdb->last_error;
+            }
+        }
+
+        if ( ! $failed ) {
+            $wpdb->delete( $pt, [ 'id' => $remove_id ], [ '%d' ] );
+            if ( $wpdb->last_error ) {
+                $failed = $wpdb->last_error;
+            }
+        }
+
+        if ( $failed ) {
+            $wpdb->query( 'ROLLBACK' );
+            $wpdb->suppress_errors( false );
+            return new WP_REST_Response( [
+                'error' => 'Merge failed and was rolled back; nothing changed. (' . $failed . ')',
+            ], 500 );
+        }
+
+        $wpdb->query( 'COMMIT' );
+        $wpdb->suppress_errors( false );
+
+        $wpdb->insert( "{$wpdb->prefix}grsh_audit_logs", [
+            'season_id'    => null,
+            'wp_user_id'   => get_current_user_id() ?: 0,
+            'user_display' => wp_get_current_user()->display_name ?? 'system',
+            'action'       => 'player_merged',
+            'object_type'  => 'player',
+            'object_id'    => $keep_id,
+            'before_value' => wp_json_encode( [ 'removed' => $rem ] ),
+            'after_value'  => wp_json_encode( [ 'kept_id' => $keep_id, 'moved' => $moved ] ),
+            'notes'        => "Merged player #$remove_id into #$keep_id.",
+            'ip_address'   => $_SERVER['REMOTE_ADDR'] ?? null,
+        ] );
+
+        return new WP_REST_Response( [ 'ok' => true, 'kept_id' => $keep_id, 'removed_id' => $remove_id, 'moved' => $moved ], 200 );
     }
 
     public static function check_permission(): bool {
@@ -169,7 +329,14 @@ class GRSH_Players {
                 r.status,
                 r.committee_notes,
                 r.imported_at,
-                r.created_at    AS registered_at
+                r.created_at    AS registered_at,
+                ( SELECT MAX(s2.season_year)
+                    FROM {$wpdb->prefix}grsh_player_history h2
+                    JOIN {$wpdb->prefix}grsh_seasons s2 ON s2.id = h2.season_id
+                   WHERE h2.player_id = p.id ) AS last_played_year,
+                ( SELECT COUNT(*)
+                    FROM {$wpdb->prefix}grsh_player_history h3
+                   WHERE h3.player_id = p.id ) AS history_count
             FROM {$wpdb->prefix}grsh_players p
             LEFT JOIN {$wpdb->prefix}grsh_registrations r
                 ON r.player_id = p.id
@@ -192,6 +359,7 @@ class GRSH_Players {
         return new WP_REST_Response( [
             'players'        => $players,
             'total'          => count( $players ),
+            'dismissed_duplicates' => array_values( (array) get_option( 'grsh_dismissed_dupes', [] ) ),
             'last_synced_at' => $last_synced ?: null,
             'audit'          => [
                 'user' => $current_user->display_name ?? 'Unknown',
@@ -310,6 +478,22 @@ class GRSH_Players {
     }
 
     private static function format_player( array $row ): array {
+        // Repair names saved as "First Last" in both columns by the older sync mapper.
+        $first = trim( (string) ( $row['first_name'] ?? '' ) );
+        $last  = trim( (string) ( $row['last_name']  ?? '' ) );
+        if ( $first !== '' && $first === $last && str_contains( $first, ' ' ) ) {
+            $parts = explode( ' ', $first, 2 );
+            $first = $parts[0];
+            $last  = $parts[1];
+        }
+        $row['first_name'] = $first;
+        $row['last_name']  = $last;
+
+        // A player with no registration row for the current season has NOT registered yet
+        // (e.g. created from the historical import). Do not default them to
+        // "pending" / "registered" — that makes returning players look like unpaid registrants.
+        $registered = array_key_exists( 'registration_id', $row ) ? ! empty( $row['registration_id'] ) : true;
+
         return [
             'id'                   => (int) $row['id'],
             'first_name'           => $row['first_name']           ?? '',
@@ -333,10 +517,13 @@ class GRSH_Players {
             'player_type'          => $row['player_type']          ?? 'primary',
             'division_requested'   => $row['division_requested']   ?? '',
             'division_assigned'    => $row['division_assigned']    ?: null,
-            'payment_status'       => $row['payment_status']       ?? 'pending',
+            'registered_this_season' => $registered,
+            'last_played_year'     => ! empty( $row['last_played_year'] ) ? (int) $row['last_played_year'] : null,
+            'history_count'        => (int) ( $row['history_count'] ?? 0 ),
+            'payment_status'       => $registered ? ( $row['payment_status'] ?? 'pending' ) : null,
             'payment_method'       => $row['payment_method']       ?? '',
             'amount_paid'          => (float) ( $row['amount_paid'] ?? 0 ),
-            'status'               => $row['status']               ?? 'registered',
+            'status'               => $registered ? ( $row['status'] ?? 'registered' ) : 'returning',
             'committee_notes'      => $row['committee_notes']      ?? '',
             'imported_at'          => $row['imported_at']          ?? null,
             'registered_at'        => $row['registered_at']        ?? null,
