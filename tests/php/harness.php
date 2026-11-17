@@ -34,6 +34,8 @@ function wp_json_encode( $v ) { return json_encode( $v ); }
 function current_time( $t ) { return $t === 'mysql' ? gmdate( 'Y-m-d H:i:s' ) : gmdate( $t ); }
 function get_current_user_id() { return 1; }
 function wp_get_current_user() { return new class { public $display_name = 'Test Admin'; public $user_email = 'admin@test.test'; function exists() { return true; } }; }
+if ( ! function_exists( 'sanitize_email' ) ) { function sanitize_email( $e ) { return trim( (string) $e ); } }
+if ( ! function_exists( 'sanitize_textarea_field' ) ) { function sanitize_textarea_field( $s ) { return trim( strip_tags( (string) $s ) ); } }
 function is_email( $e ) { return (bool) filter_var( $e, FILTER_VALIDATE_EMAIL ); }
 function wp_mail( $to, $subj, $body, $h = [] ) { $GLOBALS['mails'][] = [ $to, $subj, $body ]; return true; }
 function esc_html( $s ) { return htmlspecialchars( (string) $s, ENT_QUOTES ); }
@@ -67,8 +69,15 @@ class wpdb {
         }, $q );
     }
     function suppress_errors( $b = true ) { $this->quiet = $b; }
+    function esc_like( $t ) { return addcslashes( (string) $t, '_%\\' ); }
+    function get_charset_collate() { return ''; }
     private function run( $q ) {
         if ( preg_match( '/GET_LOCK|RELEASE_LOCK/', $q ) ) { return 'LOCK'; }
+        if ( preg_match( "/^SHOW TABLES LIKE '(.+)'$/i", trim( $q ), $m ) ) { return $this->pdo->query( "SELECT name FROM sqlite_master WHERE type='table' AND name=" . $this->pdo->quote( $m[1] ) ); }
+        if ( preg_match( "/^SHOW COLUMNS FROM (\S+) LIKE '(.+)'$/i", trim( $q ), $m ) ) {
+            $cols = array_column( $this->pdo->query( "PRAGMA table_info({$m[1]})" )->fetchAll( PDO::FETCH_ASSOC ), 'name' );
+            return $this->pdo->query( in_array( $m[2], $cols, true ) ? "SELECT " . $this->pdo->quote( $m[2] ) : 'SELECT 1 WHERE 0' );
+        }
         try { return $this->pdo->query( $q ); }
         catch ( PDOException $e ) { if ( $this->quiet ) { return $this->pdo->query( 'SELECT 1 WHERE 0' ); } throw $e; }   // like MySQL with errors suppressed: no rows
     }
@@ -78,6 +87,7 @@ class wpdb {
     function get_var( $q ) { $r = $this->run( $q ); if ( $r === 'LOCK' ) { return 1; } $v = $r->fetchColumn(); return $v === false ? null : $v; }
     function query( $q ) {
         if ( preg_match( '/^START TRANSACTION/i', $q ) ) { $q = 'BEGIN'; }
+        if ( preg_match( '/^TRUNCATE TABLE\s+(\S+)/i', $q, $m ) ) { $q = 'DELETE FROM ' . $m[1]; }
         $this->pdo->exec( $q ); return true;
     }
     function insert( $t, $data ) {

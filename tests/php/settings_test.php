@@ -1,6 +1,7 @@
 <?php
 // GRSH_Settings (real class) against the SQLite shim. Usage: php settings_test.php [settings-class]
 if ( ! defined( 'ABSPATH' ) ) { define( 'ABSPATH', '/' ); }
+class GRSH_Team_Deposit { const FORM_ID = 5181; const TEST_FORM_ID = 5178; }
 class GRSH_Sync_Engine { const SEASON = 2027; const FORM_ID = 5047; const TEST_FORM_ID = 5210; }
 function get_posts( $a ) { return $GLOBALS['forms_posts'] ?? []; }
 $GLOBALS['wpdb'] = null;
@@ -156,7 +157,7 @@ eq( array_column( $f['forms'], 'id' ), [ 5210, 5047, 2273 ], 'forms read from th
 eq( $f['forms'][1]['entries'], null, 'no entries table -> entries unknown (null), not 0' );
 $db->pdo->exec( "CREATE TABLE wp_wpforms_entries (entry_id INTEGER PRIMARY KEY AUTOINCREMENT, form_id INT); INSERT INTO wp_wpforms_entries (form_id) VALUES (5047),(5047),(5047),(5210)" );
 $f = GRSH_Settings::get_overview()->data['forms']; eq( [ $f['forms'][1]['entries'], $f['forms'][0]['entries'], $f['forms'][2]['entries'] ], [ 3, 1, 0 ], 'entry counts per form (0 for a form with none)' );
-eq( GRSH_Settings::get_overview()->data['sync_forms'], [ 'live' => 5047, 'test' => 5210 ], 'sync forms reported' );
+eq( GRSH_Settings::get_overview()->data['sync_forms'], [ 'live' => 5047, 'test' => 5210, 'team' => 5181, 'team_test' => 5178 ], 'sync forms reported (player + team)' );
 eq( GRSH_Settings::wiring()['form_id']['state'], 'not_connected', 'form id setting is honestly not connected to the sync' );
 $hl = implode( ' | ', array_column( GRSH_Settings::get_overview()->data['health'], 'text' ) );
 ok( strpos( $hl, 'Form #5047 exists in WPForms.' ) !== false, 'health: form found' ); ok( strpos( $hl, 'Registration sync is fixed to form #5047 (test form #5210 also accepted)' ) !== false, 'health explains the sync form' );
@@ -164,7 +165,7 @@ GRSH_Settings::save_settings( req( [], [ 'form_id' => 4000 ] ) );
 $hl = implode( ' | ', array_column( GRSH_Settings::get_overview()->data['health'], 'text' ) );
 ok( strpos( $hl, 'Form #4000 was not found in WPForms (3 forms found)' ) !== false, 'health: unknown form id' ); ok( strpos( $hl, 'Settings says form #4000 but the sync only listens to #5047' ) !== false, 'health: setting differs from the sync form' );
 GRSH_Settings::save_settings( req( [], [ 'form_id' => 5047 ] ) );
-$GLOBALS['forms_posts'] = [ $mk( 2273, 'TCC Captain' ) ]; $hl = implode( ' | ', array_column( GRSH_Settings::get_overview()->data['health'], 'text' ) );
+$GLOBALS['forms_posts'] = [ $mk( 2273, 'TCC Captain' ) ]; $hl0 = implode( ' | ', array_column( GRSH_Settings::get_overview()->data['health'], 'text' ) ); ok( strpos( $hl0, 'Team registration deposits listen to form #5181' ) !== false, 'health: team form missing' ); $hl = implode( ' | ', array_column( GRSH_Settings::get_overview()->data['health'], 'text' ) );
 ok( strpos( $hl, 'The sync listens to form #5047 but WPForms has no such form' ) !== false, 'health: live sync form missing from WPForms' );
 $GLOBALS['forms_posts'] = [];
 GRSH_Settings::save_settings( req( [], [ 'status' => 'open', 'registration_opens' => '2025-01-01', 'registration_closes' => '2025-02-01', 'draft_date' => '2025-03-01' ] ) );

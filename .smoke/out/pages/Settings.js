@@ -761,7 +761,7 @@ function Settings() {
               })
             }), /*#__PURE__*/(0, _jsxRuntime.jsxs)(Field, {
               id: "f-form_id",
-              label: "Registration form (WPForms)",
+              label: "Player registration form (WPForms)",
               error: err.form_id,
               hint: formList ? formKnown ? `${formKnown.title}${formKnown.entries !== null ? " · " + formKnown.entries + " entries" : ""}` : "" : "WPForms could not be read here, so type the form ID.",
               children: [formList ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("select", {
@@ -785,7 +785,7 @@ function Settings() {
                 children: ["Form #", cfg.form_id, " was not found in the WPForms list (", formList.length, " forms found)."]
               }), /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
                 className: "gs-note",
-                children: sync && sync.live ? `Not connected yet: registration sync is fixed to form #${sync.live}${sync.test ? ` (test form #${sync.test} also accepted)` : ""} in the plugin code. Changing this does not change what syncs.` : "Not connected yet: the sync does not read this setting."
+                children: sync && sync.live ? `Not connected yet: the sync is fixed in code. Player registration (draft) = form #${sync.live}${sync.test ? `, test #${sync.test}` : ""}. Team registration = form #${sync.team || "?"}${sync.team_test ? `, test #${sync.team_test}` : ""}. Changing this box does not change what syncs.` : "Not connected yet: the sync does not read this setting."
               })]
             })]
           })

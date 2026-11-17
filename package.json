@@ -7,8 +7,8 @@
     "build": "webpack --config webpack.config.js",
     "start": "webpack --watch --config webpack.config.js",
     "lint:js": "wp-scripts lint-js",
-    "test": "node tests/js/build.mjs && node tests/js/rosterEngine.test.mjs && node tests/js/dashboardEngine.test.mjs && node tests/js/reportsEngine.test.mjs && node tests/js/settingsEngine.test.mjs",
-    "test:php": "php tests/php/rosters_test.php && php tests/php/dashboard_test.php && php tests/php/history_test.php && php tests/php/reports_test.php && php tests/php/settings_test.php"
+    "test": "node tests/js/build.mjs && node tests/js/rosterEngine.test.mjs && node tests/js/dashboardEngine.test.mjs && node tests/js/reportsEngine.test.mjs && node tests/js/settingsEngine.test.mjs && node tests/js/importEngine.test.mjs",
+    "test:php": "php tests/php/rosters_test.php && php tests/php/dashboard_test.php && php tests/php/history_test.php && php tests/php/reports_test.php && php tests/php/settings_test.php && php tests/php/history_import_test.php"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -1,0 +1,133 @@
+import * as E from "./.build/importEngine.mjs";
+let pass = 0, fail = 0;
+const ok = (c, m) => { if (c) pass++; else { fail++; console.log("  FAIL:", m); } };
+const eq = (a, b, m) => ok(JSON.stringify(a) === JSON.stringify(b), `${m} (got ${JSON.stringify(a)}, want ${JSON.stringify(b)})`);
+
+console.log("1. reading files");
+eq(E.parseTable("a,b\n1,2\n").rows, [["1", "2"]], "plain csv");
+eq(E.parseTable("﻿first_name,email\nA,b@x.com").headers, ["first_name", "email"], "Excel byte-order mark stripped from the first header");
+eq(E.parseTable('name,notes\n"Smith, Jr.","said ""hi""\nsecond line"\n').rows, [['Smith, Jr.', 'said "hi"\nsecond line']], "quoted comma, doubled quote and line break");
+eq(E.parseTable("a,b\r\n1,2\r\n3,4\r\n").rows, [["1", "2"], ["3", "4"]], "Windows line endings");
+eq(E.parseTable("a,b\n1,2\n\n\n3,4\n,\n").rows, [["1", "2"], ["3", "4"]], "blank and comma-only rows dropped");
+eq(E.parseTable("a;b\n1;2\n").delimiter, ";", "semicolon file detected");
+eq(E.parseTable("a;b\n1;2\n").rows, [["1", "2"]], "semicolon rows");
+eq(E.parseTable("a\tb\n1\t2\n").delimiter, "\t", "tab (pasted from Excel) detected");
+eq(E.parseTable('a,b\n"x;y",2\n').delimiter, ",", "a semicolon inside quotes does not change the delimiter");
+eq(E.parseTable("a,b,c\n1\n").rows, [["1", "", ""]], "short rows are padded");
+eq(E.parseTable("a,b\n1,2,3,4\n").rows, [["1", "2"]], "extra cells are dropped");
+eq(E.parseTable("").rowCount, 0, "empty text");
+eq(E.parseTable("a,b").rowCount, 0, "header only");
+eq(E.parseTable("a,b\n1,2").rows, [["1", "2"]], "no trailing newline");
+eq(E.parseTable("  a , b \n 1 , 2 \n").rows, [["1", "2"]], "cells trimmed");
+
+console.log("2. matching columns");
+const m = E.autoMap(["First Name", "Last Name", "Email Address", "Season", "Division", "Tier", "Captain", "Mystery"]);
+eq(m.map((x) => x.col), ["first_name", "last_name", "email", "season_year", "division_played", "skill_tier_reported", "was_captain", ""], "common spellings matched");
+eq(m.map((x) => x.how), ["exact", "exact", "alias", "alias", "alias", "alias", "alias", "none"], "how each was matched (First Name reads as first_name)");
+eq(E.missingRequired(m), [], "all required present");
+eq(E.missingRequired(E.autoMap(["first_name", "last_name", "season_year"])), ["email", "division_played"], "missing required columns listed");
+eq(E.autoMap(["email", "Email Address"]).map((x) => [x.col, x.how]), [["email", "exact"], ["", "duplicate"]], "a column is only used once");
+eq(E.autoMap(["emial"]).map((x) => [x.col, x.how]), [["email", "fuzzy"]], "typo suggested but marked for review");
+eq(E.autoMap(["seasn_year"])[0].col, "season_year", "another typo");
+eq(E.autoMap(["xyzzy"])[0].how, "none", "unrelated header ignored");
+eq(E.autoMap(["ab"])[0].how, "none", "short headers are never guessed");
+eq(E.needsReview(E.autoMap(["emial", "first_name"])).length, 1, "only fuzzy matches need review");
+const m2 = E.setMapping(E.autoMap(["Mail", "E-mail"]), 0, "email");
+eq(m2.map((x) => x.col), ["email", ""], "choosing a column moves it off the other file column");
+eq(E.setMapping(m2, 0, "").map((x) => x.how)[0], "none", "choosing skip clears it");
+eq(E.autoMap(["Email"])[0].col, "email", "case-insensitive");
+eq(E.autoMap(["E-mail"])[0].col, "email", "hyphen treated like underscore");
+eq(E.autoMap(["﻿email"])[0].col, "email", "BOM inside a header");
+eq(E.unusedColumns(E.autoMap(["email", "zzzzzz"])).length, 1, "unused columns listed");
+
+console.log("3. building the clean file");
+const t = E.parseTable("First Name,Last Name,Email Address,Season,Division,Ignore me\nMike,Hartley,m@x.com,2025,Gold Open,x\n");
+const map = E.autoMap(t.headers);
+eq(E.toRecords(t, map), [{ first_name: "Mike", last_name: "Hartley", email: "m@x.com", season_year: "2025", division_played: "Gold Open" }], "records use our column names, unknown columns dropped");
+eq(E.canonicalCSV(t, map), "first_name,last_name,email,season_year,division_played\r\nMike,Hartley,m@x.com,2025,Gold Open\r\n", "canonical file: our headers, our order");
+eq(E.canonicalCSV(E.parseTable("Email,Season,Last,First,Division\nm@x.com,2025,H,M,gold_open"), E.autoMap(["Email", "Season", "Last", "First", "Division"])).split("\r\n")[0], "first_name,last_name,email,season_year,division_played", "columns reordered into our order");
+eq(E.canonicalCSV(E.parseTable("a,b\n1,2"), E.autoMap(["email", "x"])).split("\r\n")[1], "1", "only matched columns are sent");
+const tricky = E.parseTable('first_name,last_name,email,season_year,division_played,committee_notes\nA,"O\'Neil, Jr.",a@x.com,2025,gold_open,"line1\nline2 ""q"""\n');
+const again = E.parseTable(E.canonicalCSV(tricky, E.autoMap(tricky.headers)));
+eq(again.rows, tricky.rows, "write then read gives the same rows (commas, quotes, line breaks)");
+eq(E.csvCell("=SUM(A1)", true), "'=SUM(A1)", "spreadsheet formula neutralised in downloads");
+eq(E.csvCell("=SUM(A1)", false), "=SUM(A1)", "…but not in the file we upload");
+eq(E.csvCell("-5", true), "-5", "negative numbers left alone");
+eq(E.csvCell("@home", true), "'@home", "@ neutralised");
+eq(E.csvCell('a"b', false), '"a""b"', "quotes doubled");
+eq(E.templateCSV().split("\r\n")[0], E.COLUMN_KEYS.join(","), "template has every column");
+eq(E.parseTable(E.templateCSV()).rowCount, 3, "template has 3 example rows");
+eq(E.parseTable(E.templateCSV()).rows[0].length, E.COLUMN_KEYS.length, "template rows are full width");
+eq(E.missingRequired(E.autoMap(E.parseTable(E.templateCSV()).headers)), [], "template maps cleanly");
+
+console.log("4. fix-it file");
+const t2 = E.parseTable("first_name,email\nA,ok@x.com\nB,bad\nC,=cmd|x\n");
+const issues = [{ line: 3, level: "error", field: "email", message: "Invalid email 'bad'." }, { line: 4, level: "error", field: "email", message: "Invalid." }, { line: 3, level: "warning", field: "x", message: "ignore me" }];
+const pr = E.problemsFromRows(t2.rows, issues);
+eq(pr, [{ row: 2, messages: ["email: Invalid email 'bad'."] }, { row: 3, messages: ["email: Invalid."] }], "server line n maps to data row n-1; warnings are not problems");
+const rep = E.errorReportCSV(t2, pr);
+eq(rep.split("\r\n")[0], "problem,first_name,email", "problem column first");
+eq(rep.split("\r\n")[1], "email: Invalid email 'bad'.,B,bad", "rejected row with its reason");
+ok(rep.includes("'=cmd|x"), "formula in a bad row is neutralised");
+eq(rep.split("\r\n").length, 4, "two rows plus header plus trailing newline");
+
+const t3 = E.parseTable("first_name,email,extra\nA,a@x.com,x\n,,note only\nB,b@x.com,y\n");
+const map3 = E.autoMap(t3.headers);
+eq(E.keptIndex(t3, map3), [0, 2], "a row blank in every matched column is dropped (the server drops it too)");
+eq(E.canonicalCSV(t3, map3), "first_name,email\r\nA,a@x.com\r\nB,b@x.com\r\n", "blank row not sent");
+eq([E.sheetLine([0, 2], 2), E.sheetLine([0, 2], 3), E.sheetLine([0, 2], 99)], [2, 4, 99], "server line maps back to the user's sheet line");
+const rep3 = E.errorReportCSV(t3, [{ row: 2, messages: ["bad"] }], E.keptIndex(t3, map3));
+eq(rep3.split("\r\n")[1], "bad,B,b@x.com,y", "fix-it file picks the right original row after a blank row was dropped");
+
+console.log("5. numbers for the screen");
+const rows = [{ action: "insert" }, { action: "insert" }, { action: "update" }, { action: "skip" }, { action: "error" }, { action: "unchanged" }];
+eq(E.countActions(rows), { insert: 2, update: 1, unchanged: 1, skip: 1, error: 1 }, "counts");
+const bar = E.summaryBar(E.countActions(rows));
+eq(bar.map((b) => b.n), [2, 1, 1, 1, 1], "segments"); ok(Math.abs(bar.reduce((s, b) => s + b.pct, 0) - 100) < 0.5, "percentages add to 100");
+eq(E.summaryBar({ insert: 0, update: 0, unchanged: 0, skip: 0, error: 0 }).map((b) => b.pct), [0, 0, 0, 0, 0], "empty has no NaN");
+eq(E.verdict({ blocked: true, message: "x" }).tone, "bad", "blocked is bad");
+eq(E.verdict({ imported: 5, updated: 0, rows: [] }).headline, "Ready to import 5 rows", "ready");
+eq(E.verdict({ imported: 1, updated: 0, rows: [] }).headline, "Ready to import 1 row", "singular");
+eq(E.verdict({ imported: 5, updated: 2, rows: [{ action: "error" }] }).tone, "warn", "some bad rows is a warning");
+eq(E.verdict({ imported: 5, updated: 2, rows: [{ action: "error" }] }).headline, "7 rows ready, 1 need fixing", "warn headline");
+eq(E.verdict({ imported: 0, updated: 0, rows: [{ action: "error" }, { action: "error" }] }).tone, "bad", "all bad");
+eq(E.verdict({ imported: 0, updated: 0, rows: [{ action: "skip" }] }).tone, "info", "nothing to do");
+eq(E.verdict(null), null, "no result");
+eq(E.impactLines({ new_players: 3, matched_players: 1, new_seasons: [2023], tier_warnings: 2, no_show_players: 1 }).map((l) => l.key), ["new_players", "matched", "seasons", "tier", "noshow"], "impact lines");
+ok(E.impactLines({ new_players: 1 })[0].text.startsWith("1 new player was"), "singular grammar");
+eq(E.impactLines({}), [], "no impact lines when nothing happened");
+eq(E.diffText(["C1", "B3"], "skill_tier_reported"), "skill tier reported: C1 → B3", "diff text");
+eq(E.diffText([null, "x"], "team_name"), "team name: empty → x", "diff from empty");
+
+console.log("6. coverage map");
+const g = E.coverageGrid([{ season_year: 2025, division: "gold_open", n: 40 }, { season_year: 2024, division: "gold_open", n: 20 }, { season_year: 2025, division: "womens", n: 10 }]);
+eq(g.seasons, [2025, 2024], "newest season first"); eq(g.divisions, ["gold_open", "womens"], "only divisions with data, in our order");
+eq(g.gaps, [{ season: 2024, division: "womens" }], "a gap is a season where a known division has no records"); eq(g.max, 40, "max");
+eq([E.heat(0, 40), E.heat(1, 40), E.heat(10, 40), E.heat(20, 40), E.heat(40, 40)], [0, 1, 1, 2, 4], "heat levels 0 to 4");
+eq(E.heat(5, 0), 0, "no max, no heat");
+eq(E.coverageGrid([]).seasons, [], "empty coverage"); eq(E.coverageGrid(undefined).gaps, [], "undefined coverage");
+
+console.log("7. text helpers");
+eq(E.fmtStamp("2026-11-17 14:31:00"), "Nov 17, 2026 · 2:31 pm", "timestamp read as written");
+eq(E.fmtStamp("2026-01-02 00:05:00"), "Jan 2, 2026 · 12:05 am", "midnight");
+eq(E.fmtStamp("2026-01-02 12:00:00"), "Jan 2, 2026 · 12:00 pm", "noon");
+eq(E.fmtStamp("garbage"), "garbage", "unparseable stays as is"); eq(E.fmtStamp(null), "", "null");
+eq(E.fmtBytes(512), "512 B", "bytes"); eq(E.fmtBytes(2048), "2.0 KB", "KB"); eq(E.fmtBytes(5 * 1048576), "5.0 MB", "MB");
+eq(E.plural(1, "row"), "1 row", "plural 1"); eq(E.plural(2, "row"), "2 rows", "plural 2"); eq(E.plural(0, "row"), "0 rows", "plural 0");
+eq(E.levenshtein("kitten", "sitting"), 3, "edit distance");
+
+console.log("8. bytes and exports");
+eq(E.decodeBytes(new TextEncoder().encode("Fran\u00e7ois")), "Fran\u00e7ois", "UTF-8 file");
+eq(E.decodeBytes(new Uint8Array([70, 114, 97, 110, 0xE7, 111, 105, 115])), "Fran\u00e7ois", "Windows-1252 file (a lone 0xE7)");
+eq(E.recordsCSV([{ first_name: "A", last_name: "B", email: "a@x.com", season_year: 2025, division_played: "gold_open", was_captain: true, was_alternate: false, sandbagging_flag: 1, games_attended: null, committee_notes: "=bad" }]).split("\r\n")[1],
+  "A,B,a@x.com,2025,gold_open,,,,1,0,0,,,,,1,'=bad", "export row: booleans as 1/0, nulls blank, formulas neutralised");
+eq(E.recordsCSV([]).split("\r\n")[0], E.COLUMN_KEYS.join(","), "empty export still has headers");
+const rt = E.parseTable(E.recordsCSV([{ first_name: "A", last_name: "B", email: "a@x.com", season_year: 2025, division_played: "gold_open" }]));
+eq(E.missingRequired(E.autoMap(rt.headers)), [], "an export can be imported again");
+eq([E.isCsvName("a.CSV"), E.isCsvName("a.txt"), E.isCsvName("a.pdf"), E.isCsvName("csv")], [true, true, false, false], "file names");
+eq(E.MAX_BYTES, 5242880, "5 MB");
+
+eq(["Gold Open", "gold_open", "Senior B", "senior-c", "Women's", "45A", "Mystery", ""].map(E.normDivision), ["gold_open", "gold_open", "senior_b", "senior_c", "womens", "45a", "Mystery", ""], "division spellings");
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);
