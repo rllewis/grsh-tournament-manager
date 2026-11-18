@@ -96,7 +96,7 @@ class GRSH_Team_Deposit {
     /**
      * Fires for every WPForms submission sitewide — must self-filter to
      * self::FORM_ID (or self::TEST_FORM_ID), same pattern as
-     * GRSH_Captain_Sync::on_form_submit().
+     * GRSH_Captain_Sync's old on-submit hook (since removed).
      */
     public static function on_deposit_form_submit( array $fields, array $entry, array $form_data, int $entry_id ): void {
         $submitted_form_id = (int) ( $form_data['id'] ?? 0 );
@@ -140,6 +140,18 @@ class GRSH_Team_Deposit {
             return;
         }
 
+        self::record_deposit( $team, $entry_id );
+    }
+
+    /**
+     * Writes the deposit onto a team and sends the confirmation email. Shared by the live form hook above and by the
+     * Captain Sync repair tool (which passes the entry's own date, so a repair made after the early-fee cutoff still
+     * gives the tier the captain actually qualified for, and passes $send_email as the admin chose).
+     *
+     * @param string|null $paid_at Site-time 'Y-m-d H:i:s' the deposit was made; null means now.
+     * @return array{recorded:bool,reason?:string,fee_total?:float,fee_tier?:string,deposit_amount?:float,balance_due?:float,status?:string,before?:array,after?:array}
+     */
+    public static function record_deposit( array $team, int $entry_id, ?string $paid_at = null, bool $send_email = true ): array {
         // Idempotency: a duplicate submit / webhook retry should not
         // silently overwrite an already-recorded deposit.
         if ( ! empty( $team['deposit_paid_at'] ) ) {
@@ -147,29 +159,29 @@ class GRSH_Team_Deposit {
                 'team_deposit_duplicate_ignored', 'team', (int) $team['id'], null, null,
                 'Deposit form submitted again (entry ' . $entry_id . ') for a team that already has deposit_paid_at set — ignored.'
             );
-            return;
+            return [ 'recorded' => false, 'reason' => 'already_recorded' ];
         }
 
+        $paid_at        = $paid_at ?: current_time( 'mysql' );
         $settings       = GRSH_Settings::get();
         $deposit_amount = (float) ( $settings['team_deposit_amount'] ?? 500.00 );
 
-        [ $fee_total, $fee_tier ] = self::determine_fee_total( $settings );
+        [ $fee_total, $fee_tier ] = self::determine_fee_total( $settings, substr( $paid_at, 0, 10 ) );
         $balance_due = max( 0.0, $fee_total - $deposit_amount );
         $status      = $balance_due <= 0 ? 'paid_in_full' : 'deposit_paid';
 
+        $before = [
+            'fee_total' => $team['fee_total'] ?? null, 'fee_tier' => $team['fee_tier'] ?? null, 'deposit_amount' => $team['deposit_amount'] ?? null,
+            'deposit_paid_at' => $team['deposit_paid_at'] ?? null, 'balance_due' => $team['balance_due'] ?? null,
+            'payment_status' => $team['payment_status'] ?? 'unpaid',
+        ];
+        $after = [
+            'fee_total' => $fee_total, 'fee_tier' => $fee_tier, 'deposit_amount' => $deposit_amount,
+            'deposit_paid_at' => $paid_at, 'balance_due' => $balance_due, 'payment_status' => $status,
+        ];
+
         global $wpdb;
-        $wpdb->update(
-            "{$wpdb->prefix}grsh_teams",
-            [
-                'fee_total'       => $fee_total,
-                'fee_tier'        => $fee_tier,
-                'deposit_amount'  => $deposit_amount,
-                'deposit_paid_at' => current_time( 'mysql' ),
-                'balance_due'     => $balance_due,
-                'payment_status'  => $status,
-            ],
-            [ 'id' => (int) $team['id'] ]
-        );
+        $wpdb->update( "{$wpdb->prefix}grsh_teams", $after, [ 'id' => (int) $team['id'] ] );
 
         self::log_audit(
             'team_deposit_paid', 'team', (int) $team['id'], null,
@@ -181,7 +193,25 @@ class GRSH_Team_Deposit {
         // otherwise the only confirmation they get is the generic WPForms
         // page, and the next email they'd hear from us is the balance
         // reminder much closer to the deadline.
-        self::send_deposit_confirmation_email( (int) $team['id'], $team, $fee_total, $fee_tier, $balance_due, $deposit_amount, $settings );
+        if ( $send_email ) {
+            self::send_deposit_confirmation_email( (int) $team['id'], $team, $fee_total, $fee_tier, $balance_due, $deposit_amount, $settings );
+        }
+
+        return [
+            'recorded' => true, 'fee_total' => $fee_total, 'fee_tier' => $fee_tier, 'deposit_amount' => $deposit_amount,
+            'balance_due' => $balance_due, 'status' => $status, 'before' => $before, 'after' => $after,
+        ];
+    }
+
+    /** What recording a deposit paid on $paid_at would produce. Writes nothing. */
+    public static function preview_deposit( ?string $paid_at = null ): array {
+        $paid_at  = $paid_at ?: current_time( 'mysql' );
+        $settings = GRSH_Settings::get();
+        $deposit  = (float) ( $settings['team_deposit_amount'] ?? 500.00 );
+        [ $fee_total, $fee_tier ] = self::determine_fee_total( $settings, substr( $paid_at, 0, 10 ) );
+        $balance = max( 0.0, $fee_total - $deposit );
+        return [ 'fee_total' => $fee_total, 'fee_tier' => $fee_tier, 'deposit_amount' => $deposit, 'balance_due' => $balance,
+                 'payment_status' => $balance <= 0 ? 'paid_in_full' : 'deposit_paid', 'deposit_paid_at' => $paid_at ];
     }
 
     /**
@@ -197,12 +227,13 @@ class GRSH_Team_Deposit {
      * which locked-in total applies. Paid ON the cutoff date still counts
      * as early (inclusive).
      */
-    private static function determine_fee_total( array $settings ): array {
+    private static function determine_fee_total( array $settings, ?string $as_of = null ): array {
         $cutoff = $settings['team_fee_early_cutoff_date'] ?? '';
         $early  = (float) ( $settings['team_fee_early_amount'] ?? 1750.00 );
         $late   = (float) ( $settings['team_fee_late_amount'] ?? 2000.00 );
+        $as_of  = $as_of ?: current_time( 'Y-m-d' );
 
-        if ( $cutoff && strtotime( current_time( 'Y-m-d' ) ) <= strtotime( $cutoff ) ) {
+        if ( $cutoff && strtotime( $as_of ) <= strtotime( $cutoff ) ) {
             return [ $early, 'early' ];
         }
         return [ $late, 'late' ];

@@ -8,6 +8,8 @@ import History       from "./pages/History";
 import Reports       from "./pages/Reports";
 import Settings      from "./pages/Settings";
 import HistoryImport from "./pages/HistoryImport";
+import CaptainSync   from "./pages/CaptainSync";
+import ScoreSheets   from "./pages/ScoreSheets";
 import ErrorBoundary from "./components/ErrorBoundary";
 import NoticeToggle   from "./components/NoticeToggle";
 
@@ -22,6 +24,8 @@ const PAGES = {
   "grsh-tm-reports":        Reports,
   "grsh-tm-settings":       Settings,
   "grsh-tm-history-import": HistoryImport,
+  "grsh-captain-sync":      CaptainSync,
+  "grsh-score-sheets":      ScoreSheets,
 };
 
 export default function App() {

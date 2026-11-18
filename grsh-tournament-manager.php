@@ -73,7 +73,7 @@ $grsh_includes = [
     'class-grsh-captain-provision.php', // Shared name+email → WP account + team (used by Invite + Signup)
     'class-grsh-captain-invite.php',  // Admin "Invite a Captain" tool
     'class-grsh-captain-signup.php',  // Public [grsh_captain_signup] self-service form
-    'class-grsh-captain-sync.php',    // Tahoe Champions Cup: syncs WPForms 2273 → full_team
+    'class-grsh-captain-sync.php',    // Captain Sync: reconciles team-form deposits (GRSH only)
     'class-grsh-admin-full-teams.php',// Board view/edit/override for full-team rosters
     'class-grsh-alternates.php',      // Alternates REST routes
     'class-grsh-renewals.php',        // Renewal invites for returning players (email + tracked link)
@@ -295,7 +295,8 @@ function grsh_render_app_shell(): void {
 // -------------------------------------------------------------------------
 
 function grsh_enqueue_admin_assets( string $hook ): void {
-    if ( ! str_contains( $hook, 'grsh-tm' ) ) {
+    // Captain Sync keeps its older slug (grsh-captain-sync), so its hook name has no 'grsh-tm' in it.
+    if ( ! str_contains( $hook, 'grsh-tm' ) && ! str_contains( $hook, 'grsh-captain-sync' ) && ! str_contains( $hook, 'grsh-score-sheets' ) ) {
         return;
     }
 
