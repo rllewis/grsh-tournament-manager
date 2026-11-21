@@ -238,9 +238,11 @@ function Funnel({
         "aria-pressed": active === s.key,
         onClick: () => onPick(active === s.key ? "" : s.key),
         title: s.help,
-        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
           className: "gc-fun-n",
-          children: s.n
+          children: [s.n, /*#__PURE__*/(0, _jsxRuntime.jsxs)("small", {
+            children: [" of ", s.total]
+          })]
         }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
           className: "gc-fun-l",
           children: s.label
@@ -251,9 +253,9 @@ function Funnel({
               width: s.pct + "%"
             }
           })
-        }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+        }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
           className: "gc-fun-p",
-          children: [s.pct, "%", i === 0 ? " of teams" : ""]
+          children: s.showPct ? s.pct + "%" : i === 0 ? "all teams" : s.n === s.total ? "all" : s.n === 0 ? "none yet" : ""
         })]
       }, s.key))
     })]
@@ -480,6 +482,442 @@ function NudgeDialog({
     })]
   });
 }
+function RemoveDialog({
+  team,
+  onClose,
+  onDone,
+  toast
+}) {
+  const [imp, setImp] = (0, _react.useState)(null);
+  const [typed, setTyped] = (0, _react.useState)("");
+  const [reason, setReason] = (0, _react.useState)("");
+  const [ack, setAck] = (0, _react.useState)(false);
+  const [busy, setBusy] = (0, _react.useState)(false);
+  (0, _react.useEffect)(() => {
+    let live = true;
+    (async () => {
+      const r = await post("/captain-sync/remove-team", {
+        team_id: team.id,
+        dry_run: true
+      });
+      if (live) setImp(r.ok && r.j.success ? r.j.impact : {
+        error: r.j.message || "Could not check this team."
+      });
+    })();
+    return () => {
+      live = false;
+    };
+  }, [team.id]);
+  const L = C.removalLines(imp && !imp.error ? imp : null);
+  const ok = imp && !imp.error && C.removalReady(imp, team.name, typed, reason, ack);
+  const go = async () => {
+    if (!ok || busy) return;
+    setBusy(true);
+    const r = await post("/captain-sync/remove-team", {
+      team_id: team.id,
+      reason,
+      confirm_name: typed,
+      acknowledge: ack
+    });
+    setBusy(false);
+    toast(r.j.message || (r.ok ? "Removed." : "Could not remove."), r.ok && r.j.success ? "" : "bad");
+    if (r.ok && r.j.success) onDone();
+  };
+  return /*#__PURE__*/(0, _jsxRuntime.jsxs)(Modal, {
+    title: `Remove ${team.name}?`,
+    onClose: onClose,
+    children: [!imp ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+      className: "gc-sub",
+      role: "status",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+        className: "gc-spin"
+      }), " Checking what is attached\u2026"]
+    }) : imp.error ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+      className: "gc-alert bad",
+      role: "alert",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+        n: "alert",
+        s: 16
+      }), " ", imp.error]
+    }) : /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("h3", {
+        className: "gc-h3",
+        children: "This will remove"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("ul", {
+        className: "gc-res",
+        children: L.removes.map(x => /*#__PURE__*/(0, _jsxRuntime.jsx)("li", {
+          children: x
+        }, x))
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("h3", {
+        className: "gc-h3",
+        children: "This will keep"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("ul", {
+        className: "gc-res",
+        children: L.keeps.map(x => /*#__PURE__*/(0, _jsxRuntime.jsx)("li", {
+          children: x
+        }, x))
+      }), L.blocked.length ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+        className: "gc-alert bad",
+        role: "alert",
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+          n: "alert",
+          s: 16
+        }), " ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+          children: ["Cannot remove: ", L.blocked.join(" and "), "."]
+        })]
+      }) : /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+          className: "gc-sub",
+          children: "The History tab keeps a full copy, including roster rows and the payment, so an admin can restore it."
+        }), /*#__PURE__*/(0, _jsxRuntime.jsx)("label", {
+          className: "gc-lbl",
+          htmlFor: "gc-rm-why",
+          children: "Reason (goes in the history)"
+        }), /*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+          id: "gc-rm-why",
+          "data-autofocus": true,
+          className: "gc-input",
+          value: reason,
+          onChange: e => setReason(e.target.value),
+          autoComplete: "off"
+        }), imp.needs_ack ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("label", {
+          className: "gc-check",
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+            type: "checkbox",
+            checked: ack,
+            onChange: e => setAck(e.target.checked)
+          }), " I understand this team has players or a payment on it"]
+        }) : null, /*#__PURE__*/(0, _jsxRuntime.jsxs)("label", {
+          className: "gc-lbl",
+          htmlFor: "gc-rm-name",
+          children: ["Type the team name ", /*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+            children: team.name
+          }), " to confirm"]
+        }), /*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+          id: "gc-rm-name",
+          className: "gc-input",
+          value: typed,
+          onChange: e => setTyped(e.target.value),
+          autoComplete: "off",
+          spellCheck: "false"
+        })]
+      })]
+    }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      className: "gc-actions",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+        type: "button",
+        className: "gc-btn danger",
+        disabled: !ok || busy,
+        onClick: go,
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+          n: "trash",
+          s: 16
+        }), " ", busy ? "Removing…" : "Remove team"]
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        onClick: onClose,
+        children: "Cancel"
+      })]
+    })]
+  });
+}
+function ReasonDialog({
+  title,
+  body,
+  confirm,
+  path,
+  extra,
+  onClose,
+  onDone,
+  toast,
+  option
+}) {
+  const [reason, setReason] = (0, _react.useState)("");
+  const [opt, setOpt] = (0, _react.useState)(false);
+  const [busy, setBusy] = (0, _react.useState)(false);
+  const go = async () => {
+    if (reason.trim().length < 3 || busy) return;
+    setBusy(true);
+    const r = await post(path, {
+      ...extra,
+      reason,
+      ...(option ? {
+        [option.key]: opt
+      } : {})
+    });
+    setBusy(false);
+    toast(r.j.message || (r.ok ? "Done." : "Could not do that."), r.ok && r.j.success ? "" : "bad");
+    if (r.ok && r.j.success) onDone();
+  };
+  return /*#__PURE__*/(0, _jsxRuntime.jsxs)(Modal, {
+    title: title,
+    onClose: onClose,
+    children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      children: body
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("label", {
+      className: "gc-lbl",
+      htmlFor: "gc-why",
+      children: "Reason (goes in the history)"
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+      id: "gc-why",
+      "data-autofocus": true,
+      className: "gc-input",
+      value: reason,
+      onChange: e => setReason(e.target.value),
+      autoComplete: "off"
+    }), option ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("label", {
+      className: "gc-check",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+        type: "checkbox",
+        checked: opt,
+        onChange: e => setOpt(e.target.checked)
+      }), " ", option.label]
+    }) : null, /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      className: "gc-actions",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn danger",
+        disabled: reason.trim().length < 3 || busy,
+        onClick: go,
+        children: busy ? "Working…" : confirm
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        onClick: onClose,
+        children: "Cancel"
+      })]
+    })]
+  });
+}
+function DigestDialog({
+  onClose,
+  toast
+}) {
+  const [d, setD] = (0, _react.useState)(null);
+  const [busy, setBusy] = (0, _react.useState)(false);
+  (0, _react.useEffect)(() => {
+    let live = true;
+    (async () => {
+      const r = await post("/captain-sync/digest", {});
+      if (live) setD(r.ok && r.j.success ? r.j : {
+        error: r.j.message || "Could not build the summary."
+      });
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
+  const send = async () => {
+    setBusy(true);
+    const r = await post("/captain-sync/digest", {
+      send: true
+    });
+    setBusy(false);
+    toast(r.j.message || (r.ok ? "Sent." : "Could not send."), r.ok && r.j.success ? "" : "bad");
+  };
+  return /*#__PURE__*/(0, _jsxRuntime.jsxs)(Modal, {
+    title: "What needs you",
+    onClose: onClose,
+    children: [!d ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+      className: "gc-sub",
+      role: "status",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+        className: "gc-spin"
+      }), " Building the summary\u2026"]
+    }) : d.error ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+      className: "gc-alert bad",
+      role: "alert",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+        n: "alert",
+        s: 16
+      }), " ", d.error]
+    }) : /*#__PURE__*/(0, _jsxRuntime.jsx)("pre", {
+      className: "gc-pre gc-digest",
+      "aria-label": "Summary",
+      children: d.text
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      className: "gc-sub",
+      children: "Email goes only to the address on your own WordPress account."
+    }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      className: "gc-actions",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+        type: "button",
+        className: "gc-btn gold",
+        "data-autofocus": true,
+        disabled: !d || !!d.error || busy,
+        onClick: send,
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+          n: "mail",
+          s: 16
+        }), " ", busy ? "Sending…" : "Email me this"]
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        onClick: () => window.print(),
+        children: "Print"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        onClick: onClose,
+        children: "Close"
+      })]
+    })]
+  });
+}
+function TeamTools({
+  t,
+  ov,
+  actions
+}) {
+  const [det, setDet] = (0, _react.useState)(null);
+  const n0 = t.note || {};
+  const [note, setNote] = (0, _react.useState)(n0.note || "");
+  const [tag, setTag] = (0, _react.useState)(n0.tag || "");
+  const [fu, setFu] = (0, _react.useState)(n0.follow_up || "");
+  const [saving, setSaving] = (0, _react.useState)(false);
+  (0, _react.useEffect)(() => {
+    let live = true;
+    setDet(null);
+    (async () => {
+      const r = await call("/captain-sync/team-detail?team_id=" + t.id);
+      if (live) setDet(r.ok && r.j.success ? r.j : {
+        error: r.j.message || "Could not load details."
+      });
+    })();
+    return () => {
+      live = false;
+    };
+  }, [t.id]);
+  const save = async () => {
+    setSaving(true);
+    const r = await post("/captain-sync/note", {
+      team_id: t.id,
+      note,
+      tag,
+      follow_up: fu
+    });
+    setSaving(false);
+    actions.toast(r.j.message || (r.ok ? "Saved." : "Could not save."), r.ok && r.j.success ? "" : "bad");
+    if (r.ok) actions.reload();
+  };
+  const rd = C.readiness(t);
+  const idle = C.idleFlag(t);
+  const fee = C.teamFeeLine(t, ov.money);
+  return /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+    children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      className: "gc-badges",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Pill, {
+        tone: rd.tone,
+        children: rd.label
+      }), idle ? /*#__PURE__*/(0, _jsxRuntime.jsx)(Pill, {
+        tone: idle.tone,
+        children: idle.label
+      }) : null, t.note && t.note.tag ? /*#__PURE__*/(0, _jsxRuntime.jsx)(Pill, {
+        tone: "info",
+        children: C.noteTagLabel(t.note.tag)
+      }) : null]
+    }), rd.why ? /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      className: "gc-sub",
+      children: rd.why
+    }) : null, fee ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+      className: "gc-note",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+        n: "clock",
+        s: 14
+      }), " ", fee]
+    }) : null, det && !det.error && det.ledger.length ? /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("h3", {
+        className: "gc-h3",
+        children: "Money for this team"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("ul", {
+        className: "gc-res",
+        children: det.ledger.map((x, i) => /*#__PURE__*/(0, _jsxRuntime.jsxs)("li", {
+          children: [x.label, ": ", /*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+            children: C.money(x.amount)
+          }), x.date ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+            className: "gc-sub",
+            children: [" ", dateOnly(x.date.length === 10 ? x.date + " 00:00:00" : x.date)]
+          }) : null, x.state === "due" ? /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            className: "gc-sub",
+            children: " still due"
+          }) : null]
+        }, i))
+      })]
+    }) : null, det && !det.error && det.players.length ? /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("h3", {
+        className: "gc-h3",
+        children: ["Roster (", det.players.length, ")"]
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+        className: "gc-sub",
+        children: det.players.join(", ")
+      })]
+    }) : null, det && !det.error && det.timeline.length ? /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("h3", {
+        className: "gc-h3",
+        children: "Everything that happened"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("ul", {
+        className: "gc-res",
+        children: det.timeline.slice(0, 10).map((x, i) => /*#__PURE__*/(0, _jsxRuntime.jsxs)("li", {
+          children: [x.notes || C.historyTitle(x.action), " ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+            className: "gc-sub",
+            children: [I.fmtStamp(x.at), " \xB7 ", x.by]
+          })]
+        }, i))
+      })]
+    }) : null, det && det.error ? /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      className: "gc-sub",
+      children: det.error
+    }) : null, /*#__PURE__*/(0, _jsxRuntime.jsx)("h3", {
+      className: "gc-h3",
+      children: "Your note"
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("label", {
+      className: "gc-sr",
+      htmlFor: "gc-note",
+      children: "Note"
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("textarea", {
+      id: "gc-note",
+      className: "gc-input",
+      rows: 2,
+      maxLength: 500,
+      value: note,
+      onChange: e => setNote(e.target.value),
+      placeholder: "Phoned Sam, paying by check next week"
+    }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      className: "gc-bar-f",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("label", {
+        className: "gc-sr",
+        htmlFor: "gc-tag",
+        children: "Tag"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("select", {
+        id: "gc-tag",
+        className: "gc-select",
+        value: tag,
+        onChange: e => setTag(e.target.value),
+        children: C.NOTE_TAGS.map(x => /*#__PURE__*/(0, _jsxRuntime.jsx)("option", {
+          value: x.key,
+          children: x.label
+        }, x.key))
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("label", {
+        className: "gc-sr",
+        htmlFor: "gc-fu",
+        children: "Follow up on"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+        id: "gc-fu",
+        className: "gc-input gc-date",
+        type: "date",
+        value: fu,
+        onChange: e => setFu(e.target.value)
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        disabled: saving,
+        onClick: save,
+        children: saving ? "Saving…" : "Save note"
+      })]
+    })]
+  });
+}
 function TeamDrawer({
   team,
   ov,
@@ -582,6 +1020,10 @@ function TeamDrawer({
       }), /*#__PURE__*/(0, _jsxRuntime.jsx)("dd", {
         children: t.deposit_paid_at ? `${C.statusLabel(t.payment_status)} · balance ${C.money(t.balance_due)}` : "No deposit yet"
       })]
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)(TeamTools, {
+      t: t,
+      ov: ov,
+      actions: actions
     }), hist.length ? /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
       children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("h3", {
         className: "gc-h3",
@@ -613,12 +1055,31 @@ function TeamDrawer({
           s: 14
         })]
       }) : null]
-    }), t.delete && t.delete.allowed ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+    }), t.captain && t.account === "pending" ? /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+      className: "gc-actions",
+      children: /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        onClick: () => actions.revoke(t),
+        children: "Revoke invite link"
+      })
+    }) : null, t.captain ? /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+      className: "gc-actions",
+      children: /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        onClick: () => actions.detach(t),
+        children: "Detach captain"
+      })
+    }) : null, /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
       className: "gc-danger-zone",
-      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      children: [t.delete && t.delete.allowed ? /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
         className: "gc-sub",
         children: "Nothing real is attached to this team."
-      }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+      }) : /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+        className: "gc-sub gc-lock",
+        children: C.protectedHelp(t)
+      }), t.delete && t.delete.allowed ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
         type: "button",
         className: "gc-btn ghost",
         onClick: () => actions.clean(t),
@@ -626,10 +1087,16 @@ function TeamDrawer({
           n: "trash",
           s: 16
         }), " Select for clean-up"]
+      }) : null, /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+        type: "button",
+        className: "gc-btn ghost",
+        disabled: !ov.can_write,
+        onClick: () => actions.remove(t),
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+          n: "trash",
+          s: 16
+        }), " Remove team\u2026"]
       })]
-    }) : /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
-      className: "gc-sub gc-lock",
-      children: ["Cannot be deleted: ", t.delete && t.delete.reasons ? t.delete.reasons.join(" and ") : "protected", "."]
     })]
   });
 }
@@ -860,6 +1327,20 @@ function CaptainSync() {
   const tabs = [["deposits", "Deposits", ov.pending || 0], ["teams", "Teams", ov.teams.length], ["cleanup", "Clean-up", groups.suspect.length], ["problems", "Problems", counts.bad + counts.warn], ["history", "History", 0]];
   const sel2 = C.deleteSummary(ov.teams, cleanSel);
   const teamActions = {
+    toast,
+    reload: () => load(true),
+    remove: t => setModal({
+      t: "remove",
+      id: t.id
+    }),
+    revoke: t => setModal({
+      t: "revoke",
+      id: t.id
+    }),
+    detach: t => setModal({
+      t: "detach",
+      id: t.id
+    }),
     captain: t => setModal({
       t: "captain",
       id: t.id
@@ -906,6 +1387,16 @@ function CaptainSync() {
               n: "refresh",
               s: 16
             }), " Refresh"]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+            type: "button",
+            className: "gc-btn onnavy",
+            onClick: () => setModal({
+              t: "digest"
+            }),
+            children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+              n: "mail",
+              s: 16
+            }), " What needs me"]
           }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
             type: "button",
             className: "gc-btn onnavy",
@@ -968,7 +1459,7 @@ function CaptainSync() {
           children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
             n: hs.allOk ? "check" : "info",
             s: 14
-          }), hs.allOk ? `All ${hs.okCount} checks passed` : `${hs.okCount} checks passed`, /*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+          }), C.healthLabel(hs, v), /*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
             n: "chev",
             s: 12
           })]
@@ -1059,7 +1550,7 @@ function CaptainSync() {
                 children: C.money(m.outstanding)
               }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
                 className: "gc-tile-l",
-                children: "Still owed by paying teams"
+                children: "Balance owed by teams that paid a deposit"
               })]
             }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
               className: "gc-tile",
@@ -1068,7 +1559,7 @@ function CaptainSync() {
                 children: C.money(m.potential_now)
               }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
                 className: "gc-tile-l",
-                children: ["If ", I.plural(m.waiting, "waiting team"), " paid at ", C.money(m.fee_now)]
+                children: ["Expected if ", I.plural(m.waiting, "waiting team"), " paid now at ", C.money(m.fee_now), " each"]
               })]
             })]
           }), C.earlyBirdLine(m) ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
@@ -1095,7 +1586,7 @@ function CaptainSync() {
             className: "gc-dv",
             children: ov.balance.rows.map(r => {
               const st = C.balanceStatus(r);
-              const pct = r.expected ? Math.min(100, Math.round(r.actual / r.expected * 100)) : 100;
+              const pct = r.expected ? Math.min(100, Math.round(r.actual / r.expected * 100)) : 0;
               return /*#__PURE__*/(0, _jsxRuntime.jsxs)("li", {
                 children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
                   className: "gc-dv-h",
@@ -1538,6 +2029,15 @@ function CaptainSync() {
                 }), sd ? /*#__PURE__*/(0, _jsxRuntime.jsxs)(Pill, {
                   tone: C.stuckTone(sd),
                   children: [C.ageLabel(sd), " stuck"]
+                }) : null, C.idleFlag(t) ? /*#__PURE__*/(0, _jsxRuntime.jsx)(Pill, {
+                  tone: C.idleFlag(t).tone,
+                  children: C.idleFlag(t).label
+                }) : null, /*#__PURE__*/(0, _jsxRuntime.jsx)(Pill, {
+                  tone: C.readiness(t).tone,
+                  children: C.readiness(t).label
+                }), t.note && t.note.tag ? /*#__PURE__*/(0, _jsxRuntime.jsx)(Pill, {
+                  tone: "info",
+                  children: C.noteTagLabel(t.note.tag)
                 }) : null]
               }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
                 className: "gc-team-row",
@@ -1576,16 +2076,6 @@ function CaptainSync() {
           children: /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
             children: ov.teams.length ? "No teams match." : "No captain teams this season yet. Teams are created by Invite Captain and the captain signup page."
           })
-        }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
-          className: "gc-alert info",
-          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
-            n: "info",
-            s: 16
-          }), " ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
-            children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
-              children: "Tahoe Champions Cup is not synced here."
-            }), " Form #", ov.tcc.form_id, ov.tcc.entries !== null ? ` has ${I.plural(ov.tcc.entries, "entry", "entries")}` : "", " and is a separate tournament with different divisions. It needs its own design before anything is copied into GRSH."]
-          })]
         })]
       }) : null, tab === "cleanup" ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
         role: "tabpanel",
@@ -1682,28 +2172,38 @@ function CaptainSync() {
         }, k)), groups.protected.length ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("details", {
           className: "gc-det",
           children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("summary", {
-            children: [I.plural(groups.protected.length, "team"), " protected, cannot be deleted"]
+            children: [I.plural(groups.protected.length, "team"), " kept because of real data (players or money)"]
           }), /*#__PURE__*/(0, _jsxRuntime.jsx)("ul", {
             className: "gc-res",
             children: groups.protected.map(t => /*#__PURE__*/(0, _jsxRuntime.jsxs)("li", {
               children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
                 children: t.name
-              }), ": ", t.delete.reasons.join(" and "), "."]
+              }), ": ", C.protectedHelp(t), " ", /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                type: "button",
+                className: "gc-link",
+                onClick: () => setModal({
+                  t: "team",
+                  id: t.id
+                }),
+                children: "Open team"
+              })]
             }, t.id))
           })]
-        }) : null, /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        }) : null, cleanSel.length ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
           className: "gc-sticky",
-          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+          role: "region",
+          "aria-label": "Selected teams",
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
             "aria-live": "polite",
-            children: cleanSel.length ? I.plural(cleanSel.length, "team") + " selected" : "Nothing selected"
+            children: [I.plural(cleanSel.length, "team"), " selected"]
           }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
             className: "gc-grow"
-          }), cleanSel.length ? /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
             type: "button",
             className: "gc-link",
             onClick: () => setCleanSel([]),
             children: "Clear"
-          }) : null, /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+          }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
             type: "button",
             className: "gc-btn danger",
             disabled: !canWrite || !cleanSel.length,
@@ -1716,9 +2216,9 @@ function CaptainSync() {
             children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
               n: "trash",
               s: 16
-            }), " Delete ", cleanSel.length ? I.plural(cleanSel.length, "team") : "selected", " permanently\u2026"]
+            }), " Delete ", I.plural(cleanSel.length, "team"), " permanently\u2026"]
           })]
-        })]
+        }) : null]
       }) : null, tab === "problems" ? /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
         role: "tabpanel",
         id: "gc-panel-problems",
@@ -1830,6 +2330,20 @@ function CaptainSync() {
           }) : h.action === "captain_sync_deposit" && !h.undone ? /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
             className: "gc-sub",
             children: "The team has changed since, so this can no longer be undone safely."
+          }) : null, h.can_reattach ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+            type: "button",
+            className: "gc-btn ghost",
+            onClick: async () => {
+              const r = await post("/captain-sync/reattach-captain", {
+                audit_id: h.id
+              });
+              toast(r.j.message || (r.ok ? "Done." : "Could not do that."), r.ok && r.j.success ? "" : "bad");
+              load(true);
+            },
+            children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Ic, {
+              n: "undo",
+              s: 15
+            }), " Put captain back"]
           }) : null, h.can_restore ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
             type: "button",
             className: "gc-btn ghost",
@@ -1989,6 +2503,49 @@ function CaptainSync() {
         setModal(null);
         load(true);
       }
+    }) : null, modal && modal.t === "remove" && openTeam ? /*#__PURE__*/(0, _jsxRuntime.jsx)(RemoveDialog, {
+      team: openTeam,
+      toast: toast,
+      onClose: () => setModal(null),
+      onDone: () => {
+        setModal(null);
+        load(true);
+      }
+    }) : null, modal && modal.t === "revoke" && openTeam ? /*#__PURE__*/(0, _jsxRuntime.jsx)(ReasonDialog, {
+      title: "Revoke the invite link?",
+      body: `The link sent to ${openTeam.captain ? openTeam.captain.name : "the captain"} stops working. Their account and player record are kept. Send a new link from Invite Captain if you change your mind.`,
+      confirm: "Revoke link",
+      path: "/captain-sync/revoke-invite",
+      extra: {
+        team_id: openTeam.id
+      },
+      toast: toast,
+      onClose: () => setModal(null),
+      onDone: () => {
+        setModal(null);
+        load(true);
+      }
+    }) : null, modal && modal.t === "detach" && openTeam ? /*#__PURE__*/(0, _jsxRuntime.jsx)(ReasonDialog, {
+      title: "Detach the captain?",
+      body: `${openTeam.captain ? openTeam.captain.name : "The captain"} stops being captain of ${openTeam.name}. Nothing is deleted, and History can put them back.`,
+      confirm: "Detach captain",
+      path: "/captain-sync/detach-captain",
+      extra: {
+        team_id: openTeam.id
+      },
+      option: openTeam.account === "pending" ? {
+        key: "revoke_invite",
+        label: "Also revoke their unused invite link (cannot be undone)"
+      } : null,
+      toast: toast,
+      onClose: () => setModal(null),
+      onDone: () => {
+        setModal(null);
+        load(true);
+      }
+    }) : null, modal && modal.t === "digest" ? /*#__PURE__*/(0, _jsxRuntime.jsx)(DigestDialog, {
+      toast: toast,
+      onClose: () => setModal(null)
     }) : null, modal && modal.t === "team" && openTeam ? /*#__PURE__*/(0, _jsxRuntime.jsx)(TeamDrawer, {
       team: openTeam,
       ov: ov,
@@ -2008,16 +2565,16 @@ function CaptainSync() {
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=DM+Mono:wght@400;500&display=swap');
 .gc{--navy:#1a1a2e;--gold:#d4a017;--goldt:#7a5a05;--cream:#f6f5f0;--line:#e3e0d6;--mut:#55556a;--ok:#1f6f46;--okb:#e6f4ec;--warn:#85540a;--warnb:#fdf3dc;--bad:#b3261e;--badb:#fdeceb;--info:#27578f;--infob:#e8f0fa;
- font-family:'DM Mono',ui-monospace,Menlo,monospace;font-size:14px;line-height:1.55;color:var(--navy);background:var(--cream);margin:0 -20px;padding:0 20px 56px;min-height:100vh;box-sizing:border-box}
+ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:15px;line-height:1.55;color:var(--navy);background:var(--cream);margin:0 -20px;padding:0 20px 56px;min-height:100vh;box-sizing:border-box}
 .gc *,.gc *::before,.gc *::after{box-sizing:border-box}
-.gc button,.gc select,.gc input,.gc textarea{font-family:inherit;font-size:inherit;color:inherit}
+.gc :where(button,select,input,textarea){font-family:inherit;font-size:inherit;color:inherit}
 .gc button:focus-visible,.gc select:focus-visible,.gc input:focus-visible,.gc textarea:focus-visible,.gc [tabindex]:focus-visible,.gc a:focus-visible,.gc summary:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
 .gc-wrap{max-width:1180px;margin:0 auto}
-.gc-hero{background:linear-gradient(135deg,#1a1a2e 0%,#2a2a4a 100%);color:#fff;border-radius:0 0 18px 18px;margin:0 -20px 22px;padding:30px 20px 26px;position:relative;overflow:hidden}
+.gc-hero{background:linear-gradient(135deg,#1a1a2e 0%,#2a2a4a 100%);color:#fff;border-radius:0 0 18px 18px;margin:0 -20px 16px;padding:16px 20px 14px;position:relative;overflow:hidden}
 .gc-hero::after{content:"";position:absolute;right:-60px;top:-60px;width:260px;height:260px;border-radius:50%;background:radial-gradient(circle,rgba(212,160,23,.35),transparent 70%)}
 .gc-hero-in{max-width:1180px;margin:0 auto;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between;position:relative;z-index:1}
 .gc-kicker{color:#f0cf6e;font-size:12px;letter-spacing:.14em;text-transform:uppercase;margin:0 0 6px}
-.gc-h1{font-family:'Fraunces',Georgia,serif;font-size:34px;line-height:1.1;margin:0 0 8px;font-weight:700;color:#fff}
+.gc-h1{font-family:'Fraunces',Georgia,serif;font-size:28px;line-height:1.1;margin:0 0 4px;font-weight:700;color:#fff}
 .gc-lead{margin:0;color:#e4e4ee;max-width:640px}
 .gc-last{margin-top:12px;display:inline-flex;gap:8px;align-items:center;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.22);border-radius:999px;padding:5px 14px;font-size:13px;color:#fff}
 .gc-h2{font-family:'Fraunces',Georgia,serif;font-size:21px;margin:0;font-weight:600;color:var(--navy)}
@@ -2220,7 +2777,7 @@ a.gc-btn{text-decoration:none}.gc-badge.hot{background:var(--bad)}
 .gc-clean{list-style:none;margin:0;padding:0}.gc-clean li{border-bottom:1px solid var(--line)}.gc-clean li:last-child{border-bottom:0}
 .gc-clean-row{display:flex;gap:12px;align-items:flex-start;padding:10px 4px;cursor:pointer}.gc-clean-row input{margin-top:4px;width:18px;height:18px;accent-color:var(--bad)}
 .gc-clean-row .gc-grow{display:flex;flex-direction:column;gap:2px}.gc-why{color:var(--warn)}
-.gc-sticky{position:sticky;bottom:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#fff;border-top:2px solid var(--line);margin:18px -20px -20px;padding:12px 20px;border-radius:0 0 16px 16px}
+.gc-sticky{position:sticky;z-index:5;bottom:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#fff;border-top:2px solid var(--line);margin:18px -20px -20px;padding:12px 20px;border-radius:0 0 16px 16px}
 .gc-scrim.side{place-items:stretch end;padding:0}
 .gc-modal.drawer{max-width:440px;width:100%;height:100%;max-height:100vh;border-radius:16px 0 0 16px;animation:gc-in .2s ease-out}
 @keyframes gc-in{from{transform:translateX(30px);opacity:0}to{transform:none;opacity:1}}
@@ -2232,4 +2789,14 @@ a.gc-btn{text-decoration:none}.gc-badge.hot{background:var(--bad)}
 @media(max-width:600px){.gc-modal.drawer{max-width:100%;border-radius:0}.gc-dl{grid-template-columns:1fr}.gc-verdict{flex-wrap:wrap}.gc-act{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){.gc *{animation:none!important;transition:none!important}}
 @media print{.gc-scrim,.gc-toasts{display:none}}
+
+.gc-lead{display:none}
+.gc-fun-n small{font-size:13px;font-weight:500;color:var(--mut);font-family:inherit}
+.gc-fun{grid-template-columns:repeat(5,minmax(0,1fr))}
+@media(max-width:900px){.gc-fun{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}}
+.gc-badges{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.gc-date{max-width:170px}
+.gc-digest{white-space:pre-wrap;font-family:inherit}
+.gc-tile-n,.gc-fun-n,.gc-dv-h span{font-variant-numeric:tabular-nums}
+@media print{.gc-hero-btns,.gc-tabs,.gc-sticky,.gc-scrim .gc-actions{display:none!important}.gc{background:#fff}.gc-card{break-inside:avoid;box-shadow:none}}
 `;

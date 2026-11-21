@@ -115,5 +115,31 @@ eq(E.historyTitle("captain_sync_team_deleted"), "Team deleted", "history title")
 const csv2 = E.teamsCSV({ teams: [T(1, "invited", { name: "N", division: "45a", age_days: 4, looks_test: true, last_nudged_at: "2027-01-01 08:00:00" })] });
 ok(csv2.split("\r\n")[0].endsWith("age_days,looks_test,last_nudged_at") && csv2.split("\r\n")[1].endsWith(",4,yes,2027-01-01 08:00:00"), "teams export has age, test flag and last nudge");
 
+console.log("3. new: format-aware balance, funnel counts, readiness, idle, removal");
+const f5 = E.funnelSteps(teams); eq([f5[0].total, f5[0].showPct], [5, false], "funnel hides percentages with few teams");
+eq(E.funnelSteps(Array.from({ length: 10 }, (_, i) => T(i, "paid")))[0].showPct, true, "and shows them with enough teams");
+eq(E.balanceStatus({ format: "draft", expected: null, actual: 0, delta: null }).label, "Draft", "draft division says Draft, not 'to find'");
+eq(E.balanceStatus({ format: "draft", expected: null, actual: 2, delta: null }).label, "Draft division, 2 registered", "draft division with stray teams says so");
+eq(E.balanceStatus({ format: "both", expected: 2, actual: 1, delta: -1 }).label, "1 to find", "mixed division counts only registered slots");
+const hs0 = E.healthSummary([{ ok: true }, { ok: true }]);
+ok(E.healthLabel(hs0, { tone: "bad" }).includes("in the data, not the wiring"), "health chip no longer contradicts a red headline");
+eq(E.healthLabel(hs0, { tone: "ok" }), "Setup checks: all 2 passed", "health chip when everything is green");
+eq(E.healthLabel(E.healthSummary([{ ok: true }, { ok: false }]), null), "1 setup checks passed", "health chip when something failed");
+eq([E.readiness({ captain: null }).label, E.readiness({ captain: {}, roster_size: 0, min_players: 8 }).label, E.readiness({ captain: {}, roster_size: 5, min_players: 8 }).label, E.readiness({ captain: {}, roster_size: 8, min_players: 8 }).label, E.readiness({ captain: {}, roster_size: 8, min_players: 8, deposit_paid_at: "x" }).label], ["No captain", "No roster", "3 short", "Roster ready, no deposit", "Ready"], "readiness badge");
+eq([E.idleFlag({ idle_days: 5 }), E.idleFlag({ idle_days: null }), E.idleFlag({ idle_days: 14 }).tone, E.idleFlag({ idle_days: 40 }).tone], [null, null, "warn", "bad"], "idle flag thresholds");
+eq(E.teamFeeLine({}, { tier_now: "early", days_left: 3, fee_now: 1750, saves_per_team: 250 }), "Pays $1,750.00 if they pay in 3 days, $2,000.00 after.", "per-team early fee countdown");
+eq(E.teamFeeLine({ deposit_paid_at: "x" }, { tier_now: "early", days_left: 3 }), "", "no countdown once paid");
+eq(E.teamFeeLine({}, { tier_now: "late", fee_now: 2000 }), "Early fee has ended. They owe $2,000.00.", "late fee line");
+const imp = { allowed: true, needs_ack: true, removes: ["a"], keeps: ["b"], blocked: [] };
+ok(!E.removalReady(imp, "Wolves", "wolves", "Disbanded", false), "removal needs the acknowledgement when players or money are attached");
+ok(E.removalReady(imp, "Wolves", " wolves ", "Disbanded", true), "removal ready: name (any case), reason, acknowledgement");
+ok(!E.removalReady(imp, "Wolves", "Wolf", "Disbanded", true), "wrong name blocks");
+ok(!E.removalReady(imp, "Wolves", "Wolves", "x", true), "one-letter reason blocks");
+ok(!E.removalReady({ ...imp, allowed: false }, "Wolves", "Wolves", "Disbanded", true), "blocked impact never becomes ready");
+ok(!E.removalReady(null, "Wolves", "Wolves", "Disbanded", true), "nothing loaded yet is not ready");
+ok(E.removalReady({ allowed: true, needs_ack: false }, "W", "w", "Test row", false), "an empty team needs no acknowledgement");
+ok(E.protectedHelp({ delete: { reasons: ["a payment"] } }).includes("Remove team") && E.protectedHelp({}) === "", "protected teams say why and what to do");
+eq([E.historyTitle("captain_sync_invite_revoked"), E.historyTitle("captain_sync_captain_detached"), E.noteTagLabel("paying_by_check"), E.noteTagLabel("zzz")], ["Invite link revoked", "Captain detached", "Paying by check", ""], "new titles and tag labels");
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

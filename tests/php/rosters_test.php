@@ -102,6 +102,24 @@ $r = GRSH_Rosters::save_pins( R( [], [ 'division' => 'gold_open', 'pins' => [ [ 
 eq( count( D( $r )['pins'] ), 1, 'pins deduped/invalid dropped' );
 ok( (bool) array_filter( D( $r )['gate'], function ( $c ) { return $c['key'] === 'pins'; } ), 'gate reports broken apart rule' );
 
+echo "7b. player locks (stay put)\n";
+$poolp = D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) )['pool'][0]['id'];
+$r = GRSH_Rosters::save_locks( R( [], [ 'division' => 'gold_open', 'locks' => [ $x, $x, $poolp, 0 ] ] ) ); $pl7 = D( $r );
+eq( $r->status, 200, 'save locks 200' ); eq( $pl7['locks'], [ $x ], 'only the player on a team is held, duplicates and pool players dropped' );
+$teamx = $db->get_var( "SELECT team_id FROM wp_grsh_rosters WHERE player_id = $x" );
+$r = GRSH_Rosters::post_moves( R( [], [ 'division' => 'gold_open', 'moves' => [ [ 'player_id' => $x, 'team_id' => $T3 ] ] ] ) );
+eq( $r->status, 409, 'moving a locked player is refused' ); ok( strpos( $r->data['error'] ?? $r->data['message'] ?? json_encode( $r->data ), 'locked' ) !== false, 'with a plain reason' );
+eq( $db->get_var( "SELECT team_id FROM wp_grsh_rosters WHERE player_id = $x" ), $teamx, 'and nothing moved' );
+$r = GRSH_Rosters::post_moves( R( [], [ 'division' => 'gold_open', 'moves' => [ [ 'player_id' => $x, 'team_id' => null ] ] ] ) ); eq( $r->status, 409, 'sending a locked player to the pool is refused too' );
+$r = GRSH_Rosters::post_moves( R( [], [ 'division' => 'gold_open', 'moves' => [ [ 'player_id' => $y, 'team_id' => (int) $teamx ] ] ] ) ); eq( $r->status, 200, 'other players still move' );
+$r = GRSH_Rosters::save_locks( R( [], [ 'division' => 'nope', 'locks' => [ $x ] ] ) ); eq( $r->status, 400, 'unknown division 400' );
+ok( (bool) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_audit_logs WHERE action = 'roster_locks'" ), 'lock change is audited' );
+$r = GRSH_Rosters::save_locks( R( [], [ 'division' => 'gold_open', 'locks' => [] ] ) ); eq( D( $r )['locks'], [], 'unlock clears the lock' );
+$r = GRSH_Rosters::post_moves( R( [], [ 'division' => 'gold_open', 'moves' => [ [ 'player_id' => $y, 'team_id' => $T1 ] ] ] ) ); eq( $r->status, 200, 'move allowed again' );
+update_option( 'grsh_roster_plocks_gold_open', [ $poolp ], false );   // a stale lock on someone no longer on a team
+eq( D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) )['locks'], [], 'a stale lock on a player who is not on a team is ignored' );
+GRSH_Rosters::save_locks( R( [], [ 'division' => 'gold_open', 'locks' => [] ] ) );
+
 echo "8. plans\n";
 $r = GRSH_Rosters::save_plan( R( [], [ 'division' => 'gold_open', 'name' => 'Plan A' ] ) ); $p = D( $r ); eq( count( $p['plans'] ), 1, 'plan saved' );
 $snapA = $db->get_results( "SELECT player_id, team_id FROM wp_grsh_rosters ORDER BY player_id" );
@@ -179,6 +197,79 @@ echo "12. audit trail + payload privacy\n";
 ok( (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_audit_logs WHERE object_type='roster'" ) > 10, 'audit rows written' );
 $pj = json_encode( D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) ) );
 ok( strpos( $pj, '@x.test' ) === false, 'no emails in admin payload' );
+
+
+echo "13. publish preview and activity feed\n";
+$GLOBALS['mails'] = []; $meta_before = json_encode( D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) )['published'] );
+$pv = GRSH_Rosters::publish_preview( R( [ 'division' => 'gold_open' ] ) ); $pd = D( $pv );
+eq( $pv->status, 200, 'preview 200' ); ok( $pd['dry_run'] === true, 'marked dry run' );
+ok( $pd['will_send'] > 0 && count( $pd['recipients'] ) === min( 60, $pd['will_send'] ), 'recipients listed' );
+ok( strpos( json_encode( $pd ), '@x.test' ) !== false && ! preg_match( '/[a-z]{2,}[a-z0-9]*@x\.test/i', json_encode( $pd['recipients'] ) ), 'emails are masked (first letter and domain only)' );
+ok( $pd['sample_subject'] !== '' && strpos( $pd['sample_subject'], 'you\'re on' ) !== false, 'sample subject' );
+eq( $GLOBALS['mails'], [], 'preview sends nothing' ); eq( json_encode( D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) )['published'] ), $meta_before, 'preview changes no publish state' );
+$pd2 = D( GRSH_Rosters::publish_preview( R( [ 'division' => 'gold_open' ] ) ) );
+$bad_one = $db->get_var( "SELECT p.id FROM wp_grsh_players p JOIN wp_grsh_rosters r ON r.player_id = p.id LIMIT 1" );
+$db->pdo->exec( "UPDATE wp_grsh_players SET email = 'broken' WHERE id = " . (int) $bad_one );
+$pd3 = D( GRSH_Rosters::publish_preview( R( [ 'division' => 'gold_open' ] ) ) );
+eq( $pd3['will_skip'], $pd2['will_skip'] + 1, 'a player with a bad address is listed as skipped' ); ok( $pd3['skipped'][0]['reason'] === 'no valid email address', 'with the reason' );
+eq( GRSH_Rosters::publish_preview( R( [ 'division' => 'nope' ] ) )->status, 400, 'unknown division' );
+
+$ac = GRSH_Rosters::activity( R( [ 'division' => 'gold_open' ] ) ); $ad = D( $ac );
+eq( $ac->status, 200, 'activity 200' ); ok( count( $ad['items'] ) > 3 && isset( $ad['items'][0]['title'], $ad['items'][0]['by'], $ad['items'][0]['at'] ), 'activity lists changes with title, who and when' );
+ok( in_array( 'Players moved', array_column( $ad['items'], 'title' ), true ), 'moves are titled' );
+eq( $ad['changes_since_publish'], 0, 'nothing changed since publish yet' );
+$db->pdo->exec( "INSERT INTO wp_grsh_audit_logs (season_id, user_display, action, object_type, after_value, notes, created_at) VALUES (" . (int) D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) )['season_id'] . ", 'Tester', 'roster_moves', 'roster', '{\"division\":\"gold_open\",\"moved\":1}', 'late move', '2099-01-01 00:00:00')" );
+eq( D( GRSH_Rosters::activity( R( [ 'division' => 'gold_open' ] ) ) )['changes_since_publish'], 1, 'a move after publishing is counted' );
+eq( D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) )['changes_since_publish'], 1, 'and shown in the main payload' );
+eq( D( GRSH_Rosters::activity( R( [ 'division' => '45a' ] ) ) )['items'], [], 'another division sees none of it' );
+$pl = D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) )['plans']; ok( ! $pl || isset( $pl[0]['assign'] ), 'plans carry their assignment for comparing' );
+foreach ( [ 'publish-preview', 'activity' ] as $rt ) { GRSH_Rosters::register_routes(); ok( isset( $GLOBALS['routes'][ 'grsh/v1/rosters/' . $rt ] ), "route $rt registered" ); }
+
+echo "14. Board summary (counts only)\n";
+if ( ! function_exists( 'rest_ensure_response' ) ) { function rest_ensure_response( $d ) { return new WP_REST_Response( $d, 200 ); } }
+if ( ! function_exists( 'admin_url' ) ) { function admin_url( $p = '' ) { return 'https://x.test/wp-admin/' . $p; } }
+require __DIR__ . '/../../includes/class-grsh-board-summary.php';
+$full = D( GRSH_Rosters::get_rosters( R( [ 'division' => 'gold_open' ] ) ) );
+$ovg  = array_column( $full['divisions'], null, 'key' )['gold_open'];
+$bs   = GRSH_Board_Summary::build(); $by14 = array_column( $bs['divisions'], null, 'key' );
+ok( isset( $by14['gold_open'] ), 'gold_open row present' ); $g = $by14['gold_open'];
+eq( [ $g['on_teams'], $g['in_draft'] ], [ $ovg['assigned'], $ovg['total'] ], 'on-teams and in-draft match the Rosters tab' );
+eq( $g['in_pool'], $g['in_draft'] - $g['on_teams'], 'pool is the rest of the draft' );
+eq( $g['teams_created'], count( $full['teams'] ), 'teams created match the Rosters page' );
+eq( $g['name'], $full['division_label'], 'name matches the Rosters tab label' );
+ok( $g['registered'] >= $g['paid'] && $g['unpaid'] === $g['registered'] - $g['paid'], 'paid + unpaid add up to registered' );
+eq( $g['stage'], 'Published', 'stage reflects the published roster' );
+ok( $g['capacity'] === 0 || abs( $g['fill_pct'] - round( $g['registered'] / $g['capacity'] * 100, 1 ) ) < 0.01, 'fill percent follows capacity' );
+eq( $bs['totals']['teams_created'], array_sum( array_column( $bs['divisions'], 'teams_created' ) ), 'totals add the divisions' );
+eq( $bs['totals']['registered'], array_sum( array_column( $bs['divisions'], 'registered' ) ), 'registered total adds up' );
+ok( isset( $bs['generated_at'], $bs['season'], $bs['admin_link'] ), 'has timestamp, season and admin link' );
+$json = json_encode( $bs ); $leak = false;
+foreach ( array_keys( $by_last ) as $ln ) { if ( $ln !== '' && stripos( $json, '"' . $ln ) !== false || stripos( $json, $ln . '"' ) !== false ) { $leak = true; } }
+ok( strpos( $json, '@' ) === false && ! $leak, 'no emails and no player names in the summary' );
+$GLOBALS['user_can'] = false; ok( GRSH_Board_Summary::can_view() === false, 'people without access are refused' ); $GLOBALS['user_can'] = true;
+ok( GRSH_Board_Summary::can_view() === true, 'admins and board viewers are allowed' );
+GRSH_Board_Summary::register_routes(); ok( isset( $GLOBALS['routes']['grsh/v1/tournament/board-summary'] ), 'route registered' );
+
+echo "15. Treasurer money snapshot\n";
+global $wpdb;
+$wpdb->pdo->exec( "UPDATE wp_grsh_registrations SET amount_paid = 125 WHERE season_id = 1 AND payment_status = 'paid'" );
+$wpdb->pdo->exec( "UPDATE wp_grsh_registrations SET amount_paid = 0, payment_status = 'waived' WHERE id = (SELECT MIN(id) FROM wp_grsh_registrations WHERE season_id = 1 AND payment_status = 'paid')" );
+$wpdb->pdo->exec( "INSERT INTO wp_grsh_teams (season_id, division, team_type, name, fee_total, deposit_amount, deposit_paid_at, balance_due, payment_status) VALUES
+  (1,'gold_open','full_team','Reg A',1750,500,'2026-10-01',1250,'deposit_paid'),
+  (1,'gold_open','full_team','Reg B',1750,500,'2026-10-02',0,'paid_in_full'),
+  (1,'gold_open','full_team','Reg C',NULL,NULL,NULL,NULL,'unpaid')" );
+$m  = GRSH_Board_Summary::build()['money']; $mg = array_column( $m['divisions'], null, 'key' )['gold_open'];
+$exp_paid = (int) $wpdb->get_var( "SELECT COUNT(*) FROM wp_grsh_registrations WHERE season_id=1 AND status<>'rejected' AND payment_status='paid' AND division_requested IN ('gold_open')" );
+eq( $mg['players_paid'], $exp_paid, 'paid player count matches registrations' );
+eq( $mg['players_collected'], round( $exp_paid * 125, 2 ), 'player money = paid registrations only (waived adds nothing)' );
+ok( $mg['players_waived'] === 1, 'waived player counted, not as money' );
+eq( [ $mg['teams'], $mg['teams_deposit_paid'], $mg['teams_paid_full'] ], [ 3, 2, 1 ], 'team counts: made, deposit paid, paid in full' );
+eq( $mg['teams_collected'], 2250.0, 'team money = deposit + full fee (500 + 1750)' );
+eq( $mg['teams_outstanding'], 1250.0, 'team balance still owed' );
+eq( $m['total_collected'], round( $m['players_collected'] + $m['teams_collected'], 2 ), 'total adds players and teams' );
+eq( $m['players_collected'], round( array_sum( array_column( $m['divisions'], 'players_collected' ) ), 2 ), 'player total adds the divisions' );
+$json = json_encode( GRSH_Board_Summary::build() );
+ok( strpos( $json, '@' ) === false && stripos( $json, 'Reg A' ) === false && stripos( $json, 'Skate' ) === false, 'money block has no emails, team names or player names' );
 
 echo "\n$pass passed, $fail failed\n";
 exit( $fail ? 1 : 0 );

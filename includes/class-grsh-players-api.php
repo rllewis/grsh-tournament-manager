@@ -264,25 +264,32 @@ class GRSH_Players {
             $counts[ $row['div_key'] ] = (int) $row['registered'];
         }
 
-        // Merge. Every enabled division gets a card even if count is zero.
+        // Merge. Every enabled division gets a card even if count is zero, in the same order and with the
+        // same labels and spots as Settings and Rosters. Capacity counts DRAFT spots only (teams x max roster
+        // minus the slots Settings gives to registered teams), the same number the Settings readiness uses.
         $result = [];
         foreach ( $active_divisions as $div ) {
+            $div        = GRSH_Settings::fill_division( $div );
             $key        = $div['key'];
             $registered = $counts[ $key ] ?? 0;
-            $capacity   = $div['max_roster'] * $div['teams'];  // total season capacity
+            list( $draft_teams, $reg_teams ) = GRSH_Settings::slots( $div );
+            $capacity   = $draft_teams * (int) $div['max_roster'];
             $pct        = $capacity > 0 ? round( ( $registered / $capacity ) * 100, 1 ) : 0;
 
             $result[] = [
-                'key'        => $key,
-                'label'      => $div['label'],
-                'enabled'    => true,
-                'teams'      => $div['teams'],
-                'min_roster' => $div['min_roster'],
-                'max_roster' => $div['max_roster'],
-                'capacity'   => $capacity,
-                'registered' => $registered,
-                'pct'        => $pct,
-                'status'     => self::capacity_status( $pct ),
+                'key'         => $key,
+                'label'       => $div['label'],
+                'enabled'     => true,
+                'format'      => $div['format'],
+                'teams'       => (int) $div['teams'],
+                'draft_teams' => $draft_teams,
+                'reg_teams'   => $reg_teams,
+                'min_roster'  => (int) $div['min_roster'],
+                'max_roster'  => (int) $div['max_roster'],
+                'capacity'    => $capacity,
+                'registered'  => $registered,
+                'pct'         => $pct,
+                'status'      => self::capacity_status( $pct ),
             ];
         }
 

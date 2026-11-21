@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   STATUSES, IRREVERSIBLE, toNum, fmtDate, localToday, timelineModel, validate, diff, errorTabCounts, tabOfError, teamFeeFor, capacity, divisionWarnings,
   rolloverPlan, exportPayload, importPayload, buildPayload, money, FIELD_LABELS,
+  FORMATS, FORMAT_LABEL, FORMAT_HELP, fillDivision, slotSplit, whatIf, revenueForecast, gate, impactErrors, daysBetween,
 } from "../lib/settingsEngine";
 
 const API = (window.grshConfig && window.grshConfig.apiUrl) || "/wp-json/grsh/v1";
@@ -44,8 +45,9 @@ function Switch({ id, checked, onChange, label, hint, ov, k }) {
         {hint && <p id={id + "-h"} className="gs-hint">{hint}</p>}
         {k && <Wire ov={ov} k={k} />}
       </div>
+      <span className="gs-swwrap"><span className={"gs-swl" + (checked ? " on" : "")} aria-hidden="true">{checked ? "On" : "Off"}</span>
       <button type="button" role="switch" id={id} aria-checked={!!checked} aria-labelledby={id + "-l"} aria-describedby={hint ? id + "-h" : undefined}
-        className={"gs-sw" + (checked ? " on" : "")} onClick={() => onChange(!checked)}><span /></button>
+        className={"gs-sw" + (checked ? " on" : "")} onClick={() => onChange(!checked)}><span /></button></span>
     </div>
   );
 }
@@ -95,6 +97,7 @@ export default function Settings() {
   const [tab, setTab] = useState("season");
   const [review, setReview] = useState(false);
   const [ack, setAck] = useState(false);
+  const [ack2, setAck2] = useState(false);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState(null);
   const [conflict, setConflict] = useState(false);
@@ -122,7 +125,9 @@ export default function Settings() {
   const changes = useMemo(() => (base && cfg ? diff(base, cfg) : []), [base, cfg]);
   const dirty = changes.length > 0;
   const clientErr = useMemo(() => (cfg ? validate(cfg) : {}), [cfg]);
-  const err = useMemo(() => ({ ...srvErr, ...clientErr }), [srvErr, clientErr]);
+  const impact = useMemo(() => (ov && base && cfg ? impactErrors(base, cfg, ov.registered) : {}), [ov, base, cfg]);
+  const err = useMemo(() => ({ ...srvErr, ...clientErr, ...impact }), [srvErr, clientErr, impact]);
+  const tabDirty = useMemo(() => { const t = {}; changes.forEach((c) => { t[tabOfError(c.key)] = (t[tabOfError(c.key)] || 0) + 1; }); return t; }, [changes]);
   const errCount = Object.keys(err).length;
   const tabErr = useMemo(() => errorTabCounts(err), [err]);
   const today = (ov && ov.today) || localToday();
@@ -136,7 +141,11 @@ export default function Settings() {
 
   const set = (k, v) => { setCfg((c) => ({ ...c, [k]: v })); setSrvErr((e) => { if (!(k in e)) return e; const n = { ...e }; delete n[k]; return n; }); setMsg(null); };
   const setDiv = (i, k, v) => {
-    setCfg((c) => ({ ...c, divisions: c.divisions.map((d, x) => (x === i ? { ...d, [k]: v } : d)) }));
+    setCfg((c) => ({ ...c, divisions: c.divisions.map((d, x) => {
+      if (x !== i) return d;
+      const nd = { ...d, [k]: v };
+      return k === "teams" || k === "format" || k === "reg_teams" ? { ...nd, reg_teams: fillDivision(nd).reg_teams } : nd;
+    }) }));
     setSrvErr((e) => { const key = `divisions.${i}.${k}`; if (!(key in e)) return e; const n = { ...e }; delete n[key]; return n; }); setMsg(null);
   };
   const P = (k, extra) => ({ id: "f-" + k, value: cfg[k] === null || cfg[k] === undefined ? "" : cfg[k], onChange: (e) => set(k, e.target.value),
@@ -144,10 +153,11 @@ export default function Settings() {
 
   const discard = () => { setCfg(base); setSrvErr({}); setMsg(null); setPending(null); setConflict(false); };
 
-  const openReview = () => { setAck(false); setReview(true); };
+  const openReview = () => { setAck(false); setAck2(false); setReview(true); };
   const warnings = useMemo(() => (ov && base && cfg ? divisionWarnings(base, cfg, ov.registered) : []), [ov, base, cfg]);
   const irreversible = cfg && base && cfg.status !== base.status && IRREVERSIBLE.includes(cfg.status);
   const statusChecks = ov && cfg && base && cfg.status !== base.status ? (ov.readiness[cfg.status] || []).filter((c) => c.level !== "ok") : [];
+  const statusBlocks = statusChecks.filter((c) => c.level === "block");
 
   const save = async (force) => {
     if (busy.current) return; busy.current = true; setSaving(true); setMsg(null);
@@ -157,7 +167,8 @@ export default function Settings() {
       if (r.ok) {
         setBase(r.j.settings); setCfg(r.j.settings); setSrvErr({}); setConflict(false); setReview(false);
         setOv((o) => ({ ...o, settings: r.j.settings, meta: { ...o.meta, ...(r.j.meta || {}) }, history: r.j.history || o.history }));
-        setMsg({ kind: "ok", text: r.j.unchanged ? "Nothing changed." : `Saved ${r.j.changes.length} change${r.j.changes.length === 1 ? "" : "s"} at ${new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}.` });
+        const prev = !r.j.unchanged && Array.isArray(r.j.history) && r.j.history[1] ? r.j.history[1].id : null;
+        setMsg({ kind: "ok", undo: prev, text: r.j.unchanged ? "Nothing changed." : `Saved ${r.j.changes.length} change${r.j.changes.length === 1 ? "" : "s"} at ${new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}.` });
         fetchAll(true);
       } else if (r.status === 422) {
         setSrvErr(r.j.errors || {}); setReview(false);
@@ -221,6 +232,11 @@ export default function Settings() {
   const regd = ov.registered || {};
   const healthBad = (ov.health || []).filter((h) => h.level === "bad" || h.level === "warn").length;
   const plan = rolloverPlan(cfg);
+  const nextStatus = STATUSES[statusIdx + 1] || null;
+  const nextGate = nextStatus ? gate(ov.readiness, nextStatus) : { blockers: [], warnings: [], ok: [] };
+  const regClosed = !!cfg.registration_closes && today > cfg.registration_closes;
+  const forecast = revenueForecast(cfg, regd);
+  const cutoffDays = daysBetween(today, cfg.team_fee_early_cutoff_date);
   const fee = teamFeeFor(cfg, feeDate || today);
   const formList = ov.forms && ov.forms.available ? ov.forms.forms : null;
   const sync = (ov && ov.sync_forms) || null;
@@ -249,6 +265,7 @@ export default function Settings() {
       </header>
 
       {msg && <div className={"gs-banner " + msg.kind} role={msg.kind === "bad" ? "alert" : "status"}>{msg.text}
+        {msg.undo && <span className="gs-bact"><button className="gs-btn small" onClick={() => restore(msg.undo)}>Undo this save</button></span>}
         {conflict && <span className="gs-bact"><button className="gs-btn small" onClick={() => { if (!dirty || window.confirm("Reload and lose your unsaved edits?")) { setConflict(false); setMsg(null); fetchAll(false); } }}>Reload their version</button>
           <button className="gs-btn small danger" onClick={() => save(true)}>Overwrite with mine</button></span>}
       </div>}
@@ -258,7 +275,7 @@ export default function Settings() {
         {TABS.map(([k, l]) => (
           <button key={k} id={"gs-tab-" + k} role="tab" aria-selected={tab === k} aria-controls={"gs-panel-" + k} tabIndex={tab === k ? 0 : -1}
             className={"gs-tab" + (tab === k ? " on" : "")} onClick={() => setTab(k)}>
-            {l}{tabErr[k] ? <span className="gs-badge bad" aria-label={tabErr[k] + " problems"}>{tabErr[k]}</span> : k === "health" && healthBad ? <span className="gs-badge warn" aria-label={healthBad + " to check"}>{healthBad}</span> : null}
+            {l}{tabDirty[k] && !tabErr[k] ? <span className="gs-dot" role="img" aria-label={tabDirty[k] + " unsaved change" + (tabDirty[k] === 1 ? "" : "s")} title="Unsaved changes" /> : null}{tabErr[k] ? <span className="gs-badge bad" aria-label={tabErr[k] + " problems"}>{tabErr[k]}</span> : k === "health" && healthBad ? <span className="gs-badge warn" aria-label={healthBad + " to check"}>{healthBad}</span> : null}
           </button>
         ))}
       </div>
@@ -274,6 +291,14 @@ export default function Settings() {
               ))}
             </ol>
             <p className="gs-hint">{STATUS_HELP[cfg.status]}{cfg.status !== base.status && <strong> Not saved yet.</strong>}</p>
+            {nextStatus && !pending && (
+              <div className={"gs-gate" + (nextGate.blockers.length ? " stop" : nextGate.warnings.length ? " caution" : " go")} role="region" aria-label={"Go-live gate for " + nextStatus}>
+                <div className="gs-gatehead"><strong>Next: {nextStatus.charAt(0).toUpperCase() + nextStatus.slice(1)}</strong>
+                  <span className="gs-chip">{nextGate.blockers.length ? `${nextGate.blockers.length} thing${nextGate.blockers.length === 1 ? "" : "s"} blocking` : nextGate.warnings.length ? `Ready, ${nextGate.warnings.length} to look at` : "Ready"}</span></div>
+                {(nextGate.blockers.length > 0 || nextGate.warnings.length > 0) && <ul className="gs-checks">{[...nextGate.blockers, ...nextGate.warnings].map((c, i) => <li key={i} className={c.level}>{c.text}{c.tab && <button className="gs-link" onClick={() => setTab(c.tab)}>Fix</button>}</li>)}</ul>}
+                <div className="gs-btnrow"><button className="gs-btn small" disabled={nextGate.blockers.length > 0} onClick={() => setPending(nextStatus)}>Move to “{nextStatus}”…</button>{nextGate.blockers.length > 0 && <span className="gs-hint">Fix the blockers first. Saved settings are checked, so save any fixes before you move on.</span>}</div>
+              </div>
+            )}
             {err.status && <p className="gs-err" role="alert">{err.status}</p>}
             {pending && (
               <div className="gs-panel" role="region" aria-label={"Move to " + pending}>
@@ -321,26 +346,69 @@ export default function Settings() {
 
         {tab === "divisions" && <>
           <Group title="Divisions">
-            <p className="gs-hint">Roster spots = teams × max roster. “Needed” = teams × min roster. The bar shows registered players against both.</p>
+            <p className="gs-hint">Each division is filled one of three ways: a <strong>Draft</strong> (players register, the draft builds the teams), <strong>Registered teams</strong> (captains register whole teams) or <strong>Both</strong> (some slots of each). Every number below updates as you type, before anything is saved.</p>
             {err.divisions && <p className="gs-err" role="alert">{err.divisions}</p>}
           </Group>
-          {cfg.divisions.map((d, i) => {
-            const cap = capacity(d), n = (regd[d.key] && regd[d.key].registered) || 0, g = (regd[d.key] && regd[d.key].goalies) || 0;
+          <Group title="Season at a glance">
+            <div className="gs-tablewrap"><table className="gs-table"><caption className="sr">Every enabled division at a glance</caption>
+              <thead><tr><th scope="col">Division</th><th scope="col">Format</th><th scope="col">Draft teams</th><th scope="col">Registered teams</th><th scope="col">Players</th><th scope="col">Goalies short</th><th scope="col">Runs?</th></tr></thead>
+              <tbody>{cfg.divisions.filter((d) => d.enabled).map((d0) => {
+                const d = fillDivision(d0), w = whatIf(d, regd[d.key]), sp = slotSplit(d);
+                return (<tr key={d.key}><th scope="row">{d.label}</th><td>{FORMAT_LABEL[d.format]}</td><td>{d.format === "teams" ? "—" : sp.draft}</td><td>{d.format === "draft" ? "—" : `${(regd[d.key] && regd[d.key].full_teams) || 0} of ${sp.teams}`}</td>
+                  <td>{!w || d.format === "teams" ? "—" : w.needMore > 0 ? `${w.registered} (${w.needMore} more needed)` : `${w.registered} (enough)`}</td><td>{!w || d.format === "teams" ? "—" : w.goalieGap}</td>
+                  <td className={w && d.format !== "teams" ? (w.runs ? "yes" : "no") : "no"}>{!w ? "?" : d.format === "teams" ? (w.teamsFull ? "Yes" : "Waiting") : w.runs ? "Yes" : "Not yet"}</td></tr>);
+              })}</tbody></table></div>
+          </Group>
+          {cfg.divisions.map((d0, i) => {
+            const d = fillDivision(d0), sp = slotSplit(d), cap = capacity(d), rg = regd[d.key] || {}, wi = whatIf(d, rg);
+            const n = rg.registered || 0, g = rg.goalies || 0, full = rg.full_teams || 0, drafts = rg.teams || 0;
             const pct = cap.slots ? Math.min(100, Math.round((n / cap.slots) * 100)) : 0, needPct = cap.slots && cap.needed ? Math.round((cap.needed / cap.slots) * 100) : 0;
             const e = (f) => err[`divisions.${i}.${f}`];
-            const num = (f, lab) => <Field id={`d${i}-${f}`} label={lab} error={e(f)}><input type="number" id={`d${i}-${f}`} value={d[f] === null || d[f] === undefined ? "" : d[f]} onChange={(ev) => setDiv(i, f, ev.target.value)} aria-invalid={!!e(f)} aria-describedby={e(f) ? `d${i}-${f}-e` : undefined} className={"gs-in" + (e(f) ? " bad" : "")} /></Field>;
+            const numIn = (f, lab, props) => <input type="number" aria-label={d.label + " " + lab} id={`d${i}-${f}`} className={"gs-in tiny" + (e(f) ? " bad" : "")} value={d0[f] === null || d0[f] === undefined ? "" : d0[f]} onChange={(ev) => setDiv(i, f, ev.target.value)} aria-invalid={!!e(f)} {...props} />;
+            const step = (f, delta, lo, hi) => { const cur = toNum(d0[f]) || 0; const nv = Math.max(lo, Math.min(hi, cur + delta)); setDiv(i, f, nv); };
+            const pair = (a, bb, lab) => <Field id={`d${i}-${a}`} label={lab} error={e(a) || e(bb)}><span className="gs-pair">{numIn(a, lab + " min")}<span aria-hidden="true">to</span>{numIn(bb, lab + " max")}</span></Field>;
+            let chip = null;
+            if (d.enabled && wi) {
+              if (d.format === "teams") chip = wi.teamsFull ? ["ok", "All teams in"] : [regClosed ? "warn" : "mute", `${wi.teamsLeft} team${wi.teamsLeft === 1 ? "" : "s"} to go`];
+              else if (wi.spotsLeft < 0) chip = ["bad", `Over by ${-wi.spotsLeft}`];
+              else if (wi.runs) chip = ["ok", "Can run"];
+              else chip = [regClosed ? "warn" : "mute", wi.needMore > 0 ? `${wi.needMore} more player${wi.needMore === 1 ? "" : "s"} to run` : `${wi.goalieGap} more goalie${wi.goalieGap === 1 ? "" : "s"} needed`];
+            }
             return (
               <section key={d.key} className={"gs-div" + (d.enabled ? "" : " off")} aria-label={d.label}>
                 <div className="gs-divhead">
-                  <div className="gs-divname"><input aria-label={d.label + " name"} className={"gs-in name" + (e("label") ? " bad" : "")} value={d.label} onChange={(ev) => setDiv(i, "label", ev.target.value)} /><code>{d.key}</code>{e("label") && <span className="gs-err">{e("label")}</span>}</div>
-                  <button type="button" role="switch" aria-checked={!!d.enabled} aria-label={"Enable " + d.label} className={"gs-sw" + (d.enabled ? " on" : "")} onClick={() => setDiv(i, "enabled", !d.enabled)}><span /></button>
+                  <div className="gs-divname"><input aria-label={d.label + " name"} className={"gs-in name" + (e("label") ? " bad" : "")} value={d.label} onChange={(ev) => setDiv(i, "label", ev.target.value)} /><span className="gs-id" title="Internal key used by the database. It cannot be edited.">ID {d.key}</span>{e("label") && <span className="gs-err">{e("label")}</span>}{chip && <span className={"gs-chip " + chip[0]}>{chip[1]}</span>}</div>
+                  <span className="gs-swwrap"><span className={"gs-swl" + (d.enabled ? " on" : "")} aria-hidden="true">{d.enabled ? "Enabled" : "Off"}</span>
+                    <button type="button" role="switch" aria-checked={!!d.enabled} aria-label={"Enable " + d.label} className={"gs-sw" + (d.enabled ? " on" : "")} onClick={() => setDiv(i, "enabled", !d.enabled)}><span /></button></span>
                 </div>
                 {d.enabled && <>
-                  <div className="gs-grid five">{num("teams", "Teams")}{num("min_roster", "Min roster")}{num("max_roster", "Max roster")}{num("goalie_min", "Min goalies")}{num("goalie_max", "Max goalies")}</div>
-                  <div className="gs-cap">
-                    <div className="gs-meter" role="img" aria-label={`${n} registered of ${cap.slots === null ? "unknown" : cap.slots} spots`}><i className={n > (cap.slots || Infinity) ? "over" : ""} style={{ width: pct + "%" }} />{needPct > 0 && <b style={{ left: needPct + "%" }} title="Minimum needed" />}</div>
-                    <p className="gs-hint"><strong>{n}</strong> registered ({g} goalie{g === 1 ? "" : "s"}) · <strong>{cap.slots === null ? "—" : cap.slots}</strong> spots · <strong>{cap.needed === null ? "—" : cap.needed}</strong> needed to run{cap.goalies !== null && g < cap.goalies ? <span className="gs-warn"> · needs {cap.goalies} goalies</span> : null}</p>
+                  <div className="gs-fmt" role="radiogroup" aria-label={d.label + " format"}>
+                    {FORMATS.map((f) => <button type="button" key={f} role="radio" aria-checked={d.format === f} className={"gs-seg" + (d.format === f ? " on" : "")} onClick={() => setDiv(i, "format", f)}>{FORMAT_LABEL[f]}</button>)}
                   </div>
+                  <p className="gs-hint">{FORMAT_HELP[d.format]}</p>
+                  {e("format") && <p className="gs-err" role="alert">{e("format")}</p>}
+                  <div className="gs-grid compact">
+                    <Field id={`d${i}-teams`} label="Teams" error={e("teams")}>
+                      <span className="gs-stepper"><button type="button" className="gs-stepbtn" aria-label={"One fewer team in " + d.label} onClick={() => step("teams", -1, 1, 16)}>−</button>{numIn("teams", "teams")}<button type="button" className="gs-stepbtn" aria-label={"One more team in " + d.label} onClick={() => step("teams", 1, 1, 16)}>+</button></span>
+                    </Field>
+                    {pair("min_roster", "max_roster", "Roster")}
+                    {pair("goalie_min", "goalie_max", "Goalies")}
+                    {d.format === "both" && <Field id={`d${i}-reg_teams`} label="Registered teams" error={e("reg_teams")} hint={sp.draft === null ? "" : `${sp.teams} registered + ${sp.draft} drafted`}>
+                      <span className="gs-stepper"><button type="button" className="gs-stepbtn" aria-label={"One fewer registered team in " + d.label} onClick={() => step("reg_teams", -1, 0, toNum(d0.teams) || 0)}>−</button>{numIn("reg_teams", "registered-team slots")}<button type="button" className="gs-stepbtn" aria-label={"One more registered team in " + d.label} onClick={() => step("reg_teams", 1, 0, toNum(d0.teams) || 0)}>+</button></span>
+                    </Field>}
+                  </div>
+                  <div className="gs-stats" role="list">
+                    {d.format !== "teams" && <div className="gs-stat" role="listitem"><b>{n}<small> of {cap.slots === null ? "—" : cap.slots}</small></b><span>players ({cap.needed === null ? "—" : cap.needed} to run)</span></div>}
+                    {d.format !== "teams" && <div className="gs-stat" role="listitem"><b>{g}<small> of {cap.goalies === null ? "—" : cap.goalies}</small></b><span>goalies needed</span></div>}
+                    {d.format !== "teams" && <div className="gs-stat" role="listitem"><b>{drafts}<small> of {sp.draft === null ? "—" : sp.draft}</small></b><span>draft teams made{rg.no_captain ? `, ${rg.no_captain} without a captain` : ""}</span></div>}
+                    {d.format !== "draft" && <div className="gs-stat" role="listitem"><b>{full}<small> of {sp.teams === null ? "—" : sp.teams}</small></b><span>registered teams in <a className="gs-link" href="admin.php?page=grsh-tm-full-teams">view</a></span></div>}
+                  </div>
+                  {d.format !== "teams" && cap.slots !== null && (
+                    <div className="gs-cap">
+                      <div className="gs-meter" role="img" aria-label={`${n} registered of ${cap.slots} draft spots, ${cap.needed} needed to run`}><i className={n > cap.slots ? "over" : ""} style={{ width: pct + "%" }} />{needPct > 0 && <b style={{ left: needPct + "%" }} title="Needed to run" />}</div>
+                      <p className="gs-hint">{sp.draft} draft team{sp.draft === 1 ? "" : "s"} × {d0.max_roster} max = {cap.slots} spots. The dark mark is the {cap.needed} players needed.</p>
+                    </div>
+                  )}
                 </>}
                 {!d.enabled && n > 0 && <p className="gs-warn">{n} registered player{n === 1 ? "" : "s"} will be hidden while this division is off.</p>}
               </section>
@@ -372,6 +440,18 @@ export default function Settings() {
               <p className="gs-result">{fee ? <>That team gets the <strong>{fee.tier}</strong> fee: <strong>{money(fee.total)}</strong> total, <strong>{money(fee.balance)}</strong> due on {fmtDate(cfg.team_balance_due_date)} after the {money(fee.deposit)} deposit.
                 {fee.tier === "early" ? ` ${fee.daysFromCutoff === 0 ? "Last day for the early fee." : Math.abs(fee.daysFromCutoff) + " days before the cutoff."}` : ` ${fee.daysFromCutoff} day${fee.daysFromCutoff === 1 ? "" : "s"} past the cutoff. Paying earlier would have saved ${money(fee.saving)}.`}</> : "Fill in the amounts and dates to see an example."}</p>
             </div>
+          </Group>
+          <Group title="Revenue forecast">
+            <p className="gs-hint">What the settings add up to, not what has been paid. It counts registered-team slots in enabled divisions and players already registered.</p>
+            <div className="gs-stats" role="list">
+              <div className="gs-stat" role="listitem"><b>{forecast.teamSlots}</b><span>registered-team slots</span></div>
+              <div className="gs-stat" role="listitem"><b>{money(forecast.deposits)}</b><span>in deposits if all pay</span></div>
+              <div className="gs-stat" role="listitem"><b>{money(forecast.earlyTotal)}</b><span>if all pay the early fee</span></div>
+              <div className="gs-stat" role="listitem"><b>{money(forecast.lateTotal)}</b><span>if all pay late</span></div>
+              <div className="gs-stat" role="listitem"><b>{forecast.playerRevenue === null ? "—" : money(forecast.playerRevenue)}</b><span>{forecast.playerRevenue === null ? "no player fee set" : `from ${forecast.players} registered player${forecast.players === 1 ? "" : "s"}`}</span></div>
+            </div>
+            {cutoffDays !== null && <p className="gs-result">{cutoffDays > 0 ? <>The early fee ends in <strong>{cutoffDays} day{cutoffDays === 1 ? "" : "s"}</strong> ({fmtDate(cfg.team_fee_early_cutoff_date)}). A team that waits pays {money((toNum(cfg.team_fee_late_amount) || 0) - (toNum(cfg.team_fee_early_amount) || 0))} more.</> : cutoffDays === 0 ? <>Today is the last day for the early fee.</> : <>The early fee ended {-cutoffDays} day{cutoffDays === -1 ? "" : "s"} ago, so new teams pay {money(cfg.team_fee_late_amount)}.</>}</p>}
+            {forecast.teamSlots === 0 && <p className="gs-hint">No division takes registered teams right now, so team fees do not apply. Change a division's Format on the Divisions tab to turn them on.</p>}
           </Group>
           <Group title="Reminders">
             <div className="gs-grid">
@@ -481,10 +561,11 @@ export default function Settings() {
             <ul className="gs-chg big">{changes.map((c) => <li key={c.key}><span>{c.label}</span><span><del>{c.from}</del> → <ins>{c.to}</ins></span></li>)}</ul>
             {warnings.map((w) => <p key={w} className="gs-warn" role="alert">⚠ {w}</p>)}
             {statusChecks.length > 0 && <div className="gs-panel"><h4>Before moving to “{cfg.status}”</h4><ul className="gs-checks">{statusChecks.map((c, i) => <li key={i} className={c.level}>{c.text}</li>)}</ul></div>}
+            {statusBlocks.length > 0 && <label className="gs-ack"><input type="checkbox" checked={ack2} onChange={(e) => setAck2(e.target.checked)} /> I know {statusBlocks.length} thing{statusBlocks.length === 1 ? " is" : "s are"} blocking “{cfg.status}” and I want to save anyway.</label>}
             {irreversible && <label className="gs-ack"><input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} /> I understand “{cfg.status}” is meant to be final.</label>}
             <p className="gs-hint">Every save is logged with your name and kept in Version history so you can undo it.</p>
             <div className="gs-btnrow">
-              <button className="gs-btn primary" disabled={saving || (irreversible && !ack)} onClick={() => save(false)}>{saving ? "Saving…" : `Save ${changes.length} change${changes.length === 1 ? "" : "s"}`}</button>
+              <button className="gs-btn primary" disabled={saving || (irreversible && !ack) || (statusBlocks.length > 0 && !ack2)} onClick={() => save(false)}>{saving ? "Saving…" : `Save ${changes.length} change${changes.length === 1 ? "" : "s"}`}</button>
               <button className="gs-btn ghost" onClick={() => setReview(false)}>Keep editing</button>
             </div>
           </div>
@@ -495,12 +576,13 @@ export default function Settings() {
 }
 
 function labelOf(key, cfg) {
-  if (key.startsWith("divisions.")) { const [, dk, f] = key.split("."); const d = (cfg.divisions || []).find((x) => x.key === dk); return `${d ? d.label : dk} · ${f.replace("_", " ")}`; }
+  if (key.startsWith("divisions.")) { const [, dk, f] = key.split("."); const d = (cfg.divisions || []).find((x) => x.key === dk); return `${d ? d.label : dk} · ${f === "reg_teams" ? "registered-team slots" : f.replace("_", " ")}`; }
   return FIELD_LABELS[key] || key;
 }
 function show(key, v) {
   if (v === null || v === undefined || v === "") return "not set";
   if (typeof v === "boolean") return v ? "On" : "Off";
+  if (/\.format$/.test(key)) return FORMAT_LABEL[v] || String(v);
   if (/_(amount)$|^player_fee$/.test(key)) return money(v);
   if (/date$|_opens$|_closes$/.test(key)) return fmtDate(v);
   return String(v);
@@ -515,7 +597,7 @@ function Styles() {
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .gs-head{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-bottom:16px}
 .gs-eyebrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;line-height:1.5;margin:0 0 8px;position:relative}
-.gs-tag{font:500 11px 'DM Mono',monospace;letter-spacing:.1em;text-transform:uppercase;background:var(--ink);color:var(--gold);padding:3px 12px;border-radius:99px}
+.gs-tag{font:500 12px 'DM Mono',monospace;letter-spacing:.1em;text-transform:uppercase;background:var(--ink);color:var(--gold);padding:3px 12px;border-radius:99px}
 .gs-pill{font:500 12px 'DM Mono',monospace;border:1px solid var(--line);background:#fff;padding:2px 10px;border-radius:99px;display:inline-block}
 .gs-pill.green,.gs-pill.s-open{color:var(--ok);border-color:#9fe1cb;background:#e1f5ee}.gs-pill.blue,.gs-pill.s-setup{color:#185fa5;border-color:#b5d4f4;background:#e6f1fb}
 .gs-pill.amber,.gs-pill.s-draft{color:var(--warn);border-color:#fac775;background:#faeeda}.gs-pill.s-locked{color:var(--bad);border-color:#f7c1c1;background:#fceBEB}.gs-pill.grey,.gs-pill.s-complete{color:var(--mut);background:#f1efe8}
@@ -531,10 +613,10 @@ function Styles() {
 .gs-btn:focus-visible,.gs-tab:focus-visible,.gs-in:focus-visible,.gs-sw:focus-visible,.gs-step:focus-visible,.gs-link:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #2a6df4;outline-offset:2px}
 .gs-banner{border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:12px;font:13px 'DM Mono',monospace;display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
 .gs-banner.ok{background:#e1f5ee;border-color:#9fe1cb;color:#0b5a46}.gs-banner.bad{background:#fceaea;border-color:#f0b4b4;color:#7d1f1f}.gs-bact{display:flex;gap:8px}
-.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;position:sticky;top:32px;z-index:40;background:var(--bg);padding:8px 0;border-bottom:1px solid var(--line)}
 .gs-tab{font:500 13px 'DM Mono',monospace;padding:8px 16px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--mut);cursor:pointer}
 .gs-tab.on{background:var(--ink);color:var(--gold);border-color:var(--ink)}
-.gs-badge{margin-left:7px;font:600 11px 'DM Mono',monospace;border-radius:99px;padding:1px 7px;color:#fff}.gs-badge.bad{background:var(--bad)}.gs-badge.warn{background:#b7791f}
+.gs-badge{margin-left:7px;font:600 12px 'DM Mono',monospace;border-radius:99px;padding:1px 7px;color:#fff}.gs-badge.bad{background:var(--bad)}.gs-badge.warn{background:#b7791f}
 .gs-card{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .gs-group{padding:18px 22px;border-bottom:1px solid #efede4}.gs-group:last-child{border-bottom:0}
 .gs-gl{font:500 12px 'DM Mono',monospace;color:var(--mut);text-transform:uppercase;letter-spacing:.08em;margin:0 0 12px}
@@ -546,17 +628,17 @@ function Styles() {
 .gs-hint{font:12.5px/1.45 'DM Mono',monospace;color:var(--mut);margin:5px 0 0}.gs-err{font:600 12.5px 'DM Mono',monospace;color:var(--bad);margin:5px 0 0}.gs-warn{font:600 12.5px/1.45 'DM Mono',monospace;color:var(--warn);margin:6px 0 0}.gs-okt{font:600 12.5px 'DM Mono',monospace;color:var(--ok)}
 .gs-row{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding:12px 0;border-bottom:1px solid #f1efe7}.gs-row:last-child{border-bottom:0}
 .gs-rowlabel{font:600 15px 'Fraunces',serif;display:block}.gs-rowtxt{flex:1}
-.gs-wire{display:inline-block;font:500 11px 'DM Mono',monospace;border-radius:4px;padding:2px 7px;margin-top:6px}.gs-wire.off{background:#faeeda;color:#7a4f08;border:1px solid #fac775}.gs-wire.on{color:var(--mut);padding-left:0}
-.gs-sw{width:48px;height:28px;border-radius:99px;border:1px solid #9a968a;background:#e1ded3;position:relative;cursor:pointer;flex-shrink:0;padding:0}
-.gs-sw span{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.3);transition:left .15s}.gs-sw.on{background:var(--ink);border-color:var(--ink)}.gs-sw.on span{left:23px}
+.gs-wire{display:inline-block;font:500 12px 'DM Mono',monospace;border-radius:4px;padding:2px 7px;margin-top:6px}.gs-wire.off{background:#faeeda;color:#7a4f08;border:1px solid #fac775}.gs-wire.on{color:var(--mut);padding-left:0}
+.gs-sw{width:48px;height:28px;border-radius:99px;border:1px solid #6f6b5f;background:#8a8678;position:relative;cursor:pointer;flex-shrink:0;padding:0}
+.gs-sw span{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.3);transition:left .15s}.gs-sw.on{background:var(--ok);border-color:#0b5a46}.gs-sw.on span{left:23px}
 .gs-tl{background:#f6f5f0;border-radius:10px;padding:14px 16px}.gs-tlhead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:26px}.gs-tlnote{font:600 13px 'DM Mono',monospace}.gs-tlnote.green{color:var(--ok)}.gs-tlnote.amber{color:var(--warn)}.gs-tlnote.blue{color:#185fa5}
 .gs-bar{position:relative;height:10px;background:#dedbd0;border-radius:6px;margin:0 6px 14px}.gs-bar .seg{position:absolute;top:0;bottom:0;display:block}.gs-bar .seg.green{background:#1d9e75}.gs-bar .seg.amber{background:#e8b04a}
 .gs-bar .tick{position:absolute;top:-3px;width:3px;height:16px;background:var(--ink);transform:translateX(-1px)}
-.gs-bar .today{position:absolute;top:-10px;width:0;height:30px;border-left:2px dashed #2a6df4;text-decoration:none}.gs-bar .today em{position:absolute;top:-14px;left:-18px;font:600 11px 'DM Mono',monospace;color:#2a6df4;font-style:normal}
+.gs-bar .today{position:absolute;top:-10px;width:0;height:30px;border-left:2px dashed #2a6df4;text-decoration:none}.gs-bar .today em{position:absolute;top:-14px;left:-18px;font:600 12px 'DM Mono',monospace;color:#2a6df4;font-style:normal}
 .gs-tlfoot{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font:12.5px 'DM Mono',monospace;color:var(--mut)}.gs-tlfoot strong{color:var(--ink)}
 .gs-steps{list-style:none;display:flex;gap:6px;flex-wrap:wrap;padding:0;margin:0 0 6px}
 .gs-step{font:500 13px 'DM Mono',monospace;border:1px solid var(--line);background:#fff;border-radius:99px;padding:6px 14px 6px 8px;cursor:pointer;display:flex;align-items:center;gap:8px;color:var(--mut)}
-.gs-step .n{width:22px;height:22px;border-radius:50%;background:#e7e4da;display:inline-flex;align-items:center;justify-content:center;font-size:11px}.gs-step.done .n{background:#1d9e75;color:#fff}.gs-step.now{border-color:var(--ink);color:var(--ink);background:#f4f2ea}.gs-step.now .n{background:var(--ink);color:var(--gold)}
+.gs-step .n{width:22px;height:22px;border-radius:50%;background:#e7e4da;display:inline-flex;align-items:center;justify-content:center;font-size:12px}.gs-step.done .n{background:#1d9e75;color:#fff}.gs-step.now{border-color:var(--ink);color:var(--ink);background:#f4f2ea}.gs-step.now .n{background:var(--ink);color:var(--gold)}
 .gs-panel{border:1px solid var(--line);background:#faf9f5;border-radius:10px;padding:12px 16px;margin-top:10px}.gs-panel h4{margin:0 0 8px;font-size:15px}
 .gs-checks{list-style:none;margin:0;padding:0}.gs-checks li{font:13px/1.4 'DM Mono',monospace;padding:5px 0 5px 24px;position:relative}
 .gs-checks li:before{position:absolute;left:0;top:5px;font-weight:700}.gs-checks .ok:before{content:"✓";color:var(--ok)}.gs-checks .warn:before{content:"!";color:#b7791f}.gs-checks .block:before,.gs-checks .bad:before{content:"✕";color:var(--bad)}.gs-checks .info:before{content:"i";color:#185fa5}
@@ -564,11 +646,11 @@ function Styles() {
 .gs-link{font:600 12px 'DM Mono',monospace;background:none;border:0;color:#185fa5;text-decoration:underline;cursor:pointer;margin-left:8px}
 .gs-btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
 .gs-div{padding:16px 22px;border-bottom:1px solid #efede4}.gs-div.off{background:#fbfaf6}.gs-divhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}.gs-divname{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.gs-divname code{font:11px 'DM Mono',monospace;background:#efede4;border-radius:4px;padding:2px 6px;color:var(--mut)}
+
 .gs-cap{margin-top:12px}.gs-meter{position:relative;height:10px;border-radius:6px;background:#e5e2d8;overflow:visible}.gs-meter i{display:block;height:100%;background:#1d9e75;border-radius:6px}.gs-meter i.over{background:var(--bad)}.gs-meter b{position:absolute;top:-3px;width:2px;height:16px;background:var(--ink)}
 .gs-try{margin-top:14px;padding:12px 16px;background:#f6f5f0;border-radius:10px}.gs-result{font:13.5px/1.5 'DM Mono',monospace;margin:8px 0 0}
 .gs-range{display:flex;gap:12px;align-items:center}.gs-range input[type=range]{flex:1;accent-color:var(--ink)}
-.gs-table{width:100%;border-collapse:collapse;font:13px 'DM Mono',monospace}.gs-table th,.gs-table td{padding:9px 12px;border-bottom:1px solid #efede4;text-align:left}.gs-table thead th{background:#faf9f5;color:#44443f;font-weight:500;text-transform:uppercase;font-size:11px;letter-spacing:.06em}
+.gs-table{width:100%;border-collapse:collapse;font:13px 'DM Mono',monospace}.gs-table th,.gs-table td{padding:9px 12px;border-bottom:1px solid #efede4;text-align:left}.gs-table thead th{background:#faf9f5;color:#44443f;font-weight:500;text-transform:uppercase;font-size:12px;letter-spacing:.06em}
 .gs-table td.yes{color:var(--ok);font-weight:700;text-align:center}.gs-table td.no{color:#8a8678;text-align:center}.gs-tablewrap{overflow-x:auto}
 .gs-hist{list-style:none;padding:0;margin:0}.gs-hist>li{padding:10px 0;border-bottom:1px solid #f1efe7;font:13px 'DM Mono',monospace}.gs-hist summary{cursor:pointer;margin-bottom:6px}
 .gs-chg{list-style:none;margin:6px 0 8px;padding:0 0 0 12px;font:12.5px/1.6 'DM Mono',monospace;color:#33332f}.gs-chg span:first-child{font-weight:600;margin-right:6px}del{color:var(--bad);background:#fdeeee;text-decoration:line-through;padding:0 3px}ins{color:#0b5a46;background:#e6f6ef;text-decoration:none;padding:0 3px}
@@ -579,7 +661,26 @@ function Styles() {
 .gs-ack{display:flex;gap:8px;align-items:center;font:13px 'DM Mono',monospace;margin:10px 0}
 .gs-fail{background:#fff;border:1px solid #f0b4b4;border-radius:12px;padding:22px;max-width:560px}.gs-fail h2{margin:0 0 8px;color:var(--bad)}.gs-load{font:14px 'DM Mono',monospace;color:var(--mut)}
 @media (max-width:640px){.gs-root{padding:16px 12px 90px}.gs-title{font-size:24px}}
-@media print{.gs-actions,.gs-tabs,.gs-bottom{display:none}}
+@media print{.gs-actions,.gs-tabs,.gs-bottom{display:none}.gs-root{padding:0}}
+.gs-root,.gs-root *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.gs-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2a6df4;margin-left:7px;vertical-align:middle}
+.gs-swwrap{display:inline-flex;align-items:center;gap:8px;flex-shrink:0}.gs-swl{font:600 12px 'DM Mono',monospace;color:#5b5b55;min-width:52px;text-align:right}.gs-swl.on{color:var(--ok)}
+.gs-div.off{opacity:.62}.gs-div.off .gs-divhead{margin-bottom:0}
+.gs-id{font:12px 'DM Mono',monospace;color:#6a675d;letter-spacing:.04em}
+.gs-fmt{display:inline-flex;border:1px solid #9a968a;border-radius:8px;overflow:hidden;margin-bottom:4px}
+.gs-seg{font:600 13px 'DM Mono',monospace;background:#fff;color:var(--ink);border:0;border-right:1px solid #cfcbbd;padding:8px 16px;cursor:pointer}.gs-seg:last-child{border-right:0}
+.gs-seg:hover{background:#efede4}.gs-seg.on{background:var(--ink);color:var(--gold)}.gs-seg:focus-visible{outline:3px solid #2a6df4;outline-offset:-3px}
+.gs-grid.compact{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));margin-top:10px}
+.gs-in.tiny{width:64px;min-height:36px;text-align:center;padding:6px}
+.gs-pair{display:inline-flex;align-items:center;gap:8px;font:13px 'DM Mono',monospace;color:var(--mut)}
+.gs-stepper{display:inline-flex;align-items:center;gap:4px}.gs-stepbtn{width:36px;height:36px;border-radius:8px;border:1px solid #6f6b5f;background:#fff;font:600 18px 'DM Mono',monospace;cursor:pointer;line-height:1;color:var(--ink)}.gs-stepbtn:hover{background:#efede4}.gs-stepbtn:focus-visible{outline:3px solid #2a6df4;outline-offset:2px}
+.gs-stats{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 0}.gs-stat{flex:1 1 150px;background:#faf9f5;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.gs-stat b{display:block;font:700 22px 'Fraunces',serif;color:var(--ink)}.gs-stat b small{font:500 13px 'DM Mono',monospace;color:var(--mut)}.gs-stat span{font:12px/1.4 'DM Mono',monospace;color:var(--mut)}
+.gs-chip{font:600 12px 'DM Mono',monospace;border-radius:99px;padding:2px 10px;border:1px solid var(--line);background:#f1efe8;color:#44443f}
+.gs-chip.ok{background:#e1f5ee;border-color:#9fe1cb;color:#0b5a46}.gs-chip.warn{background:#faeeda;border-color:#fac775;color:#7a4f08}.gs-chip.bad{background:#fceaea;border-color:#f0b4b4;color:#7d1f1f}
+.gs-gate{border:1px solid var(--line);border-left-width:5px;border-radius:10px;background:#faf9f5;padding:12px 16px;margin-top:12px}.gs-gate.stop{border-left-color:var(--bad)}.gs-gate.caution{border-left-color:#b7791f}.gs-gate.go{border-left-color:#1d9e75}
+.gs-gatehead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;font:15px 'Fraunces',serif}
+.gs-meter i{-webkit-print-color-adjust:exact;print-color-adjust:exact}
 `}</style>
   );
 }

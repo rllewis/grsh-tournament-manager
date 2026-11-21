@@ -110,19 +110,6 @@ const hhmm = () => new Date().toLocaleTimeString([], {
   hour: "numeric",
   minute: "2-digit"
 });
-const lsGet = (k, d) => {
-  try {
-    const v = window.localStorage.getItem(k);
-    return v === null ? d : v;
-  } catch (e) {
-    return d;
-  }
-};
-const lsSet = (k, v) => {
-  try {
-    window.localStorage.setItem(k, v);
-  } catch (e) {/* storage can be blocked */}
-};
 
 // ─── small UI pieces ─────────────────────────────────────────────────────────
 const btn = (kind = "ghost", extra = {}) => ({
@@ -177,6 +164,7 @@ function PlayerRow({
   onDragEnd,
   captain,
   pinned,
+  held,
   selected
 }) {
   const tier = (0, _rosterEngine.tierOf)(p),
@@ -221,6 +209,12 @@ function PlayerRow({
         },
         children: "C"
       })]
+    }), held && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+      title: "Locked to this team: auto-balance and swaps will not move them",
+      style: {
+        fontSize: 11
+      },
+      children: "\uD83D\uDD12"
     }), pinned && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
       title: "Has a keep-together / keep-apart rule",
       style: {
@@ -369,9 +363,9 @@ function Rosters() {
   const [drag, setDrag] = (0, _react.useState)(null); // player id
   const [hover, setHover] = (0, _react.useState)(null); // team id | "pool"
   const [suggestTeam, setSuggestTeam] = (0, _react.useState)(null);
-  const [hideNotices, setHideNotices] = (0, _react.useState)(() => lsGet("grsh_rosters_hide_notices", "1") === "1");
   const [reveal, setReveal] = (0, _react.useState)(null); // {i, shown}
   const [printing, setPrinting] = (0, _react.useState)(false);
+  const [keyOpen, setKeyOpen] = (0, _react.useState)(false);
   const dataRef = (0, _react.useRef)(null);
   dataRef.current = data;
   const flash = (0, _react.useCallback)((msg, kind = "ok") => {
@@ -439,18 +433,6 @@ function Rosters() {
     load(div); /* eslint-disable-next-line */
   }, []);
 
-  // hide other plugins' admin notices so they do not push the board down
-  (0, _react.useEffect)(() => {
-    const el = document.createElement("style");
-    el.id = "grsh-rosters-notices";
-    el.textContent = hideNotices ? "#wpbody-content > .notice,#wpbody-content > .updated,#wpbody-content > .error,#wpbody-content > .update-nag,.wrap > .notice{display:none!important}" : "";
-    document.head.appendChild(el);
-    lsSet("grsh_rosters_hide_notices", hideNotices ? "1" : "0");
-    return () => {
-      el.remove();
-    };
-  }, [hideNotices]);
-
   // ── derived ────────────────────────────────────────────────────────────────
   const cfg = data?.config || {
     min_roster: 8,
@@ -467,7 +449,8 @@ function Rosters() {
   const MAX = data?.max_player_score || 32;
   const teams = data?.teams || [],
     pool = data?.pool || [],
-    pins = data?.pins || [];
+    pins = data?.pins || [],
+    locks = data?.locks || [];
   const live = data && (data.draft_status === "active" || data.draft_status === "paused");
   const readOnly = !!live || data?.stage === "published";
   const stats = (0, _react.useMemo)(() => (0, _rosterEngine.teamStats)(teams, MAX), [teams, MAX]);
@@ -475,6 +458,7 @@ function Rosters() {
   const target = (0, _rosterEngine.targetSize)(cfg, teams.length, totalPlayers);
   const template = (0, _react.useMemo)(() => (0, _rosterEngine.slotTemplate)(cfg, target), [cfg, target]);
   const violations = (0, _react.useMemo)(() => (0, _rosterEngine.pinViolations)(pins, teams), [pins, teams]);
+  const heldSet = (0, _react.useMemo)(() => new Set(locks), [locks]);
   const pinned = (0, _react.useMemo)(() => {
     const s = new Set();
     pins.forEach(p => {
@@ -489,6 +473,7 @@ function Rosters() {
     allPlayers.forEach(p => m.set(p.id, p));
     return m;
   }, [allPlayers]);
+  const lockSum = (0, _react.useMemo)(() => (0, _rosterEngine.lockSummary)(teams, pins, locks, byId), [teams, pins, locks, byId]);
   const teamOf = (0, _react.useMemo)(() => (0, _rosterEngine.assignMap)(teams), [teams]);
   const counts = (0, _react.useMemo)(() => ({
     all: pool.length,
@@ -621,6 +606,11 @@ function Rosters() {
       flash(`${t.name} is locked. Unlock it to add players.`, "err");
       return;
     }
+    const lb = (0, _rosterEngine.lockBlock)(id, to, teams, locks);
+    if (lb) {
+      flash(lb, "err");
+      return;
+    }
     const from = cur === null ? null : teams.find(x => x.id === cur);
     if (from && from.locked) {
       flash(`${from.name} is locked. Unlock it to move players.`, "err");
@@ -682,6 +672,22 @@ function Rosters() {
       flash(e.message, "err");
     }
   };
+  const saveLocks = async next => {
+    try {
+      await call("/rosters/locks", "POST", {
+        division: data.division,
+        locks: next
+      });
+    } catch (e) {
+      flash(e.message, "err");
+    }
+  };
+  const toggleLock = id => {
+    if (guard()) return;
+    const on = heldSet.has(id);
+    const pl = byId.get(id);
+    saveLocks(on ? locks.filter(x => x !== id) : [...locks, id]).then(() => flash(`${fullName(pl)} ${on ? "unlocked" : "locked to their team"}`));
+  };
   const savePins = async next => {
     try {
       await call("/rosters/pins", "POST", {
@@ -739,7 +745,42 @@ function Rosters() {
   });
   const rowFor = id => stats.rows.find(r => r.id === id);
   const stageIdx = STAGES.findIndex(s => s.key === data.stage);
+  const blockList = (0, _rosterEngine.blockers)(data.gate),
+    warnList = (0, _rosterEngine.warnings)(data.gate);
+  const planned = cfg.planned_teams || 0;
+  const createPlanned = async () => {
+    if (guard()) return;
+    const want = Math.max(0, planned - teams.length);
+    if (!want) return;
+    const names = (0, _rosterEngine.plannedTeamNames)(teams.map(t => t.name), want);
+    let made = 0;
+    try {
+      for (const n of names) {
+        await call("/rosters/teams", "POST", {
+          division: data.division,
+          name: n
+        });
+        made++;
+      }
+      flash(`Created ${made} team${made === 1 ? "" : "s"}.`);
+    } catch (e) {
+      flash(`${made ? `Created ${made}, then stopped: ` : ""}${e.message}`, "err");
+    }
+  };
+  const runFix = act => {
+    if (act === "newteams") {
+      planned > teams.length ? createPlanned() : setModal({
+        kind: "newteam"
+      });
+    } else if (act === "balance") setModal({
+      kind: "balance",
+      mode: pool.length && teams.some(t => t.players.length) ? "fill" : "rebalance"
+    });else if (act === "swaps") setModal({
+      kind: "swaps"
+    });else if (act === "lockall") lockAll(true);
+  };
   return /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+    className: "gr",
     style: {
       fontFamily: F_UI,
       color: INK,
@@ -752,7 +793,7 @@ function Rosters() {
       setHover(null);
     },
     children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("style", {
-      children: `@media print{body *{visibility:hidden!important}.grsh-print,.grsh-print *{visibility:visible!important}.grsh-print{position:absolute;left:0;top:0;width:100%}}`
+      children: `.gr button:disabled{opacity:.4;cursor:not-allowed}.gr button:focus-visible,.gr select:focus-visible,.gr input:focus-visible{outline:3px solid ${GOLD};outline-offset:2px}.gr .gr-key{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:12px;color:${MUTED};background:${PAPER};border-radius:8px;padding:8px 10px;margin-bottom:8px}@media print{body *{visibility:hidden!important}.grsh-print,.grsh-print *{visibility:visible!important}.grsh-print{position:absolute;left:0;top:0;width:100%}}`
     }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
       style: {
         display: "flex",
@@ -769,29 +810,18 @@ function Rosters() {
         },
         children: "Rosters"
       }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+        role: "status",
+        "aria-live": "polite",
         style: {
-          fontSize: 12,
-          color: SOFT
+          fontSize: 13,
+          color: saving > 0 ? "#92400E" : savedAt ? "#166534" : MUTED,
+          fontWeight: 600
         },
-        children: saving > 0 ? "Saving…" : savedAt ? `All changes saved ${savedAt}` : "Changes save automatically"
+        children: saving > 0 ? "Saving…" : savedAt ? `✓ All changes saved ${savedAt}` : "Changes save automatically"
       }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
         style: {
           flex: 1
         }
-      }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("label", {
-        style: {
-          fontSize: 12,
-          color: SOFT,
-          display: "flex",
-          alignItems: "center",
-          gap: 5,
-          cursor: "pointer"
-        },
-        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
-          type: "checkbox",
-          checked: hideNotices,
-          onChange: e => setHideNotices(e.target.checked)
-        }), " Hide other plugins' notices"]
       })]
     }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
       role: "tablist",
@@ -811,13 +841,13 @@ function Rosters() {
           gap: 8,
           alignItems: "center"
         },
-        children: [d.label, /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+        children: [d.label, /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+          title: (0, _rosterEngine.divisionTabLabel)(d).title,
           style: {
-            fontFamily: F_NUM,
             fontSize: 11,
-            opacity: .8
+            opacity: (0, _rosterEngine.divisionTabLabel)(d).muted ? .6 : .85
           },
-          children: [d.assigned, "/", d.total, " \xB7 ", d.pct, "%"]
+          children: (0, _rosterEngine.divisionTabLabel)(d).text
         })]
       }, d.key))
     }), live && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
@@ -843,7 +873,11 @@ function Rosters() {
         marginBottom: 12,
         fontSize: 14
       },
-      children: ["Published ", data.published.at, ". Rosters are read-only."]
+      children: ["Published ", data.published.at, ". Rosters are read-only.", data.changes_since_publish > 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+        children: [" ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+          children: [data.changes_since_publish, " roster move", data.changes_since_publish > 1 ? "s were" : " was", " made after publishing."]
+        }), " Open Activity to see them, then resend the emails if players should be told."]
+      })]
     }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
       style: {
         display: "flex",
@@ -869,7 +903,70 @@ function Rosters() {
           alignSelf: "center",
           marginLeft: 6
         },
-        children: data.gate.filter(g => g.level === "fail").length ? `${data.gate.filter(g => g.level === "fail").length} blocker${data.gate.filter(g => g.level === "fail").length > 1 ? "s" : ""} before publishing` : "No blockers"
+        children: "Click a step to open its checklist."
+      })]
+    }), blockList.length > 0 && data.stage !== "published" && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      role: "region",
+      "aria-label": "What blocks publishing",
+      style: {
+        background: "#FEF2F2",
+        border: "1px solid #FCA5A5",
+        borderRadius: 10,
+        padding: "8px 12px",
+        marginBottom: 12,
+        fontSize: 13
+      },
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+        style: {
+          color: "#991B1B"
+        },
+        children: [blockList.length, " thing", blockList.length > 1 ? "s" : "", " to fix before you can publish"]
+      }), blockList.map(b => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        style: {
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          marginTop: 4
+        },
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+          style: {
+            flex: 1
+          },
+          children: ["\u26D4 ", b.text]
+        }), b.fix && /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+          style: btn("ghost", {
+            padding: "3px 9px",
+            fontSize: 12
+          }),
+          onClick: () => runFix(b.fix.act),
+          children: b.fix.label
+        })]
+      }, b.key))]
+    }), !blockList.length && warnList.length > 0 && data.stage !== "published" && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      style: {
+        background: "#FFFBEB",
+        border: "1px solid #FCD34D",
+        borderRadius: 10,
+        padding: "6px 12px",
+        marginBottom: 12,
+        fontSize: 13,
+        color: "#92400E"
+      },
+      children: ["Nothing blocks publishing. ", warnList.length, " thing", warnList.length > 1 ? "s" : "", " worth a look: ", warnList.slice(0, 2).map(w => w.text).join("; "), warnList.length > 2 ? "…" : "", " ", /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        className: "gr-link",
+        style: {
+          background: "none",
+          border: 0,
+          color: "#92400E",
+          textDecoration: "underline",
+          cursor: "pointer",
+          fontSize: 13
+        },
+        onClick: () => setModal({
+          kind: "publish",
+          focus: "review"
+        }),
+        children: "See all"
       })]
     }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
       style: {
@@ -903,7 +1000,7 @@ function Rosters() {
               color: SOFT,
               fontSize: 13
             },
-            children: "Add teams to see balance."
+            children: "Balance appears once teams have players."
           }), teams.map(t => {
             const r = rowFor(t.id),
               b = BAND[(0, _rosterEngine.bandOf)(r?.parity ?? null, th)];
@@ -973,6 +1070,10 @@ function Rosters() {
           children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
             style: btn("primary"),
             disabled: readOnly || !teams.length,
+            title: (0, _rosterEngine.whyDisabled)("balance", {
+              readOnly,
+              teams: teams.length
+            }),
             onClick: () => setModal({
               kind: "balance",
               mode: pool.length && teams.some(t => t.players.length) ? "fill" : "rebalance"
@@ -981,6 +1082,10 @@ function Rosters() {
           }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
             style: btn(),
             disabled: readOnly || teams.length < 2,
+            title: (0, _rosterEngine.whyDisabled)("swaps", {
+              readOnly,
+              teams: teams.length
+            }) || "Find one-for-one swaps that even out the teams",
             onClick: () => setModal({
               kind: "swaps"
             }),
@@ -989,7 +1094,10 @@ function Rosters() {
             style: btn(),
             disabled: !undo.length || readOnly,
             onClick: doUndo,
-            title: "Ctrl+Z",
+            title: (0, _rosterEngine.whyDisabled)("undo", {
+              readOnly,
+              undo: undo.length
+            }) || "Ctrl+Z",
             children: ["Undo", undo.length ? ` (${undo.length})` : ""]
           }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
             style: btn(),
@@ -997,6 +1105,19 @@ function Rosters() {
               kind: "plans"
             }),
             children: ["Plans (", data.plans.length, ")"]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+            style: btn(),
+            onClick: () => setModal({
+              kind: "rules"
+            }),
+            title: "Every player with a lock, rule or captain role",
+            children: ["Rules & locks", lockSum.broken > 0 ? ` (${lockSum.broken} broken)` : lockSum.held ? ` (${lockSum.held} 🔒)` : ""]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+            style: btn(),
+            onClick: () => setModal({
+              kind: "activity"
+            }),
+            children: "Activity"
           }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
             style: btn(),
             onClick: () => setModal({
@@ -1114,6 +1235,30 @@ function Rosters() {
                   children: h.score
                 })]
               })]
+            }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+              style: {
+                display: "flex",
+                gap: 4,
+                margin: "0 0 8px",
+                flexWrap: "wrap"
+              },
+              "aria-label": "Players by position",
+              children: (0, _rosterEngine.positionNeeds)(t, cfg).map(x => /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                title: `${x.label}: ${x.have}${x.need ? ` (needs ${x.need})` : ""}`,
+                style: chip(x.tone === "bad" ? {
+                  bg: "#FEE2E2",
+                  color: "#991B1B"
+                } : x.tone === "warn" ? {
+                  bg: "#FEF3C7",
+                  color: "#92400E"
+                } : {
+                  bg: "#F3F4F6",
+                  color: MUTED
+                }, {
+                  fontFamily: F_NUM
+                }),
+                children: [x.short, " ", x.have, x.need && x.tone !== "ok" ? `/${x.need}` : ""]
+              }, x.pos))
             }), isHover && proj && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
               style: {
                 background: "#FFF8E1",
@@ -1138,8 +1283,9 @@ function Rosters() {
                 dense: true,
                 captain: t.captain_player_id === s.player.id,
                 pinned: pinned.has(s.player.id),
+                held: heldSet.has(s.player.id),
                 selected: peek === s.player.id,
-                draggable: !readOnly && !t.locked,
+                draggable: !readOnly && !t.locked && !heldSet.has(s.player.id),
                 onPeek: p => setPeek(p.id),
                 onDragStart: e => {
                   e.dataTransfer.setData("text/plain", String(s.player.id));
@@ -1273,7 +1419,59 @@ function Rosters() {
               })]
             })]
           }, t.id);
-        }), !readOnly && /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+        }), !readOnly && teams.length === 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+          style: {
+            gridColumn: "1 / -1",
+            background: WHITE,
+            border: `2px dashed ${LINE}`,
+            borderRadius: 12,
+            padding: "28px 20px",
+            textAlign: "center"
+          },
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+            style: {
+              fontFamily: F_HEAD,
+              fontSize: 20,
+              fontWeight: 700,
+              marginBottom: 6
+            },
+            children: ["No teams in ", data.division_label, " yet"]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+            style: {
+              margin: "0 auto 14px",
+              maxWidth: 460,
+              fontSize: 14,
+              color: MUTED
+            },
+            children: planned ? `Settings plans ${planned} team${planned === 1 ? "" : "s"} for this division. Create them now, then drag players from the list on the right, or let Auto-balance fill them.` : "Add a team, then drag players from the list on the right, or let Auto-balance fill it."
+          }), planned > 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+            style: btn("primary", {
+              marginRight: 8
+            }),
+            onClick: createPlanned,
+            children: ["Create ", planned, " team", planned === 1 ? "" : "s"]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+            style: btn(),
+            onClick: () => setModal({
+              kind: "newteam"
+            }),
+            children: "Add one team"
+          })]
+        }), !readOnly && teams.length > 0 && planned > teams.length && /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+          onClick: createPlanned,
+          style: {
+            border: `2px dashed ${GOLD}`,
+            borderRadius: 12,
+            background: "#FFFBEB",
+            color: INK,
+            minHeight: 60,
+            cursor: "pointer",
+            fontFamily: F_UI,
+            fontSize: 14,
+            fontWeight: 600
+          },
+          children: ["Create the other ", planned - teams.length, " planned team", planned - teams.length === 1 ? "" : "s"]
+        }), !readOnly && teams.length > 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
           onClick: () => setModal({
             kind: "newteam"
           }),
@@ -1335,7 +1533,38 @@ function Rosters() {
                 color: SOFT
               },
               children: [pool.length, " players"]
+            }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+              type: "button",
+              "aria-expanded": keyOpen,
+              onClick: () => setKeyOpen(!keyOpen),
+              style: btn("ghost", {
+                padding: "2px 8px",
+                fontSize: 12
+              }),
+              title: "What the dots, chips and numbers mean",
+              children: "Key"
             })]
+          }), keyOpen && /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+            className: "gr-key",
+            role: "note",
+            style: {
+              marginTop: 8
+            },
+            children: _rosterEngine.KEY_ITEMS.map(k => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              style: {
+                display: "contents"
+              },
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+                style: {
+                  fontFamily: F_NUM
+                },
+                children: k.mark
+              }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+                  children: [k.label, "."]
+                }), " ", k.text]
+              })]
+            }, k.label))
           }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
             style: {
               display: "flex",
@@ -1383,8 +1612,9 @@ function Rosters() {
               style: {
                 border: `1px solid ${LINE}`,
                 borderRadius: 8,
-                fontSize: 12,
-                padding: "0 6px"
+                fontSize: 13,
+                padding: "0 8px",
+                minWidth: 104
               },
               children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("option", {
                 value: "score",
@@ -1433,6 +1663,8 @@ function Rosters() {
       p: byId.get(peek),
       teams: teams,
       pins: pins,
+      held: heldSet.has(peek),
+      onLock: () => toggleLock(peek),
       byId: byId,
       allPlayers: allPlayers,
       teamOf: teamOf,
@@ -1440,6 +1672,11 @@ function Rosters() {
       onClose: () => setPeek(null),
       onMove: tid => {
         const pl = byId.get(peek);
+        const lb = (0, _rosterEngine.lockBlock)(peek, tid, teams, locks);
+        if (lb) {
+          flash(lb, "err");
+          return;
+        }
         const t = tid === null ? null : teams.find(x => x.id === tid);
         doMoves([{
           player_id: peek,
@@ -1474,6 +1711,7 @@ function Rosters() {
       teams: teams,
       pool: pool,
       pins: pins,
+      locks: locks,
       cfg: cfg,
       th: th,
       MAX: MAX,
@@ -1495,6 +1733,7 @@ function Rosters() {
     }), modal?.kind === "swaps" && /*#__PURE__*/(0, _jsxRuntime.jsx)(SwapsModal, {
       teams: teams,
       pins: pins,
+      locks: locks,
       cfg: cfg,
       MAX: MAX,
       onClose: () => setModal(null),
@@ -1513,6 +1752,9 @@ function Rosters() {
     }), modal?.kind === "plans" && /*#__PURE__*/(0, _jsxRuntime.jsx)(PlansModal, {
       plans: data.plans,
       readOnly: readOnly,
+      byId: byId,
+      teams: teams,
+      MAX: MAX,
       onClose: () => setModal(null),
       onSave: async name => {
         try {
@@ -1554,6 +1796,20 @@ function Rosters() {
       call: call,
       flash: flash,
       lockAll: lockAll
+    }), modal?.kind === "rules" && /*#__PURE__*/(0, _jsxRuntime.jsx)(RulesModal, {
+      sum: lockSum,
+      readOnly: readOnly,
+      onClose: () => setModal(null),
+      onPeek: id => {
+        setModal(null);
+        setPeek(id);
+      },
+      onUnlock: id => toggleLock(id),
+      onRemoveRule: (a, b) => savePins(pins.filter(x => !(x.a === a && x.b === b || x.a === b && x.b === a)))
+    }), modal?.kind === "activity" && /*#__PURE__*/(0, _jsxRuntime.jsx)(ActivityModal, {
+      division: data.division,
+      call: call,
+      onClose: () => setModal(null)
     }), modal?.kind === "print" && /*#__PURE__*/(0, _jsxRuntime.jsxs)(Modal, {
       title: "Print rosters / Reveal",
       onClose: () => setModal(null),
@@ -1676,6 +1932,8 @@ function PeekCard({
   p,
   teams,
   pins,
+  held,
+  onLock,
   byId,
   allPlayers,
   teamOf,
@@ -1823,6 +2081,33 @@ function PeekCard({
           disabled: t.locked && t.id !== cur,
           children: [t.name, t.locked ? " (locked)" : ""]
         }, t.id))]
+      }), team && !team.locked && /*#__PURE__*/(0, _jsxRuntime.jsxs)("label", {
+        style: {
+          display: "flex",
+          gap: 8,
+          alignItems: "flex-start",
+          fontSize: 13,
+          margin: "2px 0 10px",
+          cursor: "pointer"
+        },
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+          type: "checkbox",
+          checked: !!held,
+          onChange: onLock,
+          style: {
+            marginTop: 3
+          }
+        }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+            children: ["\uD83D\uDD12 Lock to ", team.name]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("br", {}), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: {
+              color: SOFT,
+              fontSize: 12
+            },
+            children: "Auto-balance and swaps will leave this player here, and moving them by hand is blocked until you untick this."
+          })]
+        })]
       }), team && !team.locked && team.captain_player_id !== p.id && /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
         style: btn("ghost", {
           marginBottom: 10
@@ -2057,6 +2342,7 @@ function BalanceModal({
   teams,
   pool,
   pins,
+  locks,
   cfg,
   th,
   MAX,
@@ -2067,8 +2353,9 @@ function BalanceModal({
   const [mode, setMode] = (0, _react.useState)(initialMode);
   const prop = (0, _react.useMemo)(() => (0, _rosterEngine.proposeBalance)(teams, pool, pins, cfg, {
     mode,
-    max: MAX
-  }), [teams, pool, pins, cfg, mode, MAX]);
+    max: MAX,
+    locks
+  }), [teams, pool, pins, cfg, mode, MAX, locks]);
   const [off, setOff] = (0, _react.useState)({}); // player ids the user unticked
   (0, _react.useEffect)(() => setOff({}), [mode]);
   const accepted = (prop.moves || []).filter(m => !off[m.player_id]);
@@ -2249,6 +2536,7 @@ function BalanceModal({
 function SwapsModal({
   teams,
   pins,
+  locks,
   cfg,
   MAX,
   onClose,
@@ -2256,8 +2544,9 @@ function SwapsModal({
 }) {
   const list = (0, _react.useMemo)(() => (0, _rosterEngine.findSwaps)(teams, pins, cfg, {
     limit: 6,
-    max: MAX
-  }), [teams, pins, cfg, MAX]);
+    max: MAX,
+    locks
+  }), [teams, pins, cfg, MAX, locks]);
   const nm = id => teams.find(t => t.id === id)?.name || "?";
   return /*#__PURE__*/(0, _jsxRuntime.jsxs)(Modal, {
     title: "Swap finder",
@@ -2312,6 +2601,13 @@ function SwapsModal({
             fontSize: 12
           },
           children: ["Spread ", s.spreadBefore.toFixed(1), " \u2192 ", s.spreadAfter.toFixed(1), " pts", s.samePos ? " · same position" : " · different positions"]
+        }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+          style: {
+            color: SOFT,
+            fontSize: 12,
+            marginTop: 2
+          },
+          children: (0, _rosterEngine.explainSwap)(s, teams, MAX)
         })]
       }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
         style: btn("primary"),
@@ -2324,12 +2620,28 @@ function SwapsModal({
 function PlansModal({
   plans,
   readOnly,
+  byId,
+  teams,
+  MAX,
   onClose,
   onSave,
   onRestore,
   onDelete
 }) {
   const [name, setName] = (0, _react.useState)("");
+  const [cmp, setCmp] = (0, _react.useState)(null); // { id, against }
+  const nm = id => id === null ? "Unassigned" : (teams.find(t => t.id === id) || {}).name || "?";
+  const shown = (0, _react.useMemo)(() => {
+    if (!cmp) return null;
+    const pl = plans.find(x => x.id === cmp.id);
+    if (!pl) return null;
+    const other = cmp.against === "now" ? (0, _rosterEngine.currentAssign)(teams) : (plans.find(x => x.id === cmp.against) || {}).assign || {};
+    return {
+      pl,
+      other,
+      res: (0, _rosterEngine.comparePlans)(other, pl.assign || {}, byId, teams, MAX)
+    };
+  }, [cmp, plans, teams, byId, MAX]);
   return /*#__PURE__*/(0, _jsxRuntime.jsxs)(Modal, {
     title: "Plans (saved versions)",
     onClose: onClose,
@@ -2371,6 +2683,88 @@ function PlansModal({
         fontSize: 13
       },
       children: "No saved plans yet."
+    }), shown && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      style: {
+        background: PAPER,
+        borderRadius: 10,
+        padding: 10,
+        marginBottom: 10
+      },
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        style: {
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          flexWrap: "wrap",
+          fontSize: 13
+        },
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+          children: shown.pl.name
+        }), " compared with", /*#__PURE__*/(0, _jsxRuntime.jsxs)("select", {
+          value: cmp.against,
+          onChange: e => setCmp({
+            ...cmp,
+            against: e.target.value
+          }),
+          "aria-label": "Compare with",
+          style: {
+            border: `1px solid ${LINE}`,
+            borderRadius: 8,
+            padding: "3px 6px"
+          },
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("option", {
+            value: "now",
+            children: "the rosters right now"
+          }), plans.filter(x => x.id !== cmp.id).map(x => /*#__PURE__*/(0, _jsxRuntime.jsx)("option", {
+            value: x.id,
+            children: x.name
+          }, x.id))]
+        })]
+      }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        style: {
+          fontSize: 13,
+          margin: "6px 0"
+        },
+        children: ["Spread ", /*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+          style: {
+            fontFamily: F_NUM
+          },
+          children: shown.res.spreadFrom.toFixed(1)
+        }), " \u2192 ", /*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+          style: {
+            fontFamily: F_NUM
+          },
+          children: shown.res.spreadTo.toFixed(1)
+        }), " pts if you restore it. ", shown.res.moves.length, " player", shown.res.moves.length === 1 ? "" : "s", " would move."]
+      }), shown.res.moves.length === 0 && /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+        style: {
+          fontSize: 13,
+          color: SOFT
+        },
+        children: "No differences."
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+        style: {
+          maxHeight: 200,
+          overflowY: "auto",
+          display: "grid",
+          gap: 2
+        },
+        children: shown.res.moves.map(m => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+          style: {
+            fontSize: 12
+          },
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+            children: fullName(m.player)
+          }), " ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+            style: {
+              color: SOFT
+            },
+            children: [nm(m.from), " \u2192 "]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+            children: nm(m.to)
+          })]
+        }, m.player.id))
+      })]
     }), plans.map(p => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
       style: {
         display: "flex",
@@ -2392,6 +2786,14 @@ function PlansModal({
           },
           children: [p.created_at, p.by ? ` · ${p.by}` : "", " \xB7 ", p.count, " players"]
         })]
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        style: btn(),
+        onClick: () => setCmp(cmp && cmp.id === p.id ? null : {
+          id: p.id,
+          against: "now"
+        }),
+        "aria-pressed": !!cmp && cmp.id === p.id,
+        children: "Compare"
       }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
         style: btn(),
         disabled: readOnly,
@@ -2438,6 +2840,14 @@ function PublishModal({
         division: data.division,
         enable
       });
+    } catch (e) {
+      flash(e.message, "err");
+    }
+  };
+  const [pv, setPv] = (0, _react.useState)(null);
+  const preview = async () => {
+    try {
+      setPv(await call(`/rosters/publish-preview?division=${encodeURIComponent(data.division)}`));
     } catch (e) {
       flash(e.message, "err");
     }
@@ -2608,6 +3018,79 @@ function PublishModal({
         margin: "16px 0 6px",
         fontFamily: F_HEAD
       },
+      children: "Who will be emailed (dry run)"
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      style: {
+        fontSize: 12,
+        color: SOFT,
+        margin: "0 0 6px"
+      },
+      children: "Shows each player who would be told their team, and anyone who would be skipped. Nothing is sent."
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+      style: btn(),
+      onClick: preview,
+      children: "Preview emails"
+    }), pv && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      style: {
+        marginTop: 8,
+        fontSize: 13
+      },
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+          children: pv.will_send
+        }), " would be emailed, ", /*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+          children: pv.will_skip
+        }), " skipped."]
+      }), pv.sample_subject && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        style: {
+          background: PAPER,
+          borderRadius: 8,
+          padding: "6px 10px",
+          margin: "6px 0"
+        },
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+          children: "Subject:"
+        }), " ", pv.sample_subject, /*#__PURE__*/(0, _jsxRuntime.jsx)("br", {}), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+          style: {
+            color: MUTED
+          },
+          children: pv.sample_body
+        })]
+      }), pv.skipped.length > 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        style: {
+          color: "#92400E"
+        },
+        children: ["Skipped: ", pv.skipped.map(x => `${x.name} (${x.reason})`).join("; ")]
+      }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("details", {
+        style: {
+          marginTop: 4
+        },
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("summary", {
+          style: {
+            cursor: "pointer"
+          },
+          children: "Show recipients"
+        }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+          style: {
+            maxHeight: 160,
+            overflowY: "auto",
+            fontSize: 12
+          },
+          children: pv.recipients.map((x, i) => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+            children: [x.name, " ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+              style: {
+                color: SOFT
+              },
+              children: ["\u2192 ", x.team, " \xB7 ", x.to]
+            })]
+          }, i))
+        })]
+      })]
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("h4", {
+      style: {
+        margin: "16px 0 6px",
+        fontFamily: F_HEAD
+      },
       children: "SportsPress check (dry run)"
     }), /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
       style: {
@@ -2649,6 +3132,254 @@ function PublishModal({
         }) : ""]
       }, t.team))]
     }))]
+  });
+}
+function RulesModal({
+  sum,
+  readOnly,
+  onClose,
+  onPeek,
+  onUnlock,
+  onRemoveRule
+}) {
+  const [only, setOnly] = (0, _react.useState)("all");
+  const rows = sum.rows.filter(r => only === "all" || only === "broken" && r.broken || only === "locked" && r.held || only === "rules" && r.rules.length);
+  const tab = (k, label, n) => /*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+    style: btn(only === k ? "primary" : "ghost", {
+      padding: "3px 10px",
+      fontSize: 12
+    }),
+    "aria-pressed": only === k,
+    onClick: () => setOnly(k),
+    children: [label, " ", n]
+  }, k);
+  return /*#__PURE__*/(0, _jsxRuntime.jsxs)(Modal, {
+    title: "Rules & locks",
+    onClose: onClose,
+    width: 640,
+    children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+      style: {
+        marginTop: 0,
+        fontSize: 13,
+        color: MUTED
+      },
+      children: ["Every player who is held in place, has a keep-together/apart rule, or captains a team. \uD83D\uDD12 locked players are never moved by Auto-balance or Find swaps.", sum.onLockedTeams > 0 ? ` ${sum.onLockedTeams} more player${sum.onLockedTeams === 1 ? " is" : "s are"} held because their whole team is locked.` : ""]
+    }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+      style: {
+        display: "flex",
+        gap: 6,
+        marginBottom: 10,
+        flexWrap: "wrap"
+      },
+      children: [tab("all", "All", sum.rows.length), tab("broken", "Broken", sum.broken), tab("locked", "🔒 Locked", sum.held), tab("rules", "With rules", sum.ruled)]
+    }), rows.length === 0 && /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      style: {
+        color: SOFT,
+        fontSize: 13
+      },
+      children: sum.rows.length === 0 ? "Nothing yet. Open a player and tick “Lock to team”, or add a keep-together/apart rule." : "Nothing matches this filter."
+    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+      style: {
+        display: "grid",
+        gap: 6,
+        maxHeight: "60vh",
+        overflowY: "auto"
+      },
+      children: rows.map(r => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+        style: {
+          border: `1px solid ${r.broken ? "#FCA5A5" : LINE}`,
+          background: r.broken ? "#FEF2F2" : WHITE,
+          borderRadius: 8,
+          padding: "8px 10px",
+          fontSize: 13
+        },
+        children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+          style: {
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            flexWrap: "wrap"
+          },
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+            style: {
+              background: "none",
+              border: 0,
+              padding: 0,
+              fontWeight: 700,
+              cursor: "pointer",
+              color: INK,
+              fontSize: 14,
+              fontFamily: F_UI,
+              textDecoration: "underline"
+            },
+            onClick: () => onPeek(r.player.id),
+            children: fullName(r.player)
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: {
+              color: SOFT
+            },
+            children: r.teamName
+          }), r.held && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: chip({
+              bg: "#E0F2FE",
+              color: "#075985"
+            }),
+            children: "\uD83D\uDD12 Locked to team"
+          }), r.captain && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: chip({
+              bg: "#FEF3C7",
+              color: "#92400E"
+            }),
+            children: "Captain"
+          }), r.teamLocked && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: chip({
+              bg: "#F3F4F6",
+              color: MUTED
+            }),
+            children: "Team locked"
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: {
+              flex: 1
+            }
+          }), r.held && !readOnly && /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+            style: btn("ghost", {
+              padding: "2px 8px",
+              fontSize: 12
+            }),
+            onClick: () => onUnlock(r.player.id),
+            children: "Unlock"
+          })]
+        }), r.rules.map((x, i) => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+          style: {
+            display: "flex",
+            gap: 6,
+            alignItems: "center",
+            marginTop: 4
+          },
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: chip(x.type === "together" ? {
+              bg: "#DCFCE7",
+              color: "#166534"
+            } : {
+              bg: "#FEE2E2",
+              color: "#991B1B"
+            }),
+            children: x.type === "together" ? "Together" : "Apart"
+          }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+            style: {
+              flex: 1
+            },
+            children: [fullName(x.other), " ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+              style: {
+                color: SOFT
+              },
+              children: ["(", x.otherTeam, ")"]
+            })]
+          }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+            style: {
+              fontWeight: 700,
+              color: x.met === false ? "#991B1B" : x.met ? "#166534" : SOFT
+            },
+            children: x.met === null ? "not placed yet" : x.met ? "✓ kept" : "✗ broken"
+          }), !readOnly && /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+            style: btn("ghost", {
+              padding: "1px 7px",
+              fontSize: 12
+            }),
+            onClick: () => onRemoveRule(r.player.id, x.other.id),
+            "aria-label": "Remove rule",
+            children: "\u2715"
+          })]
+        }, i))]
+      }, r.player.id))
+    })]
+  });
+}
+function ActivityModal({
+  division,
+  call,
+  onClose
+}) {
+  const [d, setD] = (0, _react.useState)(null);
+  (0, _react.useEffect)(() => {
+    let live = true;
+    (async () => {
+      try {
+        const r = await call(`/rosters/activity?division=${encodeURIComponent(division)}`);
+        if (live) setD(r);
+      } catch (e) {
+        if (live) setD({
+          error: e.message
+        });
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [division, call]);
+  return /*#__PURE__*/(0, _jsxRuntime.jsx)(Modal, {
+    title: "Activity",
+    onClose: onClose,
+    width: 560,
+    children: !d ? /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      style: {
+        color: SOFT
+      },
+      children: "Loading\u2026"
+    }) : d.error ? /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+      style: {
+        color: "#991B1B"
+      },
+      children: d.error
+    }) : /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+        style: {
+          marginTop: 0,
+          fontSize: 13,
+          color: MUTED
+        },
+        children: ["Every roster change for this division: who made it and when.", d.published_at ? ` Published ${d.published_at}.` : ""]
+      }), d.changes_since_publish > 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
+        style: {
+          background: "#FEF3C7",
+          color: "#92400E",
+          borderRadius: 8,
+          padding: "6px 10px",
+          fontSize: 13
+        },
+        children: [d.changes_since_publish, " move", d.changes_since_publish > 1 ? "s" : "", " since publishing. Players were not told."]
+      }), d.items.length === 0 && /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+        style: {
+          color: SOFT
+        },
+        children: "Nothing recorded yet."
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+        style: {
+          display: "grid",
+          gap: 4
+        },
+        children: d.items.map(x => /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+          style: {
+            borderTop: `1px solid ${LINE}`,
+            padding: "6px 0",
+            fontSize: 13
+          },
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+            children: x.title
+          }), x.moved ? ` (${x.moved})` : "", " ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+            style: {
+              color: SOFT
+            },
+            children: [x.at, " \xB7 ", x.by]
+          }), x.notes ? /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+            style: {
+              color: MUTED
+            },
+            children: x.notes
+          }) : null]
+        }, x.id))
+      })]
+    })
   });
 }
 function RevealView({

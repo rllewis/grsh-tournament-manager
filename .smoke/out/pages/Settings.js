@@ -97,16 +97,23 @@ function Switch({
         ov: ov,
         k: k
       })]
-    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
-      type: "button",
-      role: "switch",
-      id: id,
-      "aria-checked": !!checked,
-      "aria-labelledby": id + "-l",
-      "aria-describedby": hint ? id + "-h" : undefined,
-      className: "gs-sw" + (checked ? " on" : ""),
-      onClick: () => onChange(!checked),
-      children: /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {})
+    }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+      className: "gs-swwrap",
+      children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+        className: "gs-swl" + (checked ? " on" : ""),
+        "aria-hidden": "true",
+        children: checked ? "On" : "Off"
+      }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+        type: "button",
+        role: "switch",
+        id: id,
+        "aria-checked": !!checked,
+        "aria-labelledby": id + "-l",
+        "aria-describedby": hint ? id + "-h" : undefined,
+        className: "gs-sw" + (checked ? " on" : ""),
+        onClick: () => onChange(!checked),
+        children: /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {})
+      })]
     })]
   });
 }
@@ -236,6 +243,7 @@ function Settings() {
   const [tab, setTab] = (0, _react.useState)("season");
   const [review, setReview] = (0, _react.useState)(false);
   const [ack, setAck] = (0, _react.useState)(false);
+  const [ack2, setAck2] = (0, _react.useState)(false);
   const [saving, setSaving] = (0, _react.useState)(false);
   const [msg, setMsg] = (0, _react.useState)(null);
   const [conflict, setConflict] = (0, _react.useState)(false);
@@ -284,10 +292,19 @@ function Settings() {
   const changes = (0, _react.useMemo)(() => base && cfg ? (0, _settingsEngine.diff)(base, cfg) : [], [base, cfg]);
   const dirty = changes.length > 0;
   const clientErr = (0, _react.useMemo)(() => cfg ? (0, _settingsEngine.validate)(cfg) : {}, [cfg]);
+  const impact = (0, _react.useMemo)(() => ov && base && cfg ? (0, _settingsEngine.impactErrors)(base, cfg, ov.registered) : {}, [ov, base, cfg]);
   const err = (0, _react.useMemo)(() => ({
     ...srvErr,
-    ...clientErr
-  }), [srvErr, clientErr]);
+    ...clientErr,
+    ...impact
+  }), [srvErr, clientErr, impact]);
+  const tabDirty = (0, _react.useMemo)(() => {
+    const t = {};
+    changes.forEach(c => {
+      t[(0, _settingsEngine.tabOfError)(c.key)] = (t[(0, _settingsEngine.tabOfError)(c.key)] || 0) + 1;
+    });
+    return t;
+  }, [changes]);
   const errCount = Object.keys(err).length;
   const tabErr = (0, _react.useMemo)(() => (0, _settingsEngine.errorTabCounts)(err), [err]);
   const today = ov && ov.today || (0, _settingsEngine.localToday)();
@@ -318,10 +335,17 @@ function Settings() {
   const setDiv = (i, k, v) => {
     setCfg(c => ({
       ...c,
-      divisions: c.divisions.map((d, x) => x === i ? {
-        ...d,
-        [k]: v
-      } : d)
+      divisions: c.divisions.map((d, x) => {
+        if (x !== i) return d;
+        const nd = {
+          ...d,
+          [k]: v
+        };
+        return k === "teams" || k === "format" || k === "reg_teams" ? {
+          ...nd,
+          reg_teams: (0, _settingsEngine.fillDivision)(nd).reg_teams
+        } : nd;
+      })
     }));
     setSrvErr(e => {
       const key = `divisions.${i}.${k}`;
@@ -352,11 +376,13 @@ function Settings() {
   };
   const openReview = () => {
     setAck(false);
+    setAck2(false);
     setReview(true);
   };
   const warnings = (0, _react.useMemo)(() => ov && base && cfg ? (0, _settingsEngine.divisionWarnings)(base, cfg, ov.registered) : [], [ov, base, cfg]);
   const irreversible = cfg && base && cfg.status !== base.status && _settingsEngine.IRREVERSIBLE.includes(cfg.status);
   const statusChecks = ov && cfg && base && cfg.status !== base.status ? (ov.readiness[cfg.status] || []).filter(c => c.level !== "ok") : [];
+  const statusBlocks = statusChecks.filter(c => c.level === "block");
   const save = async force => {
     if (busy.current) return;
     busy.current = true;
@@ -388,8 +414,10 @@ function Settings() {
           },
           history: r.j.history || o.history
         }));
+        const prev = !r.j.unchanged && Array.isArray(r.j.history) && r.j.history[1] ? r.j.history[1].id : null;
         setMsg({
           kind: "ok",
+          undo: prev,
           text: r.j.unchanged ? "Nothing changed." : `Saved ${r.j.changes.length} change${r.j.changes.length === 1 ? "" : "s"} at ${new Date().toLocaleTimeString("en-US", {
             hour: "numeric",
             minute: "2-digit"
@@ -553,6 +581,15 @@ function Settings() {
   const regd = ov.registered || {};
   const healthBad = (ov.health || []).filter(h => h.level === "bad" || h.level === "warn").length;
   const plan = (0, _settingsEngine.rolloverPlan)(cfg);
+  const nextStatus = _settingsEngine.STATUSES[statusIdx + 1] || null;
+  const nextGate = nextStatus ? (0, _settingsEngine.gate)(ov.readiness, nextStatus) : {
+    blockers: [],
+    warnings: [],
+    ok: []
+  };
+  const regClosed = !!cfg.registration_closes && today > cfg.registration_closes;
+  const forecast = (0, _settingsEngine.revenueForecast)(cfg, regd);
+  const cutoffDays = (0, _settingsEngine.daysBetween)(today, cfg.team_fee_early_cutoff_date);
   const fee = (0, _settingsEngine.teamFeeFor)(cfg, feeDate || today);
   const formList = ov.forms && ov.forms.available ? ov.forms.forms : null;
   const sync = ov && ov.sync_forms || null;
@@ -611,7 +648,14 @@ function Settings() {
     }), msg && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
       className: "gs-banner " + msg.kind,
       role: msg.kind === "bad" ? "alert" : "status",
-      children: [msg.text, conflict && /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+      children: [msg.text, msg.undo && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+        className: "gs-bact",
+        children: /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+          className: "gs-btn small",
+          onClick: () => restore(msg.undo),
+          children: "Undo this save"
+        })
+      }), conflict && /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
         className: "gs-bact",
         children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
           className: "gs-btn small",
@@ -646,7 +690,12 @@ function Settings() {
         tabIndex: tab === k ? 0 : -1,
         className: "gs-tab" + (tab === k ? " on" : ""),
         onClick: () => setTab(k),
-        children: [l, tabErr[k] ? /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+        children: [l, tabDirty[k] && !tabErr[k] ? /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+          className: "gs-dot",
+          role: "img",
+          "aria-label": tabDirty[k] + " unsaved change" + (tabDirty[k] === 1 ? "" : "s"),
+          title: "Unsaved changes"
+        }) : null, tabErr[k] ? /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
           className: "gs-badge bad",
           "aria-label": tabErr[k] + " problems",
           children: tabErr[k]
@@ -693,6 +742,40 @@ function Settings() {
             className: "gs-hint",
             children: [STATUS_HELP[cfg.status], cfg.status !== base.status && /*#__PURE__*/(0, _jsxRuntime.jsx)("strong", {
               children: " Not saved yet."
+            })]
+          }), nextStatus && !pending && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+            className: "gs-gate" + (nextGate.blockers.length ? " stop" : nextGate.warnings.length ? " caution" : " go"),
+            role: "region",
+            "aria-label": "Go-live gate for " + nextStatus,
+            children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              className: "gs-gatehead",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("strong", {
+                children: ["Next: ", nextStatus.charAt(0).toUpperCase() + nextStatus.slice(1)]
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                className: "gs-chip",
+                children: nextGate.blockers.length ? `${nextGate.blockers.length} thing${nextGate.blockers.length === 1 ? "" : "s"} blocking` : nextGate.warnings.length ? `Ready, ${nextGate.warnings.length} to look at` : "Ready"
+              })]
+            }), (nextGate.blockers.length > 0 || nextGate.warnings.length > 0) && /*#__PURE__*/(0, _jsxRuntime.jsx)("ul", {
+              className: "gs-checks",
+              children: [...nextGate.blockers, ...nextGate.warnings].map((c, i) => /*#__PURE__*/(0, _jsxRuntime.jsxs)("li", {
+                className: c.level,
+                children: [c.text, c.tab && /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                  className: "gs-link",
+                  onClick: () => setTab(c.tab),
+                  children: "Fix"
+                })]
+              }, i))
+            }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              className: "gs-btnrow",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("button", {
+                className: "gs-btn small",
+                disabled: nextGate.blockers.length > 0,
+                onClick: () => setPending(nextStatus),
+                children: ["Move to \u201C", nextStatus, "\u201D\u2026"]
+              }), nextGate.blockers.length > 0 && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                className: "gs-hint",
+                children: "Fix the blockers first. Saved settings are checked, so save any fixes before you move on."
+              })]
             })]
           }), err.status && /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
             className: "gs-err",
@@ -826,35 +909,126 @@ function Settings() {
       }), tab === "divisions" && /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
         children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)(Group, {
           title: "Divisions",
-          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
             className: "gs-hint",
-            children: "Roster spots = teams \xD7 max roster. \u201CNeeded\u201D = teams \xD7 min roster. The bar shows registered players against both."
+            children: ["Each division is filled one of three ways: a ", /*#__PURE__*/(0, _jsxRuntime.jsx)("strong", {
+              children: "Draft"
+            }), " (players register, the draft builds the teams), ", /*#__PURE__*/(0, _jsxRuntime.jsx)("strong", {
+              children: "Registered teams"
+            }), " (captains register whole teams) or ", /*#__PURE__*/(0, _jsxRuntime.jsx)("strong", {
+              children: "Both"
+            }), " (some slots of each). Every number below updates as you type, before anything is saved."]
           }), err.divisions && /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
             className: "gs-err",
             role: "alert",
             children: err.divisions
           })]
-        }), cfg.divisions.map((d, i) => {
-          const cap = (0, _settingsEngine.capacity)(d),
-            n = regd[d.key] && regd[d.key].registered || 0,
-            g = regd[d.key] && regd[d.key].goalies || 0;
+        }), /*#__PURE__*/(0, _jsxRuntime.jsx)(Group, {
+          title: "Season at a glance",
+          children: /*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+            className: "gs-tablewrap",
+            children: /*#__PURE__*/(0, _jsxRuntime.jsxs)("table", {
+              className: "gs-table",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("caption", {
+                className: "sr",
+                children: "Every enabled division at a glance"
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("thead", {
+                children: /*#__PURE__*/(0, _jsxRuntime.jsxs)("tr", {
+                  children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                    scope: "col",
+                    children: "Division"
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                    scope: "col",
+                    children: "Format"
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                    scope: "col",
+                    children: "Draft teams"
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                    scope: "col",
+                    children: "Registered teams"
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                    scope: "col",
+                    children: "Players"
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                    scope: "col",
+                    children: "Goalies short"
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                    scope: "col",
+                    children: "Runs?"
+                  })]
+                })
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("tbody", {
+                children: cfg.divisions.filter(d => d.enabled).map(d0 => {
+                  const d = (0, _settingsEngine.fillDivision)(d0),
+                    w = (0, _settingsEngine.whatIf)(d, regd[d.key]),
+                    sp = (0, _settingsEngine.slotSplit)(d);
+                  return /*#__PURE__*/(0, _jsxRuntime.jsxs)("tr", {
+                    children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("th", {
+                      scope: "row",
+                      children: d.label
+                    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("td", {
+                      children: _settingsEngine.FORMAT_LABEL[d.format]
+                    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("td", {
+                      children: d.format === "teams" ? "—" : sp.draft
+                    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("td", {
+                      children: d.format === "draft" ? "—" : `${regd[d.key] && regd[d.key].full_teams || 0} of ${sp.teams}`
+                    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("td", {
+                      children: !w || d.format === "teams" ? "—" : w.needMore > 0 ? `${w.registered} (${w.needMore} more needed)` : `${w.registered} (enough)`
+                    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("td", {
+                      children: !w || d.format === "teams" ? "—" : w.goalieGap
+                    }), /*#__PURE__*/(0, _jsxRuntime.jsx)("td", {
+                      className: w && d.format !== "teams" ? w.runs ? "yes" : "no" : "no",
+                      children: !w ? "?" : d.format === "teams" ? w.teamsFull ? "Yes" : "Waiting" : w.runs ? "Yes" : "Not yet"
+                    })]
+                  }, d.key);
+                })
+              })]
+            })
+          })
+        }), cfg.divisions.map((d0, i) => {
+          const d = (0, _settingsEngine.fillDivision)(d0),
+            sp = (0, _settingsEngine.slotSplit)(d),
+            cap = (0, _settingsEngine.capacity)(d),
+            rg = regd[d.key] || {},
+            wi = (0, _settingsEngine.whatIf)(d, rg);
+          const n = rg.registered || 0,
+            g = rg.goalies || 0,
+            full = rg.full_teams || 0,
+            drafts = rg.teams || 0;
           const pct = cap.slots ? Math.min(100, Math.round(n / cap.slots * 100)) : 0,
             needPct = cap.slots && cap.needed ? Math.round(cap.needed / cap.slots * 100) : 0;
           const e = f => err[`divisions.${i}.${f}`];
-          const num = (f, lab) => /*#__PURE__*/(0, _jsxRuntime.jsx)(Field, {
+          const numIn = (f, lab, props) => /*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+            type: "number",
+            "aria-label": d.label + " " + lab,
             id: `d${i}-${f}`,
+            className: "gs-in tiny" + (e(f) ? " bad" : ""),
+            value: d0[f] === null || d0[f] === undefined ? "" : d0[f],
+            onChange: ev => setDiv(i, f, ev.target.value),
+            "aria-invalid": !!e(f),
+            ...props
+          });
+          const step = (f, delta, lo, hi) => {
+            const cur = (0, _settingsEngine.toNum)(d0[f]) || 0;
+            const nv = Math.max(lo, Math.min(hi, cur + delta));
+            setDiv(i, f, nv);
+          };
+          const pair = (a, bb, lab) => /*#__PURE__*/(0, _jsxRuntime.jsx)(Field, {
+            id: `d${i}-${a}`,
             label: lab,
-            error: e(f),
-            children: /*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
-              type: "number",
-              id: `d${i}-${f}`,
-              value: d[f] === null || d[f] === undefined ? "" : d[f],
-              onChange: ev => setDiv(i, f, ev.target.value),
-              "aria-invalid": !!e(f),
-              "aria-describedby": e(f) ? `d${i}-${f}-e` : undefined,
-              className: "gs-in" + (e(f) ? " bad" : "")
+            error: e(a) || e(bb),
+            children: /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+              className: "gs-pair",
+              children: [numIn(a, lab + " min"), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                "aria-hidden": "true",
+                children: "to"
+              }), numIn(bb, lab + " max")]
             })
           });
+          let chip = null;
+          if (d.enabled && wi) {
+            if (d.format === "teams") chip = wi.teamsFull ? ["ok", "All teams in"] : [regClosed ? "warn" : "mute", `${wi.teamsLeft} team${wi.teamsLeft === 1 ? "" : "s"} to go`];else if (wi.spotsLeft < 0) chip = ["bad", `Over by ${-wi.spotsLeft}`];else if (wi.runs) chip = ["ok", "Can run"];else chip = [regClosed ? "warn" : "mute", wi.needMore > 0 ? `${wi.needMore} more player${wi.needMore === 1 ? "" : "s"} to run` : `${wi.goalieGap} more goalie${wi.goalieGap === 1 ? "" : "s"} needed`];
+          }
           return /*#__PURE__*/(0, _jsxRuntime.jsxs)("section", {
             className: "gs-div" + (d.enabled ? "" : " off"),
             "aria-label": d.label,
@@ -867,33 +1041,153 @@ function Settings() {
                   className: "gs-in name" + (e("label") ? " bad" : ""),
                   value: d.label,
                   onChange: ev => setDiv(i, "label", ev.target.value)
-                }), /*#__PURE__*/(0, _jsxRuntime.jsx)("code", {
-                  children: d.key
+                }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                  className: "gs-id",
+                  title: "Internal key used by the database. It cannot be edited.",
+                  children: ["ID ", d.key]
                 }), e("label") && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
                   className: "gs-err",
                   children: e("label")
+                }), chip && /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                  className: "gs-chip " + chip[0],
+                  children: chip[1]
                 })]
-              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
-                type: "button",
-                role: "switch",
-                "aria-checked": !!d.enabled,
-                "aria-label": "Enable " + d.label,
-                className: "gs-sw" + (d.enabled ? " on" : ""),
-                onClick: () => setDiv(i, "enabled", !d.enabled),
-                children: /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {})
+              }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                className: "gs-swwrap",
+                children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                  className: "gs-swl" + (d.enabled ? " on" : ""),
+                  "aria-hidden": "true",
+                  children: d.enabled ? "Enabled" : "Off"
+                }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                  type: "button",
+                  role: "switch",
+                  "aria-checked": !!d.enabled,
+                  "aria-label": "Enable " + d.label,
+                  className: "gs-sw" + (d.enabled ? " on" : ""),
+                  onClick: () => setDiv(i, "enabled", !d.enabled),
+                  children: /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {})
+                })]
               })]
             }), d.enabled && /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
-              children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
-                className: "gs-grid five",
-                children: [num("teams", "Teams"), num("min_roster", "Min roster"), num("max_roster", "Max roster"), num("goalie_min", "Min goalies"), num("goalie_max", "Max goalies")]
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("div", {
+                className: "gs-fmt",
+                role: "radiogroup",
+                "aria-label": d.label + " format",
+                children: _settingsEngine.FORMATS.map(f => /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                  type: "button",
+                  role: "radio",
+                  "aria-checked": d.format === f,
+                  className: "gs-seg" + (d.format === f ? " on" : ""),
+                  onClick: () => setDiv(i, "format", f),
+                  children: _settingsEngine.FORMAT_LABEL[f]
+                }, f))
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+                className: "gs-hint",
+                children: _settingsEngine.FORMAT_HELP[d.format]
+              }), e("format") && /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+                className: "gs-err",
+                role: "alert",
+                children: e("format")
               }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+                className: "gs-grid compact",
+                children: [/*#__PURE__*/(0, _jsxRuntime.jsx)(Field, {
+                  id: `d${i}-teams`,
+                  label: "Teams",
+                  error: e("teams"),
+                  children: /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                    className: "gs-stepper",
+                    children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                      type: "button",
+                      className: "gs-stepbtn",
+                      "aria-label": "One fewer team in " + d.label,
+                      onClick: () => step("teams", -1, 1, 16),
+                      children: "\u2212"
+                    }), numIn("teams", "teams"), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                      type: "button",
+                      className: "gs-stepbtn",
+                      "aria-label": "One more team in " + d.label,
+                      onClick: () => step("teams", 1, 1, 16),
+                      children: "+"
+                    })]
+                  })
+                }), pair("min_roster", "max_roster", "Roster"), pair("goalie_min", "goalie_max", "Goalies"), d.format === "both" && /*#__PURE__*/(0, _jsxRuntime.jsx)(Field, {
+                  id: `d${i}-reg_teams`,
+                  label: "Registered teams",
+                  error: e("reg_teams"),
+                  hint: sp.draft === null ? "" : `${sp.teams} registered + ${sp.draft} drafted`,
+                  children: /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                    className: "gs-stepper",
+                    children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                      type: "button",
+                      className: "gs-stepbtn",
+                      "aria-label": "One fewer registered team in " + d.label,
+                      onClick: () => step("reg_teams", -1, 0, (0, _settingsEngine.toNum)(d0.teams) || 0),
+                      children: "\u2212"
+                    }), numIn("reg_teams", "registered-team slots"), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
+                      type: "button",
+                      className: "gs-stepbtn",
+                      "aria-label": "One more registered team in " + d.label,
+                      onClick: () => step("reg_teams", 1, 0, (0, _settingsEngine.toNum)(d0.teams) || 0),
+                      children: "+"
+                    })]
+                  })
+                })]
+              }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+                className: "gs-stats",
+                role: "list",
+                children: [d.format !== "teams" && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+                  className: "gs-stat",
+                  role: "listitem",
+                  children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+                    children: [n, /*#__PURE__*/(0, _jsxRuntime.jsxs)("small", {
+                      children: [" of ", cap.slots === null ? "—" : cap.slots]
+                    })]
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                    children: ["players (", cap.needed === null ? "—" : cap.needed, " to run)"]
+                  })]
+                }), d.format !== "teams" && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+                  className: "gs-stat",
+                  role: "listitem",
+                  children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+                    children: [g, /*#__PURE__*/(0, _jsxRuntime.jsxs)("small", {
+                      children: [" of ", cap.goalies === null ? "—" : cap.goalies]
+                    })]
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                    children: "goalies needed"
+                  })]
+                }), d.format !== "teams" && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+                  className: "gs-stat",
+                  role: "listitem",
+                  children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+                    children: [drafts, /*#__PURE__*/(0, _jsxRuntime.jsxs)("small", {
+                      children: [" of ", sp.draft === null ? "—" : sp.draft]
+                    })]
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                    children: ["draft teams made", rg.no_captain ? `, ${rg.no_captain} without a captain` : ""]
+                  })]
+                }), d.format !== "draft" && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+                  className: "gs-stat",
+                  role: "listitem",
+                  children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("b", {
+                    children: [full, /*#__PURE__*/(0, _jsxRuntime.jsxs)("small", {
+                      children: [" of ", sp.teams === null ? "—" : sp.teams]
+                    })]
+                  }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
+                    children: ["registered teams in ", /*#__PURE__*/(0, _jsxRuntime.jsx)("a", {
+                      className: "gs-link",
+                      href: "admin.php?page=grsh-tm-full-teams",
+                      children: "view"
+                    })]
+                  })]
+                })]
+              }), d.format !== "teams" && cap.slots !== null && /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
                 className: "gs-cap",
                 children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
                   className: "gs-meter",
                   role: "img",
-                  "aria-label": `${n} registered of ${cap.slots === null ? "unknown" : cap.slots} spots`,
+                  "aria-label": `${n} registered of ${cap.slots} draft spots, ${cap.needed} needed to run`,
                   children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("i", {
-                    className: n > (cap.slots || Infinity) ? "over" : "",
+                    className: n > cap.slots ? "over" : "",
                     style: {
                       width: pct + "%"
                     }
@@ -901,20 +1195,11 @@ function Settings() {
                     style: {
                       left: needPct + "%"
                     },
-                    title: "Minimum needed"
+                    title: "Needed to run"
                   })]
                 }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
                   className: "gs-hint",
-                  children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("strong", {
-                    children: n
-                  }), " registered (", g, " goalie", g === 1 ? "" : "s", ") \xB7 ", /*#__PURE__*/(0, _jsxRuntime.jsx)("strong", {
-                    children: cap.slots === null ? "—" : cap.slots
-                  }), " spots \xB7 ", /*#__PURE__*/(0, _jsxRuntime.jsx)("strong", {
-                    children: cap.needed === null ? "—" : cap.needed
-                  }), " needed to run", cap.goalies !== null && g < cap.goalies ? /*#__PURE__*/(0, _jsxRuntime.jsxs)("span", {
-                    className: "gs-warn",
-                    children: [" \xB7 needs ", cap.goalies, " goalies"]
-                  }) : null]
+                  children: [sp.draft, " draft team", sp.draft === 1 ? "" : "s", " \xD7 ", d0.max_roster, " max = ", cap.slots, " spots. The dark mark is the ", cap.needed, " players needed."]
                 })]
               })]
             }), !d.enabled && n > 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)("p", {
@@ -1024,6 +1309,70 @@ function Settings() {
                 }), " due on ", (0, _settingsEngine.fmtDate)(cfg.team_balance_due_date), " after the ", (0, _settingsEngine.money)(fee.deposit), " deposit.", fee.tier === "early" ? ` ${fee.daysFromCutoff === 0 ? "Last day for the early fee." : Math.abs(fee.daysFromCutoff) + " days before the cutoff."}` : ` ${fee.daysFromCutoff} day${fee.daysFromCutoff === 1 ? "" : "s"} past the cutoff. Paying earlier would have saved ${(0, _settingsEngine.money)(fee.saving)}.`]
               }) : "Fill in the amounts and dates to see an example."
             })]
+          })]
+        }), /*#__PURE__*/(0, _jsxRuntime.jsxs)(Group, {
+          title: "Revenue forecast",
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+            className: "gs-hint",
+            children: "What the settings add up to, not what has been paid. It counts registered-team slots in enabled divisions and players already registered."
+          }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+            className: "gs-stats",
+            role: "list",
+            children: [/*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              className: "gs-stat",
+              role: "listitem",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+                children: forecast.teamSlots
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                children: "registered-team slots"
+              })]
+            }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              className: "gs-stat",
+              role: "listitem",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+                children: (0, _settingsEngine.money)(forecast.deposits)
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                children: "in deposits if all pay"
+              })]
+            }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              className: "gs-stat",
+              role: "listitem",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+                children: (0, _settingsEngine.money)(forecast.earlyTotal)
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                children: "if all pay the early fee"
+              })]
+            }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              className: "gs-stat",
+              role: "listitem",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+                children: (0, _settingsEngine.money)(forecast.lateTotal)
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                children: "if all pay late"
+              })]
+            }), /*#__PURE__*/(0, _jsxRuntime.jsxs)("div", {
+              className: "gs-stat",
+              role: "listitem",
+              children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("b", {
+                children: forecast.playerRevenue === null ? "—" : (0, _settingsEngine.money)(forecast.playerRevenue)
+              }), /*#__PURE__*/(0, _jsxRuntime.jsx)("span", {
+                children: forecast.playerRevenue === null ? "no player fee set" : `from ${forecast.players} registered player${forecast.players === 1 ? "" : "s"}`
+              })]
+            })]
+          }), cutoffDays !== null && /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+            className: "gs-result",
+            children: cutoffDays > 0 ? /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+              children: ["The early fee ends in ", /*#__PURE__*/(0, _jsxRuntime.jsxs)("strong", {
+                children: [cutoffDays, " day", cutoffDays === 1 ? "" : "s"]
+              }), " (", (0, _settingsEngine.fmtDate)(cfg.team_fee_early_cutoff_date), "). A team that waits pays ", (0, _settingsEngine.money)(((0, _settingsEngine.toNum)(cfg.team_fee_late_amount) || 0) - ((0, _settingsEngine.toNum)(cfg.team_fee_early_amount) || 0)), " more."]
+            }) : cutoffDays === 0 ? /*#__PURE__*/(0, _jsxRuntime.jsx)(_jsxRuntime.Fragment, {
+              children: "Today is the last day for the early fee."
+            }) : /*#__PURE__*/(0, _jsxRuntime.jsxs)(_jsxRuntime.Fragment, {
+              children: ["The early fee ended ", -cutoffDays, " day", cutoffDays === -1 ? "" : "s", " ago, so new teams pay ", (0, _settingsEngine.money)(cfg.team_fee_late_amount), "."]
+            })
+          }), forecast.teamSlots === 0 && /*#__PURE__*/(0, _jsxRuntime.jsx)("p", {
+            className: "gs-hint",
+            children: "No division takes registered teams right now, so team fees do not apply. Change a division's Format on the Divisions tab to turn them on."
           })]
         }), /*#__PURE__*/(0, _jsxRuntime.jsxs)(Group, {
           title: "Reminders",
@@ -1431,6 +1780,13 @@ function Settings() {
               children: c.text
             }, i))
           })]
+        }), statusBlocks.length > 0 && /*#__PURE__*/(0, _jsxRuntime.jsxs)("label", {
+          className: "gs-ack",
+          children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
+            type: "checkbox",
+            checked: ack2,
+            onChange: e => setAck2(e.target.checked)
+          }), " I know ", statusBlocks.length, " thing", statusBlocks.length === 1 ? " is" : "s are", " blocking \u201C", cfg.status, "\u201D and I want to save anyway."]
         }), irreversible && /*#__PURE__*/(0, _jsxRuntime.jsxs)("label", {
           className: "gs-ack",
           children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("input", {
@@ -1445,7 +1801,7 @@ function Settings() {
           className: "gs-btnrow",
           children: [/*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
             className: "gs-btn primary",
-            disabled: saving || irreversible && !ack,
+            disabled: saving || irreversible && !ack || statusBlocks.length > 0 && !ack2,
             onClick: () => save(false),
             children: saving ? "Saving…" : `Save ${changes.length} change${changes.length === 1 ? "" : "s"}`
           }), /*#__PURE__*/(0, _jsxRuntime.jsx)("button", {
@@ -1462,13 +1818,14 @@ function labelOf(key, cfg) {
   if (key.startsWith("divisions.")) {
     const [, dk, f] = key.split(".");
     const d = (cfg.divisions || []).find(x => x.key === dk);
-    return `${d ? d.label : dk} · ${f.replace("_", " ")}`;
+    return `${d ? d.label : dk} · ${f === "reg_teams" ? "registered-team slots" : f.replace("_", " ")}`;
   }
   return _settingsEngine.FIELD_LABELS[key] || key;
 }
 function show(key, v) {
   if (v === null || v === undefined || v === "") return "not set";
   if (typeof v === "boolean") return v ? "On" : "Off";
+  if (/\.format$/.test(key)) return _settingsEngine.FORMAT_LABEL[v] || String(v);
   if (/_(amount)$|^player_fee$/.test(key)) return (0, _settingsEngine.money)(v);
   if (/date$|_opens$|_closes$/.test(key)) return (0, _settingsEngine.fmtDate)(v);
   return String(v);
@@ -1482,7 +1839,7 @@ function Styles() {
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .gs-head{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-bottom:16px}
 .gs-eyebrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;line-height:1.5;margin:0 0 8px;position:relative}
-.gs-tag{font:500 11px 'DM Mono',monospace;letter-spacing:.1em;text-transform:uppercase;background:var(--ink);color:var(--gold);padding:3px 12px;border-radius:99px}
+.gs-tag{font:500 12px 'DM Mono',monospace;letter-spacing:.1em;text-transform:uppercase;background:var(--ink);color:var(--gold);padding:3px 12px;border-radius:99px}
 .gs-pill{font:500 12px 'DM Mono',monospace;border:1px solid var(--line);background:#fff;padding:2px 10px;border-radius:99px;display:inline-block}
 .gs-pill.green,.gs-pill.s-open{color:var(--ok);border-color:#9fe1cb;background:#e1f5ee}.gs-pill.blue,.gs-pill.s-setup{color:#185fa5;border-color:#b5d4f4;background:#e6f1fb}
 .gs-pill.amber,.gs-pill.s-draft{color:var(--warn);border-color:#fac775;background:#faeeda}.gs-pill.s-locked{color:var(--bad);border-color:#f7c1c1;background:#fceBEB}.gs-pill.grey,.gs-pill.s-complete{color:var(--mut);background:#f1efe8}
@@ -1498,10 +1855,10 @@ function Styles() {
 .gs-btn:focus-visible,.gs-tab:focus-visible,.gs-in:focus-visible,.gs-sw:focus-visible,.gs-step:focus-visible,.gs-link:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #2a6df4;outline-offset:2px}
 .gs-banner{border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:12px;font:13px 'DM Mono',monospace;display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
 .gs-banner.ok{background:#e1f5ee;border-color:#9fe1cb;color:#0b5a46}.gs-banner.bad{background:#fceaea;border-color:#f0b4b4;color:#7d1f1f}.gs-bact{display:flex;gap:8px}
-.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;position:sticky;top:32px;z-index:40;background:var(--bg);padding:8px 0;border-bottom:1px solid var(--line)}
 .gs-tab{font:500 13px 'DM Mono',monospace;padding:8px 16px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--mut);cursor:pointer}
 .gs-tab.on{background:var(--ink);color:var(--gold);border-color:var(--ink)}
-.gs-badge{margin-left:7px;font:600 11px 'DM Mono',monospace;border-radius:99px;padding:1px 7px;color:#fff}.gs-badge.bad{background:var(--bad)}.gs-badge.warn{background:#b7791f}
+.gs-badge{margin-left:7px;font:600 12px 'DM Mono',monospace;border-radius:99px;padding:1px 7px;color:#fff}.gs-badge.bad{background:var(--bad)}.gs-badge.warn{background:#b7791f}
 .gs-card{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .gs-group{padding:18px 22px;border-bottom:1px solid #efede4}.gs-group:last-child{border-bottom:0}
 .gs-gl{font:500 12px 'DM Mono',monospace;color:var(--mut);text-transform:uppercase;letter-spacing:.08em;margin:0 0 12px}
@@ -1513,17 +1870,17 @@ function Styles() {
 .gs-hint{font:12.5px/1.45 'DM Mono',monospace;color:var(--mut);margin:5px 0 0}.gs-err{font:600 12.5px 'DM Mono',monospace;color:var(--bad);margin:5px 0 0}.gs-warn{font:600 12.5px/1.45 'DM Mono',monospace;color:var(--warn);margin:6px 0 0}.gs-okt{font:600 12.5px 'DM Mono',monospace;color:var(--ok)}
 .gs-row{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding:12px 0;border-bottom:1px solid #f1efe7}.gs-row:last-child{border-bottom:0}
 .gs-rowlabel{font:600 15px 'Fraunces',serif;display:block}.gs-rowtxt{flex:1}
-.gs-wire{display:inline-block;font:500 11px 'DM Mono',monospace;border-radius:4px;padding:2px 7px;margin-top:6px}.gs-wire.off{background:#faeeda;color:#7a4f08;border:1px solid #fac775}.gs-wire.on{color:var(--mut);padding-left:0}
-.gs-sw{width:48px;height:28px;border-radius:99px;border:1px solid #9a968a;background:#e1ded3;position:relative;cursor:pointer;flex-shrink:0;padding:0}
-.gs-sw span{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.3);transition:left .15s}.gs-sw.on{background:var(--ink);border-color:var(--ink)}.gs-sw.on span{left:23px}
+.gs-wire{display:inline-block;font:500 12px 'DM Mono',monospace;border-radius:4px;padding:2px 7px;margin-top:6px}.gs-wire.off{background:#faeeda;color:#7a4f08;border:1px solid #fac775}.gs-wire.on{color:var(--mut);padding-left:0}
+.gs-sw{width:48px;height:28px;border-radius:99px;border:1px solid #6f6b5f;background:#8a8678;position:relative;cursor:pointer;flex-shrink:0;padding:0}
+.gs-sw span{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.3);transition:left .15s}.gs-sw.on{background:var(--ok);border-color:#0b5a46}.gs-sw.on span{left:23px}
 .gs-tl{background:#f6f5f0;border-radius:10px;padding:14px 16px}.gs-tlhead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:26px}.gs-tlnote{font:600 13px 'DM Mono',monospace}.gs-tlnote.green{color:var(--ok)}.gs-tlnote.amber{color:var(--warn)}.gs-tlnote.blue{color:#185fa5}
 .gs-bar{position:relative;height:10px;background:#dedbd0;border-radius:6px;margin:0 6px 14px}.gs-bar .seg{position:absolute;top:0;bottom:0;display:block}.gs-bar .seg.green{background:#1d9e75}.gs-bar .seg.amber{background:#e8b04a}
 .gs-bar .tick{position:absolute;top:-3px;width:3px;height:16px;background:var(--ink);transform:translateX(-1px)}
-.gs-bar .today{position:absolute;top:-10px;width:0;height:30px;border-left:2px dashed #2a6df4;text-decoration:none}.gs-bar .today em{position:absolute;top:-14px;left:-18px;font:600 11px 'DM Mono',monospace;color:#2a6df4;font-style:normal}
+.gs-bar .today{position:absolute;top:-10px;width:0;height:30px;border-left:2px dashed #2a6df4;text-decoration:none}.gs-bar .today em{position:absolute;top:-14px;left:-18px;font:600 12px 'DM Mono',monospace;color:#2a6df4;font-style:normal}
 .gs-tlfoot{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font:12.5px 'DM Mono',monospace;color:var(--mut)}.gs-tlfoot strong{color:var(--ink)}
 .gs-steps{list-style:none;display:flex;gap:6px;flex-wrap:wrap;padding:0;margin:0 0 6px}
 .gs-step{font:500 13px 'DM Mono',monospace;border:1px solid var(--line);background:#fff;border-radius:99px;padding:6px 14px 6px 8px;cursor:pointer;display:flex;align-items:center;gap:8px;color:var(--mut)}
-.gs-step .n{width:22px;height:22px;border-radius:50%;background:#e7e4da;display:inline-flex;align-items:center;justify-content:center;font-size:11px}.gs-step.done .n{background:#1d9e75;color:#fff}.gs-step.now{border-color:var(--ink);color:var(--ink);background:#f4f2ea}.gs-step.now .n{background:var(--ink);color:var(--gold)}
+.gs-step .n{width:22px;height:22px;border-radius:50%;background:#e7e4da;display:inline-flex;align-items:center;justify-content:center;font-size:12px}.gs-step.done .n{background:#1d9e75;color:#fff}.gs-step.now{border-color:var(--ink);color:var(--ink);background:#f4f2ea}.gs-step.now .n{background:var(--ink);color:var(--gold)}
 .gs-panel{border:1px solid var(--line);background:#faf9f5;border-radius:10px;padding:12px 16px;margin-top:10px}.gs-panel h4{margin:0 0 8px;font-size:15px}
 .gs-checks{list-style:none;margin:0;padding:0}.gs-checks li{font:13px/1.4 'DM Mono',monospace;padding:5px 0 5px 24px;position:relative}
 .gs-checks li:before{position:absolute;left:0;top:5px;font-weight:700}.gs-checks .ok:before{content:"✓";color:var(--ok)}.gs-checks .warn:before{content:"!";color:#b7791f}.gs-checks .block:before,.gs-checks .bad:before{content:"✕";color:var(--bad)}.gs-checks .info:before{content:"i";color:#185fa5}
@@ -1531,11 +1888,11 @@ function Styles() {
 .gs-link{font:600 12px 'DM Mono',monospace;background:none;border:0;color:#185fa5;text-decoration:underline;cursor:pointer;margin-left:8px}
 .gs-btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
 .gs-div{padding:16px 22px;border-bottom:1px solid #efede4}.gs-div.off{background:#fbfaf6}.gs-divhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}.gs-divname{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.gs-divname code{font:11px 'DM Mono',monospace;background:#efede4;border-radius:4px;padding:2px 6px;color:var(--mut)}
+
 .gs-cap{margin-top:12px}.gs-meter{position:relative;height:10px;border-radius:6px;background:#e5e2d8;overflow:visible}.gs-meter i{display:block;height:100%;background:#1d9e75;border-radius:6px}.gs-meter i.over{background:var(--bad)}.gs-meter b{position:absolute;top:-3px;width:2px;height:16px;background:var(--ink)}
 .gs-try{margin-top:14px;padding:12px 16px;background:#f6f5f0;border-radius:10px}.gs-result{font:13.5px/1.5 'DM Mono',monospace;margin:8px 0 0}
 .gs-range{display:flex;gap:12px;align-items:center}.gs-range input[type=range]{flex:1;accent-color:var(--ink)}
-.gs-table{width:100%;border-collapse:collapse;font:13px 'DM Mono',monospace}.gs-table th,.gs-table td{padding:9px 12px;border-bottom:1px solid #efede4;text-align:left}.gs-table thead th{background:#faf9f5;color:#44443f;font-weight:500;text-transform:uppercase;font-size:11px;letter-spacing:.06em}
+.gs-table{width:100%;border-collapse:collapse;font:13px 'DM Mono',monospace}.gs-table th,.gs-table td{padding:9px 12px;border-bottom:1px solid #efede4;text-align:left}.gs-table thead th{background:#faf9f5;color:#44443f;font-weight:500;text-transform:uppercase;font-size:12px;letter-spacing:.06em}
 .gs-table td.yes{color:var(--ok);font-weight:700;text-align:center}.gs-table td.no{color:#8a8678;text-align:center}.gs-tablewrap{overflow-x:auto}
 .gs-hist{list-style:none;padding:0;margin:0}.gs-hist>li{padding:10px 0;border-bottom:1px solid #f1efe7;font:13px 'DM Mono',monospace}.gs-hist summary{cursor:pointer;margin-bottom:6px}
 .gs-chg{list-style:none;margin:6px 0 8px;padding:0 0 0 12px;font:12.5px/1.6 'DM Mono',monospace;color:#33332f}.gs-chg span:first-child{font-weight:600;margin-right:6px}del{color:var(--bad);background:#fdeeee;text-decoration:line-through;padding:0 3px}ins{color:#0b5a46;background:#e6f6ef;text-decoration:none;padding:0 3px}
@@ -1546,7 +1903,26 @@ function Styles() {
 .gs-ack{display:flex;gap:8px;align-items:center;font:13px 'DM Mono',monospace;margin:10px 0}
 .gs-fail{background:#fff;border:1px solid #f0b4b4;border-radius:12px;padding:22px;max-width:560px}.gs-fail h2{margin:0 0 8px;color:var(--bad)}.gs-load{font:14px 'DM Mono',monospace;color:var(--mut)}
 @media (max-width:640px){.gs-root{padding:16px 12px 90px}.gs-title{font-size:24px}}
-@media print{.gs-actions,.gs-tabs,.gs-bottom{display:none}}
+@media print{.gs-actions,.gs-tabs,.gs-bottom{display:none}.gs-root{padding:0}}
+.gs-root,.gs-root *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.gs-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2a6df4;margin-left:7px;vertical-align:middle}
+.gs-swwrap{display:inline-flex;align-items:center;gap:8px;flex-shrink:0}.gs-swl{font:600 12px 'DM Mono',monospace;color:#5b5b55;min-width:52px;text-align:right}.gs-swl.on{color:var(--ok)}
+.gs-div.off{opacity:.62}.gs-div.off .gs-divhead{margin-bottom:0}
+.gs-id{font:12px 'DM Mono',monospace;color:#6a675d;letter-spacing:.04em}
+.gs-fmt{display:inline-flex;border:1px solid #9a968a;border-radius:8px;overflow:hidden;margin-bottom:4px}
+.gs-seg{font:600 13px 'DM Mono',monospace;background:#fff;color:var(--ink);border:0;border-right:1px solid #cfcbbd;padding:8px 16px;cursor:pointer}.gs-seg:last-child{border-right:0}
+.gs-seg:hover{background:#efede4}.gs-seg.on{background:var(--ink);color:var(--gold)}.gs-seg:focus-visible{outline:3px solid #2a6df4;outline-offset:-3px}
+.gs-grid.compact{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));margin-top:10px}
+.gs-in.tiny{width:64px;min-height:36px;text-align:center;padding:6px}
+.gs-pair{display:inline-flex;align-items:center;gap:8px;font:13px 'DM Mono',monospace;color:var(--mut)}
+.gs-stepper{display:inline-flex;align-items:center;gap:4px}.gs-stepbtn{width:36px;height:36px;border-radius:8px;border:1px solid #6f6b5f;background:#fff;font:600 18px 'DM Mono',monospace;cursor:pointer;line-height:1;color:var(--ink)}.gs-stepbtn:hover{background:#efede4}.gs-stepbtn:focus-visible{outline:3px solid #2a6df4;outline-offset:2px}
+.gs-stats{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 0}.gs-stat{flex:1 1 150px;background:#faf9f5;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.gs-stat b{display:block;font:700 22px 'Fraunces',serif;color:var(--ink)}.gs-stat b small{font:500 13px 'DM Mono',monospace;color:var(--mut)}.gs-stat span{font:12px/1.4 'DM Mono',monospace;color:var(--mut)}
+.gs-chip{font:600 12px 'DM Mono',monospace;border-radius:99px;padding:2px 10px;border:1px solid var(--line);background:#f1efe8;color:#44443f}
+.gs-chip.ok{background:#e1f5ee;border-color:#9fe1cb;color:#0b5a46}.gs-chip.warn{background:#faeeda;border-color:#fac775;color:#7a4f08}.gs-chip.bad{background:#fceaea;border-color:#f0b4b4;color:#7d1f1f}
+.gs-gate{border:1px solid var(--line);border-left-width:5px;border-radius:10px;background:#faf9f5;padding:12px 16px;margin-top:12px}.gs-gate.stop{border-left-color:var(--bad)}.gs-gate.caution{border-left-color:#b7791f}.gs-gate.go{border-left-color:#1d9e75}
+.gs-gatehead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px;font:15px 'Fraunces',serif}
+.gs-meter i{-webkit-print-color-adjust:exact;print-color-adjust:exact}
 `
   });
 }

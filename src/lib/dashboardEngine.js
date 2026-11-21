@@ -114,9 +114,14 @@ export function nextActions(d, extra = {}) {
   (d.divisions || []).forEach((v) => {
     if (!v.configured) return;
     const link = `?division=${encodeURIComponent(v.key)}`;
-    if (v.registered > 0 && v.planned_teams > 0 && v.teams === 0) push(`teams_${v.key}`, "medium", `${v.label}: no teams created yet.`, "grsh-tm-rosters", link);
-    const needG = v.planned_teams > 0 ? v.planned_teams - v.goalies : 0;
-    if (needG > 0 && v.registered > 0) push(`goalies_${v.key}`, "high", `${v.label}: needs ${plural(needG, "more goalie")} for ${v.planned_teams} teams.`, "grsh-tm-players");
+    // Only the draft slots are drafted. Registered-team slots (format "teams" or "both") bring their own rosters.
+    // Older payloads have no draft_slots, in which case every planned team is a draft team, as before.
+    const ds = num(v.draft_slots) ?? num(v.planned_teams) ?? 0;
+    const rs = num(v.reg_slots) ?? 0, inTeams = num(v.full_teams) ?? 0;
+    if (v.registered > 0 && ds > 0 && v.teams === 0) push(`teams_${v.key}`, "medium", `${v.label}: no draft teams created yet.`, "grsh-tm-rosters", link);
+    const needG = ds > 0 ? (num(v.goalie_need) ?? ds) - v.goalies : 0;
+    if (needG > 0 && v.registered > 0) push(`goalies_${v.key}`, "high", `${v.label}: needs ${plural(needG, "more goalie")} for ${plural(ds, "draft team")}.`, "grsh-tm-players");
+    if (rs > 0 && inTeams < rs) push(`regteams_${v.key}`, "medium", `${v.label}: ${inTeams} of ${plural(rs, "registered team")} ${inTeams === 1 ? "is" : "are"} in.`, "grsh-captain-sync");
     if (v.teams > 0 && v.stage === "draft") push(`finish_${v.key}`, "low", `${v.label}: rosters not locked yet (${v.rostered} players on ${plural(v.teams, "team")}).`, "grsh-tm-rosters", link);
     else if (v.teams > 0 && v.stage === "locked") push(`publish_${v.key}`, "low", `${v.label}: rosters are locked — ready to publish.`, "grsh-tm-rosters", link);
   });

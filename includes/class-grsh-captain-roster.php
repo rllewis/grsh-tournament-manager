@@ -53,9 +53,51 @@ class GRSH_Captain_Roster {
             'permission_callback' => [ __CLASS__, 'check_permission' ],
         ] );
 
+        register_rest_route( $ns, '/captain/team/players/(?P<roster_id>\d+)/waiver', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'resend_waiver' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
+        register_rest_route( $ns, '/captain/team/players/(?P<roster_id>\d+)/email', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'update_player_email' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
+        register_rest_route( $ns, '/captain/team/players/(?P<roster_id>\d+)/waiver-link', [
+            'methods'             => WP_REST_Server::READABLE,
+            'callback'            => [ __CLASS__, 'get_waiver_link' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
+        register_rest_route( $ns, '/captain/team/players/(?P<roster_id>\d+)/details', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'update_player_details' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
+        register_rest_route( $ns, '/captain/team/remind', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'remind_unsigned' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
         register_rest_route( $ns, '/captain/team/submit', [
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => [ __CLASS__, 'submit_roster' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
+        register_rest_route( $ns, '/captain/team/update', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'update_team' ],
+            'permission_callback' => [ __CLASS__, 'check_permission' ],
+        ] );
+
+        register_rest_route( $ns, '/captain/team/change-request', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'request_change' ],
             'permission_callback' => [ __CLASS__, 'check_permission' ],
         ] );
 
@@ -112,10 +154,9 @@ class GRSH_Captain_Roster {
 
         return new WP_REST_Response( [
             'team'      => $team ? self::format_team( (int) $team['id'], $season_id ) : null,
-            'divisions' => array_map(
-                fn( $d ) => [ 'key' => $d['key'], 'label' => $d['label'] ],
-                GRSH_Settings::get_active_divisions()
-            ),
+            'divisions' => self::divisions_payload( $season_id ),
+            'registration' => self::registration_payload(),
+            'fees'         => self::fees_payload(),
             'tiers'     => array_map(
                 fn( $k, $v ) => [ 'key' => $k, 'label' => $k, 'value' => $v ],
                 array_keys( GRSH_Scoring::TIER_VALUES ),
@@ -123,6 +164,7 @@ class GRSH_Captain_Roster {
             ),
             'min_players' => GRSH_Scoring::FULL_TEAM_MIN_PLAYERS,
             'max_players' => GRSH_Scoring::FULL_TEAM_MAX_PLAYERS,
+            'goalie_min'  => GRSH_Scoring::FULL_TEAM_GOALIE_MIN,
         ], 200 );
     }
 
@@ -161,6 +203,11 @@ class GRSH_Captain_Roster {
     public static function create_team( WP_REST_Request $request ): WP_REST_Response {
         $season_id = self::get_season_id();
         $body      = (array) $request->get_json_params();
+
+        $want = sanitize_key( (string) ( $body['division'] ?? '' ) );
+        if ( $want !== '' && self::division_full( $want, $season_id ) ) {
+            return new WP_REST_Response( [ 'error' => 'That division has no team spots left. Pick another division or contact the board.' ], 409 );
+        }
 
         $player_id = self::get_or_create_self_player();
         if ( ! $player_id ) {
@@ -232,6 +279,10 @@ class GRSH_Captain_Roster {
         $valid_divisions = array_column( GRSH_Settings::get_active_divisions(), 'key' );
         if ( ! in_array( $division, $valid_divisions, true ) ) {
             return [ 'error' => 'Choose a valid division.', 'status' => 400 ];
+        }
+
+        if ( self::team_name_taken( $name, $season_id ) ) {
+            return [ 'error' => 'Another team already uses that name. Pick a different name.', 'status' => 409 ];
         }
 
         $wpdb->insert( "{$wpdb->prefix}grsh_teams", [
@@ -320,9 +371,12 @@ class GRSH_Captain_Roster {
         if ( ! in_array( $position, [ 'defenseman', 'center', 'winger', 'goaltender' ], true ) ) {
             return new WP_REST_Response( [ 'error' => 'Choose a valid position.' ], 400 );
         }
-        if ( ! array_key_exists( $tier, GRSH_Scoring::TIER_VALUES ) ) {
+        // Tier is optional at add time (quick-add), required before submit.
+        // An empty tier is stored as NULL and ignored by team scoring.
+        if ( $tier !== '' && ! array_key_exists( $tier, GRSH_Scoring::TIER_VALUES ) ) {
             return new WP_REST_Response( [ 'error' => 'Choose a valid experience tier.' ], 400 );
         }
+        $tier_db = $tier !== '' ? $tier : null;
 
         $current_count = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_rosters WHERE team_id = %d", $team['id']
@@ -355,21 +409,34 @@ class GRSH_Captain_Roster {
 
             // Update captain-reported fields only — never touch
             // skill_tier_assigned (committee override) or sandbagging_flag.
-            $wpdb->update( "{$wpdb->prefix}grsh_players", [
-                'first_name'          => $first_name,
-                'last_name'           => $last_name,
-                'position'            => $position,
-                'skill_tier_reported' => $tier,
-                'years_experience'    => $years,
-                'is_goalie'           => $position === 'goaltender' ? 1 : 0,
-            ], [ 'id' => $player_id ] );
+            $player_update = [
+                'first_name'  => $first_name,
+                'last_name'   => $last_name,
+                'position'    => $position,
+                'is_goalie'   => $position === 'goaltender' ? 1 : 0,
+            ];
+            // Quick-add leaves tier/years blank: never wipe values a
+            // returning player already has on file.
+            if ( $tier_db !== null ) {
+                $player_update['skill_tier_reported'] = $tier_db;
+            }
+            if ( isset( $body['years_experience'] ) && $body['years_experience'] !== '' ) {
+                $player_update['years_experience'] = $years;
+            }
+            $wpdb->update( "{$wpdb->prefix}grsh_players", $player_update, [ 'id' => $player_id ] );
+            if ( $tier_db === null ) {
+                // Roster snapshot should reflect the stored tier, not blank.
+                $tier_db = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT skill_tier_reported FROM {$wpdb->prefix}grsh_players WHERE id = %d", $player_id
+                ) ) ?: null;
+            }
         } else {
             $wpdb->insert( "{$wpdb->prefix}grsh_players", [
                 'first_name'          => $first_name,
                 'last_name'           => $last_name,
                 'email'               => $email,
                 'position'            => $position,
-                'skill_tier_reported' => $tier,
+                'skill_tier_reported' => $tier_db,
                 'years_experience'    => $years,
                 'is_goalie'           => $position === 'goaltender' ? 1 : 0,
             ] );
@@ -419,7 +486,7 @@ class GRSH_Captain_Roster {
             'is_captain'          => $is_captain,
             'jersey_number'       => $jersey,
             'position_assigned'   => $position,
-            'skill_tier_at_draft' => $tier,
+            'skill_tier_at_draft' => $tier_db,
             'assigned_by'         => get_current_user_id(),
             'assigned_at'         => current_time( 'mysql' ),
         ] );
@@ -439,21 +506,12 @@ class GRSH_Captain_Roster {
         // problem to relay. Only for a registration that isn't already
         // signed, so re-adding a returning player who signed a prior
         // season/team doesn't spam them with a redundant email.
-        $already_signed = $wpdb->get_var( $wpdb->prepare(
-            "SELECT signed_at FROM {$wpdb->prefix}grsh_registrations WHERE id = %d", $registration_id
-        ) );
-        if ( ! $already_signed && class_exists( 'GRSH_Waiver_Page' ) ) {
-            wp_mail(
-                $email,
-                __( 'Sign your waiver — Gold Rush Senior Hockey', 'grsh' ),
-                sprintf(
-                    /* translators: 1: player first name, 2: team name, 3: waiver link */
-                    __( "Hi %1\$s,\n\n%2\$s's captain has added you to their 2027 roster. Before you can play, please sign your waiver here:\n\n%3\$s\n\nThis link is unique to you — please don't forward it.", 'grsh' ),
-                    $first_name,
-                    $team['name'],
-                    GRSH_Waiver_Page::build_url( (int) $registration_id )
-                )
-            );
+        // "Signed" means signed on the v2 waiver form, not registrations.signed_at
+        // (the player-registration form's own waiver also sets that).
+        if ( class_exists( 'GRSH_Waiver_WPForms' ) && ! GRSH_Waiver_WPForms::is_signed( (int) $registration_id ) ) {
+            // WPForms v2 waiver link, prefilled. Signing marks the
+            // registration signed via wpforms_process_complete.
+            GRSH_Waiver_WPForms::send( (int) $registration_id, 'initial' );
         }
 
         return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 201 );
@@ -498,6 +556,176 @@ class GRSH_Captain_Roster {
     }
 
     // -------------------------------------------------------------------------
+    // Waiver actions: resend one, edit email, remind everyone unsigned
+    // -------------------------------------------------------------------------
+
+    /** Roster row (with registration + email) that belongs to this team, or null. */
+    private static function get_team_roster_row( int $team_id, int $roster_id ): ?array {
+        global $wpdb;
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT ro.id AS roster_id, ro.registration_id, ro.player_id, p.email, p.wp_user_id, r.signed_at
+             FROM {$wpdb->prefix}grsh_rosters ro
+             JOIN {$wpdb->prefix}grsh_players p ON p.id = ro.player_id
+             JOIN {$wpdb->prefix}grsh_registrations r ON r.id = ro.registration_id
+             WHERE ro.id = %d AND ro.team_id = %d",
+            $roster_id, $team_id
+        ), ARRAY_A );
+        return $row ?: null;
+    }
+
+    public static function resend_waiver( WP_REST_Request $request ): WP_REST_Response {
+        $season_id = self::get_season_id();
+        $team      = self::get_my_team( $season_id );
+        if ( ! $team ) {
+            return new WP_REST_Response( [ 'error' => 'No team found.' ], 404 );
+        }
+        $row = self::get_team_roster_row( (int) $team['id'], (int) $request->get_param( 'roster_id' ) );
+        if ( ! $row ) {
+            return new WP_REST_Response( [ 'error' => 'Player not found on your roster.' ], 404 );
+        }
+        if ( GRSH_Waiver_WPForms::is_signed( (int) $row['registration_id'] ) ) {
+            return new WP_REST_Response( [ 'error' => 'This player has already signed.' ], 409 );
+        }
+        $wait = GRSH_Waiver_WPForms::cooldown_remaining( (int) $row['registration_id'], GRSH_Waiver_WPForms::RESEND_COOLDOWN );
+        if ( $wait > 0 ) {
+            return new WP_REST_Response( [
+                'error' => 'A waiver email was just sent. You can resend in ' . max( 1, (int) ceil( $wait / 60 ) ) . ' minute(s).',
+            ], 429 );
+        }
+        if ( ! GRSH_Waiver_WPForms::send( (int) $row['registration_id'], 'resend' ) ) {
+            return new WP_REST_Response( [ 'error' => 'The email could not be sent. Check the address and try again.' ], 502 );
+        }
+        return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 200 );
+    }
+
+    /**
+     * Fix a typo'd address. Safe cases only: the player has not signed, has
+     * no WP account linked, and the new address is not already another
+     * player record (email is the system-wide identity key).
+     */
+    public static function update_player_email( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $season_id = self::get_season_id();
+        $team      = self::get_my_team( $season_id );
+        if ( ! $team ) {
+            return new WP_REST_Response( [ 'error' => 'No team found.' ], 404 );
+        }
+        $row = self::get_team_roster_row( (int) $team['id'], (int) $request->get_param( 'roster_id' ) );
+        if ( ! $row ) {
+            return new WP_REST_Response( [ 'error' => 'Player not found on your roster.' ], 404 );
+        }
+        $body  = (array) $request->get_json_params();
+        $email = sanitize_email( $body['email'] ?? '' );
+        if ( ! is_email( $email ) ) {
+            return new WP_REST_Response( [ 'error' => 'Enter a valid email address.' ], 400 );
+        }
+        if ( GRSH_Waiver_WPForms::is_signed( (int) $row['registration_id'] ) || ! empty( $row['wp_user_id'] ) ) {
+            return new WP_REST_Response( [ 'error' => 'This player\'s email can\'t be changed here. Contact the board.' ], 409 );
+        }
+        $taken = $wpdb->get_var( $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}grsh_players WHERE email = %s AND id != %d",
+            $email, (int) $row['player_id']
+        ) );
+        if ( $taken ) {
+            return new WP_REST_Response( [ 'error' => 'That email already belongs to another player. Remove this player and add them with that address instead.' ], 409 );
+        }
+        $wpdb->update( "{$wpdb->prefix}grsh_players", [ 'email' => $email ], [ 'id' => (int) $row['player_id'] ] );
+        GRSH_Waiver_WPForms::send( (int) $row['registration_id'], 'initial' );
+        return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 200 );
+    }
+
+    /** Waiver link for the captain to text to a player. Captain-only: never in the public share payload. */
+    public static function get_waiver_link( WP_REST_Request $request ): WP_REST_Response {
+        $season_id = self::get_season_id();
+        $team      = self::get_my_team( $season_id );
+        if ( ! $team ) {
+            return new WP_REST_Response( [ 'error' => 'No team found.' ], 404 );
+        }
+        $row = self::get_team_roster_row( (int) $team['id'], (int) $request->get_param( 'roster_id' ) );
+        if ( ! $row ) {
+            return new WP_REST_Response( [ 'error' => 'Player not found on your roster.' ], 404 );
+        }
+        $ctx = GRSH_Waiver_WPForms::load_context( (int) $row['registration_id'] );
+        if ( ! $ctx ) {
+            return new WP_REST_Response( [ 'error' => 'Player record not found.' ], 404 );
+        }
+        $response = new WP_REST_Response( [ 'url' => GRSH_Waiver_WPForms::build_url( (int) $row['registration_id'], $ctx ) ], 200 );
+        $response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+        return $response;
+    }
+
+    /** Fill in details left blank at quick-add time (tier, years, age, jersey). */
+    public static function update_player_details( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $season_id = self::get_season_id();
+        $team      = self::get_my_team( $season_id );
+        if ( ! $team ) {
+            return new WP_REST_Response( [ 'error' => 'No team found.' ], 404 );
+        }
+        $row = self::get_team_roster_row( (int) $team['id'], (int) $request->get_param( 'roster_id' ) );
+        if ( ! $row ) {
+            return new WP_REST_Response( [ 'error' => 'Player not found on your roster.' ], 404 );
+        }
+        $body = (array) $request->get_json_params();
+
+        if ( array_key_exists( 'skill_tier_reported', $body ) ) {
+            $tier = sanitize_text_field( (string) $body['skill_tier_reported'] );
+            if ( ! array_key_exists( $tier, GRSH_Scoring::TIER_VALUES ) ) {
+                return new WP_REST_Response( [ 'error' => 'Choose a valid experience level.' ], 400 );
+            }
+            $wpdb->update( "{$wpdb->prefix}grsh_players", [ 'skill_tier_reported' => $tier ], [ 'id' => (int) $row['player_id'] ] );
+            $wpdb->update( "{$wpdb->prefix}grsh_rosters", [ 'skill_tier_at_draft' => $tier ], [ 'id' => (int) $row['roster_id'] ] );
+        }
+        if ( isset( $body['years_experience'] ) && $body['years_experience'] !== '' ) {
+            $wpdb->update( "{$wpdb->prefix}grsh_players", [ 'years_experience' => absint( $body['years_experience'] ) ], [ 'id' => (int) $row['player_id'] ] );
+        }
+        if ( isset( $body['age'] ) && $body['age'] !== '' ) {
+            $wpdb->update( "{$wpdb->prefix}grsh_registrations", [ 'age' => absint( $body['age'] ) ], [ 'id' => (int) $row['registration_id'] ] );
+        }
+        if ( isset( $body['jersey_number'] ) && $body['jersey_number'] !== '' ) {
+            $ok = $wpdb->update( "{$wpdb->prefix}grsh_rosters", [ 'jersey_number' => absint( $body['jersey_number'] ) ], [ 'id' => (int) $row['roster_id'] ] );
+            if ( $ok === false ) {
+                return new WP_REST_Response( [ 'error' => 'That jersey number is already taken on this roster.' ], 409 );
+            }
+        }
+
+        self::recalculate_team_scores( (int) $team['id'] );
+        return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 200 );
+    }
+
+    /** Remind every unsigned player not emailed in the last 24 hours. */
+    public static function remind_unsigned( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $season_id = self::get_season_id();
+        $team      = self::get_my_team( $season_id );
+        if ( ! $team ) {
+            return new WP_REST_Response( [ 'error' => 'No team found.' ], 404 );
+        }
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT ro.registration_id FROM {$wpdb->prefix}grsh_rosters ro
+             JOIN {$wpdb->prefix}grsh_registrations r ON r.id = ro.registration_id
+             WHERE ro.team_id = %d",
+            (int) $team['id']
+        ), ARRAY_A ) ?: [];
+
+        $sent = 0; $skipped = 0;
+        foreach ( $rows as $r ) {
+            $reg = (int) $r['registration_id'];
+            if ( GRSH_Waiver_WPForms::is_signed( $reg ) ) {
+                continue; // signed players aren't "skipped", just not part of the reminder
+            }
+            if ( GRSH_Waiver_WPForms::cooldown_remaining( $reg, GRSH_Waiver_WPForms::REMIND_COOLDOWN ) > 0 ) {
+                $skipped++;
+                continue;
+            }
+            GRSH_Waiver_WPForms::send( $reg, 'reminder' ) ? $sent++ : $skipped++;
+        }
+        $out = self::format_team( (int) $team['id'], $season_id );
+        $out['remind_result'] = [ 'sent' => $sent, 'skipped' => $skipped ];
+        return new WP_REST_Response( $out, 200 );
+    }
+
+    // -------------------------------------------------------------------------
     // POST /captain/team/submit — lock roster for board review
     // -------------------------------------------------------------------------
 
@@ -517,7 +745,193 @@ class GRSH_Captain_Roster {
         }
 
         $wpdb->update( "{$wpdb->prefix}grsh_teams", [ 'draft_locked' => 1 ], [ 'id' => $team['id'] ] );
+        GRSH_Team_Review::mark_submitted( (int) $team['id'] );
 
+        return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 200 );
+    }
+
+    // -------------------------------------------------------------------------
+    // Team setup helpers: division capacity, name check, registration + fee info
+    // -------------------------------------------------------------------------
+
+    /** @return array<string,mixed>|null */
+    private static function division_row( string $key ): ?array {
+        foreach ( GRSH_Settings::get_active_divisions() as $d ) {
+            if ( $d['key'] === $key ) {
+                return GRSH_Settings::fill_division( $d );
+            }
+        }
+        return null;
+    }
+
+    /** True when a division has a registered-team cap and it is already used up. No cap configured = never full. */
+    private static function division_full( string $key, int $season_id, int $exclude_team_id = 0 ): bool {
+        global $wpdb;
+        $row = self::division_row( $key );
+        if ( ! $row ) {
+            return false;
+        }
+        $slots = (int) $row['reg_teams'];
+        if ( $slots <= 0 ) {
+            return false;
+        }
+        $taken = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}grsh_teams
+             WHERE season_id = %d AND team_type = 'full_team' AND division = %s AND id <> %d",
+            $season_id, $key, $exclude_team_id
+        ) );
+        return $taken >= $slots;
+    }
+
+    private static function team_name_taken( string $name, int $season_id, int $exclude_team_id = 0 ): bool {
+        global $wpdb;
+        return (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}grsh_teams
+             WHERE season_id = %d AND LOWER(name) = LOWER(%s) AND id <> %d LIMIT 1",
+            $season_id, $name, $exclude_team_id
+        ) );
+    }
+
+    private static function divisions_payload( int $season_id ): array {
+        global $wpdb;
+        $taken = [];
+        $rows  = $wpdb->get_results( $wpdb->prepare(
+            "SELECT division, COUNT(*) AS n FROM {$wpdb->prefix}grsh_teams
+             WHERE season_id = %d AND team_type = 'full_team' GROUP BY division",
+            $season_id
+        ), ARRAY_A ) ?: [];
+        foreach ( $rows as $r ) {
+            $taken[ $r['division'] ] = (int) $r['n'];
+        }
+        $list = GRSH_Settings::divisions_for( 'full_team' );
+        if ( ! $list ) {
+            $list = GRSH_Settings::get_active_divisions();
+        }
+        $out = [];
+        foreach ( $list as $d ) {
+            $d     = GRSH_Settings::fill_division( $d );
+            $slots = (int) $d['reg_teams'];
+            $out[] = [
+                'key'   => $d['key'],
+                'label' => $d['label'],
+                'spots' => $slots > 0 ? $slots : null,
+                'taken' => $taken[ $d['key'] ] ?? 0,
+            ];
+        }
+        return $out;
+    }
+
+    private static function registration_payload(): array {
+        $s      = GRSH_Settings::get();
+        $opens  = (string) ( $s['registration_opens'] ?? '' );
+        $closes = (string) ( $s['registration_closes'] ?? '' );
+        $today  = current_time( 'Y-m-d' );
+        $state  = 'open';
+        if ( $opens !== '' && $today < $opens ) {
+            $state = 'not_open';
+        } elseif ( $closes !== '' && $today > $closes ) {
+            $state = 'closed';
+        }
+        $days_left = null;
+        if ( $state === 'open' && $closes !== '' && strtotime( $closes ) ) {
+            $days_left = (int) floor( ( strtotime( $closes ) - strtotime( $today ) ) / DAY_IN_SECONDS );
+        }
+        return [
+            'state'     => $state,
+            'opens'     => $opens !== '' ? $opens : null,
+            'closes'    => $closes !== '' ? $closes : null,
+            'days_left' => $days_left,
+        ];
+    }
+
+    private static function fees_payload(): array {
+        $s      = GRSH_Settings::get();
+        $cutoff = (string) ( $s['team_fee_early_cutoff_date'] ?? '' );
+        $due    = (string) ( $s['team_balance_due_date'] ?? '' );
+        return [
+            'deposit'          => (float) ( $s['team_deposit_amount'] ?? 500 ),
+            'early_amount'     => (float) ( $s['team_fee_early_amount'] ?? 0 ),
+            'late_amount'      => (float) ( $s['team_fee_late_amount'] ?? 0 ),
+            'early_cutoff'     => $cutoff !== '' ? $cutoff : null,
+            'balance_due_date' => $due !== '' ? $due : null,
+            // Set via the grsh_team_deposit_url filter or the grsh_team_deposit_url option.
+            'deposit_url'      => (string) apply_filters( 'grsh_team_deposit_url', (string) get_option( 'grsh_team_deposit_url', '' ) ),
+        ];
+    }
+
+    /** Shared (view-only) link payload: roster only, never fees or board notes. */
+    private static function public_share_payload( int $team_id, int $season_id ): array {
+        $out = self::format_team( $team_id, $season_id );
+        unset( $out['payment'], $out['review'] );
+        return $out;
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /captain/team/update - rename or change division (before submit)
+    // -------------------------------------------------------------------------
+
+    public static function update_team( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $season_id = self::get_season_id();
+        $team      = self::get_my_team( $season_id );
+        if ( ! $team ) {
+            return new WP_REST_Response( [ 'error' => 'No team found.' ], 404 );
+        }
+        if ( (int) $team['draft_locked'] === 1 ) {
+            return new WP_REST_Response( [ 'error' => 'Your roster is submitted. Use Request a change instead.' ], 409 );
+        }
+
+        $body     = (array) $request->get_json_params();
+        $name     = sanitize_text_field( trim( (string) ( $body['name'] ?? $team['name'] ) ) );
+        $division = sanitize_key( (string) ( $body['division'] ?? $team['division'] ) );
+
+        if ( $name === '' ) {
+            return new WP_REST_Response( [ 'error' => 'Team name is required.' ], 400 );
+        }
+        if ( strlen( $name ) > 100 ) {
+            return new WP_REST_Response( [ 'error' => 'Team name is too long.' ], 400 );
+        }
+        $valid = array_column( GRSH_Settings::get_active_divisions(), 'key' );
+        if ( ! in_array( $division, $valid, true ) ) {
+            return new WP_REST_Response( [ 'error' => 'Choose a valid division.' ], 400 );
+        }
+        if ( self::team_name_taken( $name, $season_id, (int) $team['id'] ) ) {
+            return new WP_REST_Response( [ 'error' => 'Another team already uses that name. Pick a different name.' ], 409 );
+        }
+        $division_changed = $division !== $team['division'];
+        if ( $division_changed && self::division_full( $division, $season_id, (int) $team['id'] ) ) {
+            return new WP_REST_Response( [ 'error' => 'That division has no team spots left.' ], 409 );
+        }
+
+        $wpdb->update(
+            "{$wpdb->prefix}grsh_teams",
+            [ 'name' => $name, 'division' => $division ],
+            [ 'id' => (int) $team['id'] ]
+        );
+        if ( $division_changed ) {
+            self::recalculate_team_scores( (int) $team['id'] );
+        }
+        return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 200 );
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /captain/team/change-request - ask the board for a change after submit
+    // -------------------------------------------------------------------------
+
+    public static function request_change( WP_REST_Request $request ): WP_REST_Response {
+        $season_id = self::get_season_id();
+        $team      = self::get_my_team( $season_id );
+        if ( ! $team ) {
+            return new WP_REST_Response( [ 'error' => 'No team found.' ], 404 );
+        }
+        if ( (int) $team['draft_locked'] !== 1 ) {
+            return new WP_REST_Response( [ 'error' => 'Your roster is not submitted yet, so you can edit it directly.' ], 409 );
+        }
+        $body   = (array) $request->get_json_params();
+        $result = GRSH_Team_Review::request_change( (int) $team['id'], (string) ( $body['message'] ?? '' ) );
+        if ( empty( $result['ok'] ) ) {
+            return new WP_REST_Response( [ 'error' => $result['error'] ?? 'Could not send your request.' ], 400 );
+        }
         return new WP_REST_Response( self::format_team( (int) $team['id'], $season_id ), 200 );
     }
 
@@ -539,14 +953,20 @@ class GRSH_Captain_Roster {
 
         $skaters = []; $goalies = []; $ages = [];
         foreach ( $rows as $row ) {
+            if ( $row['age'] !== null ) {
+                $ages[] = (int) $row['age'];
+            }
+            // Quick-add players may have no tier yet. Leave them out of the
+            // skill score entirely: counting them as 0 would drag the
+            // team's balance band down until the captain fills them in.
+            if ( empty( $row['tier'] ) ) {
+                continue;
+            }
             $entry = [ 'tier' => $row['tier'], 'years' => (int) $row['years'], 'adjustment' => 0 ];
             if ( $row['position'] === 'goaltender' ) {
                 $goalies[] = $entry;
             } else {
                 $skaters[] = $entry;
-            }
-            if ( $row['age'] !== null ) {
-                $ages[] = (int) $row['age'];
             }
         }
 
@@ -609,7 +1029,14 @@ class GRSH_Captain_Roster {
             $team_id
         ), ARRAY_A ) ?: [];
 
-        $players = array_map( fn( $row ) => [
+        $players = array_map( function ( $row ) {
+            $signed = GRSH_Waiver_WPForms::is_signed( (int) $row['registration_id'] );
+            $ws     = GRSH_Waiver_WPForms::status_for( (int) $row['registration_id'], $signed );
+            return [
+            'registration_id'     => (int) $row['registration_id'],
+            'waiver_status'       => $ws['status'],
+            'waiver_sent_at'      => $ws['sent_at'] ? gmdate( 'c', $ws['sent_at'] ) : null,
+            'needs_details'       => empty( $row['skill_tier_reported'] ),
             'roster_id'           => (int) $row['roster_id'],
             'player_id'           => (int) $row['player_id'],
             'first_name'          => $row['first_name'],
@@ -621,8 +1048,9 @@ class GRSH_Captain_Roster {
             'age'                 => $row['age'] !== null ? (int) $row['age'] : null,
             'jersey_number'       => $row['jersey_number'] !== null ? (int) $row['jersey_number'] : null,
             'is_captain'          => (bool) $row['is_captain'],
-            'waiver_signed'       => ! empty( $row['signed_at'] ),
-        ], $rows );
+            'waiver_signed'       => $signed,
+            ];
+        }, $rows );
 
         $goalie_count = count( array_filter( $players, fn( $p ) => $p['position'] === 'goaltender' ) );
         $count        = count( $players );
@@ -643,9 +1071,18 @@ class GRSH_Captain_Roster {
         if ( $goalie_count < GRSH_Scoring::FULL_TEAM_GOALIE_MIN ) {
             $gaps[] = 'a goalie';
         }
+        // Experience level is optional when adding, required to submit.
+        $untiered = count( array_filter( $players, fn( $p ) => $p['needs_details'] ) );
+        if ( $untiered > 0 ) {
+            $gaps[] = "experience level for {$untiered} player" . ( $untiered === 1 ? '' : 's' );
+        }
+        // Unsigned waivers WARN but never block submit: a captain can't
+        // force a player to sign. Board sees the count; rink check-in
+        // enforces it.
         $unsigned = count( array_filter( $players, fn( $p ) => ! $p['waiver_signed'] ) );
+        $warnings = [];
         if ( $unsigned > 0 ) {
-            $gaps[] = "{$unsigned} player" . ( $unsigned === 1 ? '' : 's' ) . ' still need to sign their waiver';
+            $warnings[] = "{$unsigned} player" . ( $unsigned === 1 ? '' : 's' ) . ' still need to sign their waiver';
         }
 
         $division_label = $team['division'];
@@ -672,7 +1109,20 @@ class GRSH_Captain_Roster {
             'min_players'   => GRSH_Scoring::FULL_TEAM_MIN_PLAYERS,
             'max_players'   => GRSH_Scoring::FULL_TEAM_MAX_PLAYERS,
             'gaps'          => $gaps,
+            'warnings'      => $warnings,
+            'waivers_signed' => $count - $unsigned,
+            'waivers_total'  => $count,
             'can_submit'    => empty( $gaps ) && $count <= GRSH_Scoring::FULL_TEAM_MAX_PLAYERS,
+            'review'        => GRSH_Team_Review::public_view( (int) $team['id'], (bool) $team['draft_locked'] ),
+            'payment'       => [
+                'deposit_paid'    => ! empty( $team['deposit_paid_at'] ),
+                'deposit_paid_at' => $team['deposit_paid_at'] ?? null,
+                'deposit_amount'  => isset( $team['deposit_amount'] ) ? (float) $team['deposit_amount'] : null,
+                'fee_total'       => isset( $team['fee_total'] ) ? (float) $team['fee_total'] : null,
+                'fee_tier'        => $team['fee_tier'] ?? null,
+                'balance_due'     => isset( $team['balance_due'] ) ? (float) $team['balance_due'] : null,
+                'status'          => $team['payment_status'] ?? null,
+            ],
         ];
     }
 
@@ -800,7 +1250,7 @@ class GRSH_Captain_Roster {
                 "SELECT season_id FROM {$wpdb->prefix}grsh_teams WHERE id = %d", $team_id
             ) );
             $response = $season_id
-                ? new WP_REST_Response( self::format_team( $team_id, $season_id ), 200 )
+                ? new WP_REST_Response( self::public_share_payload( $team_id, $season_id ), 200 )
                 : new WP_REST_Response( [ 'error' => 'Team not found.' ], 404 );
         }
 

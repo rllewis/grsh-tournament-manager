@@ -32,11 +32,13 @@ class GRSH_Rosters {
     const DRAFT_OPT   = 'grsh_draft_state_';
     const META_OPT    = 'grsh_roster_meta_';
     const PINS_OPT    = 'grsh_roster_pins_';
+    const PLOCK_OPT   = 'grsh_roster_plocks_';
     const PLANS_OPT   = 'grsh_roster_plans_';
     const FB_OPT      = 'grsh_roster_fb_';
     const MAX_PLANS   = 12;
     const MAX_FB      = 200;
     const MAX_PINS    = 60;
+    const MAX_PLOCKS  = 80;
     const MAX_EMAILS  = 200;
     const DIV_ENUM    = [ 'gold_open', '45a', 'senior_b', 'senior_c', 'womens' ];
     const DIV_ALIASES = [ '45a' => [ '45a', 'o45_a' ] ];
@@ -60,6 +62,7 @@ class GRSH_Rosters {
         register_rest_route( $ns, '/rosters/assign/(?P<roster_id>\d+)', [ 'methods' => 'DELETE', 'callback' => [ __CLASS__, 'remove_player' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/moves', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'post_moves' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/captain', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'set_captain' ], 'permission_callback' => $p ] );
+        register_rest_route( $ns, '/rosters/locks', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'save_locks' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/pins', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'save_pins' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/plans', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'save_plan' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/plans/restore', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'restore_plan' ], 'permission_callback' => $p ] );
@@ -67,6 +70,8 @@ class GRSH_Rosters {
         register_rest_route( $ns, '/rosters/review', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'toggle_review' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/publish', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'publish' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/sportspress', [ 'methods' => 'GET', 'callback' => [ __CLASS__, 'sportspress_preview' ], 'permission_callback' => $p ] );
+        register_rest_route( $ns, '/rosters/publish-preview', [ 'methods' => 'GET', 'callback' => [ __CLASS__, 'publish_preview' ], 'permission_callback' => $p ] );
+        register_rest_route( $ns, '/rosters/activity', [ 'methods' => 'GET', 'callback' => [ __CLASS__, 'activity' ], 'permission_callback' => $p ] );
         register_rest_route( $ns, '/rosters/review/feedback', [ 'methods' => 'POST', 'callback' => [ __CLASS__, 'review_feedback' ], 'permission_callback' => '__return_true' ] );
     }
 
@@ -313,6 +318,12 @@ class GRSH_Rosters {
         return is_array( $p ) ? $p : [];
     }
 
+    /** Player ids held on their current team ("stay put"). */
+    private static function plocks_get( string $div ): array {
+        $p = get_option( self::PLOCK_OPT . $div, [] );
+        return is_array( $p ) ? array_values( array_unique( array_map( 'intval', $p ) ) ) : [];
+    }
+
     private static function plans_get( string $div ): array {
         $p = get_option( self::PLANS_OPT . $div, [] );
         return is_array( $p ) ? $p : [];
@@ -348,6 +359,115 @@ class GRSH_Rosters {
                        'assigned' => $a, 'total' => $tot, 'pct' => $tot > 0 ? (int) round( $a / $tot * 100 ) : 0 ];
         }
         return $out;
+    }
+
+    /**
+     * Read-only head counts for the Board minutes: one row per division, from the same sources as the
+     * Rosters tabs and Settings. Counts only. No names, emails, scores or payment details of any person.
+     */
+    public static function board_rows(): array {
+        global $wpdb;
+        $sid = self::season_id();
+        $ov  = [];
+        foreach ( self::divisions_overview( $sid ) as $o ) { $ov[ $o['key'] ] = $o; }
+        $reg_teams = [];
+        foreach ( $wpdb->get_results( $wpdb->prepare(
+            "SELECT division, COUNT(*) AS n FROM {$wpdb->prefix}grsh_teams WHERE season_id = %d AND team_type = 'full_team' GROUP BY division", $sid
+        ), ARRAY_A ) ?: [] as $r ) { $reg_teams[ $r['division'] ] = (int) $r['n']; }
+        $set = [];
+        if ( class_exists( 'GRSH_Settings' ) ) {
+            foreach ( GRSH_Settings::get_active_divisions() as $d ) { $set[ (string) ( $d['key'] ?? '' ) ] = method_exists( 'GRSH_Settings', 'fill_division' ) ? GRSH_Settings::fill_division( $d ) : (array) $d; }
+        }
+        $rows = [];
+        foreach ( self::known_divisions( $sid ) as $key ) {
+            $cfg   = self::division_cfg( $key );
+            $keys  = self::aliases( $key );
+            $ph    = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
+            $reg   = $wpdb->get_row( $wpdb->prepare(
+                "SELECT COUNT(*) AS n, SUM(CASE WHEN r.payment_status = 'paid' THEN 1 ELSE 0 END) AS paid
+                   FROM {$wpdb->prefix}grsh_registrations r JOIN {$wpdb->prefix}grsh_players p ON p.id = r.player_id
+                  WHERE r.season_id = %d AND r.status <> 'rejected' AND COALESCE(r.player_type,'primary') <> 'sub'
+                    AND COALESCE(p.is_alternate,0) = 0 AND r.division_requested IN ($ph)",
+                array_merge( [ $sid ], $keys )
+            ), ARRAY_A ) ?: [ 'n' => 0, 'paid' => 0 ];
+            $o     = $ov[ $key ] ?? [ 'assigned' => 0, 'total' => 0, 'teams' => 0 ];
+            $drows = self::teams_rows( $sid, $key );
+            $locked = count( array_filter( $drows, function ( $t ) { return (int) $t['draft_locked'] === 1; } ) );
+            $meta  = self::meta_get( $key );
+            $ds    = self::draft_status( $key );
+            $stage = $meta['published_at'] ? 'Published' : ( $drows && $locked === count( $drows ) ? 'Locked' : ( in_array( $ds, [ 'active', 'paused' ], true ) ? 'Drafting' : ( $drows ? 'Building teams' : 'Not started' ) ) );
+            $f     = $set[ $key ]['format'] ?? 'both';
+            list( $planned_draft, $planned_reg ) = ( isset( $set[ $key ] ) && method_exists( 'GRSH_Settings', 'slots' ) ) ? GRSH_Settings::slots( $set[ $key ] ) : [ (int) $cfg['teams'], 0 ];
+            $cap   = $f === 'teams' ? 0 : $planned_draft * (int) $cfg['max_roster'];
+            $n     = (int) $reg['n'];
+            $rows[] = [
+                'key' => $key, 'name' => $cfg['label'], 'format' => $f,
+                'registered' => $n, 'paid' => (int) $reg['paid'], 'unpaid' => max( 0, $n - (int) $reg['paid'] ),
+                'in_draft' => (int) $o['total'], 'on_teams' => (int) $o['assigned'], 'in_pool' => max( 0, (int) $o['total'] - (int) $o['assigned'] ),
+                'teams_created' => count( $drows ), 'teams_planned' => $planned_draft,
+                'reg_teams_created' => $reg_teams[ $key ] ?? 0, 'reg_teams_planned' => $planned_reg,
+                'capacity' => $cap, 'fill_pct' => $cap > 0 ? round( $n / $cap * 100, 1 ) : 0,
+                'stage' => $stage,
+            ];
+        }
+        return $rows;
+    }
+
+    /**
+     * Money collected per division for the Board Treasurer snapshot. Totals only: no names, emails or payment
+     * methods of any person. Individual players = registrations (paid status only counts as collected);
+     * teams = registered full teams (deposit, or full fee once paid in full), same rule as Captain Sync.
+     */
+    public static function money_rows(): array {
+        global $wpdb;
+        $sid  = self::season_id();
+        $rows = [];
+        $tm   = [];
+        foreach ( $wpdb->get_results( $wpdb->prepare(
+            "SELECT division, payment_status, deposit_paid_at, deposit_amount, fee_total, balance_due
+               FROM {$wpdb->prefix}grsh_teams WHERE season_id = %d AND team_type = 'full_team'", $sid
+        ), ARRAY_A ) ?: [] as $t ) {
+            $d = (string) $t['division'];
+            if ( ! isset( $tm[ $d ] ) ) { $tm[ $d ] = [ 'teams' => 0, 'paid_dep' => 0, 'full' => 0, 'collected' => 0.0, 'outstanding' => 0.0 ]; }
+            $tm[ $d ]['teams']++;
+            if ( empty( $t['deposit_paid_at'] ) ) { continue; }
+            $tm[ $d ]['paid_dep']++;
+            if ( $t['payment_status'] === 'paid_in_full' ) {
+                $tm[ $d ]['full']++;
+                $tm[ $d ]['collected'] += (float) ( $t['fee_total'] ?? $t['deposit_amount'] ?? 0 );
+            } else {
+                $tm[ $d ]['collected']   += (float) ( $t['deposit_amount'] ?? 0 );
+                $tm[ $d ]['outstanding'] += $t['balance_due'] !== null ? (float) $t['balance_due']
+                    : max( 0, (float) ( $t['fee_total'] ?? 0 ) - (float) ( $t['deposit_amount'] ?? 0 ) );
+            }
+        }
+        foreach ( self::known_divisions( $sid ) as $key ) {
+            $keys = self::aliases( $key );
+            $ph   = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
+            $r    = $wpdb->get_row( $wpdb->prepare(
+                "SELECT COUNT(*) AS n,
+                        SUM(CASE WHEN r.payment_status = 'paid' THEN 1 ELSE 0 END) AS paid_n,
+                        SUM(CASE WHEN r.payment_status = 'paid' THEN r.amount_paid ELSE 0 END) AS collected,
+                        SUM(CASE WHEN r.payment_status IN ('waived') THEN 1 ELSE 0 END) AS waived_n,
+                        SUM(CASE WHEN r.payment_status IN ('pending','failed') THEN 1 ELSE 0 END) AS owing_n,
+                        SUM(CASE WHEN r.payment_status = 'refunded' THEN 1 ELSE 0 END) AS refunded_n
+                   FROM {$wpdb->prefix}grsh_registrations r
+                  WHERE r.season_id = %d AND r.status <> 'rejected' AND r.division_requested IN ($ph)",
+                array_merge( [ $sid ], $keys )
+            ), ARRAY_A ) ?: [];
+            $t = $tm[ $key ] ?? [ 'teams' => 0, 'paid_dep' => 0, 'full' => 0, 'collected' => 0.0, 'outstanding' => 0.0 ];
+            $cfg = self::division_cfg( $key );
+            $rows[] = [
+                'key' => $key, 'name' => $cfg['label'],
+                'players_registered' => (int) ( $r['n'] ?? 0 ), 'players_paid' => (int) ( $r['paid_n'] ?? 0 ),
+                'players_collected'  => round( (float) ( $r['collected'] ?? 0 ), 2 ),
+                'players_waived' => (int) ( $r['waived_n'] ?? 0 ), 'players_owing' => (int) ( $r['owing_n'] ?? 0 ),
+                'players_refunded' => (int) ( $r['refunded_n'] ?? 0 ),
+                'teams' => $t['teams'], 'teams_deposit_paid' => $t['paid_dep'], 'teams_paid_full' => $t['full'],
+                'teams_collected' => round( $t['collected'], 2 ), 'teams_outstanding' => round( $t['outstanding'], 2 ),
+            ];
+        }
+        return $rows;
     }
 
     // -------------------------------------------------------------------------
@@ -488,8 +608,13 @@ class GRSH_Rosters {
         foreach ( $all as $p ) { $valid[ $p['id'] ] = true; }
         $pins = array_values( array_filter( self::pins_get( $div ), function ( $pin ) use ( $valid ) { return isset( $valid[ $pin['a'] ], $valid[ $pin['b'] ] ); } ) );
 
+        // player locks only mean something while the player is on a team
+        $on_team = [];
+        foreach ( $teams as $t ) { foreach ( $t['players'] as $pp ) { $on_team[ (int) $pp['id'] ] = true; } }
+        $locks = array_values( array_filter( self::plocks_get( $div ), function ( $id ) use ( $on_team ) { return isset( $on_team[ $id ] ); } ) );
+
         $plans = array_map( function ( $pl ) {
-            return [ 'id' => $pl['id'], 'name' => $pl['name'], 'created_at' => $pl['created_at'], 'by' => $pl['by'], 'count' => count( $pl['assign'] ) ];
+            return [ 'id' => $pl['id'], 'name' => $pl['name'], 'created_at' => $pl['created_at'], 'by' => $pl['by'], 'count' => count( $pl['assign'] ), 'assign' => $pl['assign'] ];
         }, self::plans_get( $div ) );
 
         $locked_all = $teams && ! array_filter( $teams, function ( $t ) { return ! $t['locked']; } );
@@ -509,11 +634,12 @@ class GRSH_Rosters {
             'parity' => [ 'rebalance_low' => GRSH_Scoring::PARITY_REBALANCE_LOW, 'review_low' => GRSH_Scoring::PARITY_REVIEW_LOW,
                           'review_high' => GRSH_Scoring::PARITY_REVIEW_HIGH, 'rebalance_high' => GRSH_Scoring::PARITY_REBALANCE_HIGH ],
             'draft_status' => self::draft_status( $div ),
-            'teams' => $teams, 'pool' => $pool, 'pins' => $pins, 'plans' => $plans,
+            'teams' => $teams, 'pool' => $pool, 'pins' => $pins, 'locks' => $locks, 'plans' => $plans,
             'stage' => $stage,
             'gate' => self::gate( $cfg, $teams, $pool, $pins, $meta, $fb ),
             'review' => [ 'active' => (bool) $meta['review_key'], 'url' => $meta['review_key'] ? add_query_arg( 'grsh_roster_review', $meta['review_key'], home_url( '/' ) ) : '',
                           'approvals' => $approvals, 'comments' => array_values( array_filter( $fb, function ( $f ) { return $f['action'] === 'comment'; } ) ) ],
+            'changes_since_publish' => $meta['published_at'] ? self::changes_since( $div, (string) $meta['published_at'] ) : 0,
             'published' => [ 'at' => $meta['published_at'], 'url' => $meta['pub_key'] ? add_query_arg( 'grsh_roster_pub', $meta['pub_key'], home_url( '/' ) ) : '', 'result' => $meta['publish_result'] ],
         ];
     }
@@ -661,9 +787,13 @@ class GRSH_Rosters {
 
         $todo = [];
         $skipped = 0;
+        $held = array_flip( self::plocks_get( $div ) );
         foreach ( $plan as $pid => $tid ) {
             $from = $cur[ $pid ]['team_id'] ?? null;
             if ( $from === $tid ) { $skipped++; continue; }
+            if ( $from !== null && isset( $held[ $pid ] ) ) {
+                return new WP_Error( 'player_locked', 'That player is locked to ' . $teams[ $from ]['name'] . '. Unlock the player first.', [ 'status' => 409 ] );
+            }
             if ( $from !== null && (int) $teams[ $from ]['draft_locked'] === 1 ) {
                 return new WP_Error( 'locked', $teams[ $from ]['name'] . ' is locked. Unlock it to move players off it.', [ 'status' => 409 ] );
             }
@@ -778,6 +908,34 @@ class GRSH_Rosters {
         } );
         if ( is_wp_error( $res ) ) { return self::wp_err( $res ); }
         self::audit( 'roster_captain', (int) $team['id'], [ 'player_id' => $pid ] );
+        return self::out( $div );
+    }
+
+    // -------------------------------------------------------------------------
+    // Player locks ("stay put")
+    // -------------------------------------------------------------------------
+
+    public static function save_locks( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $body = $request->get_json_params() ?: [];
+        $div  = self::resolve_div( $body['division'] ?? '' );
+        if ( is_wp_error( $div ) ) { return self::wp_err( $div ); }
+        if ( $g = self::draft_guard( $div ) ) { return self::wp_err( $g ); }
+        $want = array_values( array_unique( array_filter( array_map( 'absint', (array) ( $body['locks'] ?? [] ) ) ) ) );
+        if ( count( $want ) > self::MAX_PLOCKS ) { return self::err( 'Too many locked players (max ' . self::MAX_PLOCKS . ').' ); }
+        // only players who are on a team in this division can be held
+        $teams = self::teams_rows( self::season_id(), $div );
+        $ids = array_map( function ( $t ) { return (int) $t['id']; }, $teams );
+        $onteam = [];
+        if ( $ids ) {
+            $ph = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+            foreach ( $wpdb->get_col( $wpdb->prepare( "SELECT player_id FROM {$wpdb->prefix}grsh_rosters WHERE season_id = %d AND team_id IN ($ph)", array_merge( [ self::season_id() ], $ids ) ) ) ?: [] as $pid ) { $onteam[ (int) $pid ] = true; }
+        }
+        $keep = array_values( array_filter( $want, function ( $id ) use ( $onteam ) { return isset( $onteam[ $id ] ); } ) );
+        $old  = self::plocks_get( $div );
+        update_option( self::PLOCK_OPT . $div, $keep, false );
+        $added = array_values( array_diff( $keep, $old ) ); $removed = array_values( array_diff( $old, $keep ) );
+        if ( $added || $removed ) { self::audit( 'roster_locks', null, [ 'division' => $div, 'locked' => $added, 'unlocked' => $removed ], count( $added ) . ' locked, ' . count( $removed ) . ' unlocked' ); }
         return self::out( $div );
     }
 
@@ -972,6 +1130,81 @@ class GRSH_Rosters {
         self::meta_save( $div, $meta );
         self::audit( 'roster_published', null, [ 'division' => $div ] + $meta['publish_result'] );
         return self::out( $div, [ 'publish_result' => $meta['publish_result'] ] );
+    }
+
+    // -------------------------------------------------------------------------
+    // Publish preview (dry run) and activity feed
+    // -------------------------------------------------------------------------
+
+    /** a***@host: enough to recognise an address, not enough to copy it. */
+    private static function mask_email( string $e ): string {
+        $at = strpos( $e, '@' );
+        if ( $at === false || $at < 1 ) { return '(no valid address)'; }
+        return substr( $e, 0, 1 ) . str_repeat( '*', min( 6, max( 1, $at - 1 ) ) ) . substr( $e, $at );
+    }
+
+    /** Roster audit rows for one division (newest first). The division lives inside after_value, so match it there. */
+    private static function activity_rows( string $div, int $limit ): array {
+        global $wpdb;
+        // The division lives inside after_value (JSON), so read the season's recent roster rows and filter here; no LIKE tricks.
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, user_display, action, notes, after_value, created_at FROM {$wpdb->prefix}grsh_audit_logs WHERE object_type = 'roster' AND season_id = %d ORDER BY id DESC LIMIT 600",
+            self::season_id()
+        ), ARRAY_A );
+        $out = [];
+        foreach ( is_array( $rows ) ? $rows : [] as $r ) {
+            $a = json_decode( (string) $r['after_value'], true );
+            if ( is_array( $a ) && ( $a['division'] ?? null ) === $div ) { $out[] = $r; if ( count( $out ) >= $limit ) { break; } }
+        }
+        return $out;
+    }
+
+    /** Number of roster moves made after the rosters were published. */
+    private static function changes_since( string $div, string $published_at ): int {
+        $n = 0;
+        foreach ( self::activity_rows( $div, 200 ) as $r ) {
+            if ( (string) $r['created_at'] > $published_at && $r['action'] === 'roster_moves' ) { $n++; }
+        }
+        return $n;
+    }
+
+    public static function activity( WP_REST_Request $request ): WP_REST_Response {
+        $div = self::resolve_div( $request->get_param( 'division' ) ?? '' );
+        if ( is_wp_error( $div ) ) { return self::wp_err( $div ); }
+        $titles = [ 'roster_moves' => 'Players moved', 'roster_locks' => 'Player locks changed', 'roster_plan_saved' => 'Plan saved', 'roster_plan_restored' => 'Plan restored', 'roster_published' => 'Published', 'roster_team_created' => 'Team added' ];
+        $out = [];
+        foreach ( self::activity_rows( $div, 40 ) as $r ) {
+            $a = json_decode( (string) $r['after_value'], true ) ?: [];
+            $out[] = [ 'id' => (int) $r['id'], 'at' => (string) $r['created_at'], 'by' => (string) $r['user_display'], 'action' => (string) $r['action'],
+                       'title' => $titles[ $r['action'] ] ?? str_replace( '_', ' ', preg_replace( '/^roster_/', '', (string) $r['action'] ) ), 'notes' => (string) $r['notes'], 'moved' => isset( $a['moved'] ) ? (int) $a['moved'] : null ];
+        }
+        $meta = self::meta_get( $div );
+        return new WP_REST_Response( [ 'division' => $div, 'items' => $out, 'published_at' => $meta['published_at'] ?: null,
+            'changes_since_publish' => $meta['published_at'] ? self::changes_since( $div, (string) $meta['published_at'] ) : 0 ], 200 );
+    }
+
+    /** Dry run of Publish & email: who would be told which team, who would be skipped and why. Sends and writes nothing. */
+    public static function publish_preview( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $div = self::resolve_div( $request->get_param( 'division' ) ?? '' );
+        if ( is_wp_error( $div ) ) { return self::wp_err( $div ); }
+        $p = self::payload( $div );
+        $team_of = [];
+        foreach ( $p['teams'] as $t ) { foreach ( $t['players'] as $pl ) { $team_of[ $pl['id'] ] = $t['name']; } }
+        $rows = $team_of ? $wpdb->get_results( "SELECT id, first_name, last_name, email FROM {$wpdb->prefix}grsh_players WHERE id IN (" . implode( ',', array_map( 'intval', array_keys( $team_of ) ) ) . ') ORDER BY last_name, first_name', ARRAY_A ) : [];
+        $send = []; $skip = []; $n = 0;
+        foreach ( (array) $rows as $e ) {
+            $name = trim( $e['first_name'] . ' ' . $e['last_name'] );
+            if ( ! is_email( $e['email'] ) ) { $skip[] = [ 'name' => $name, 'team' => $team_of[ (int) $e['id'] ], 'reason' => 'no valid email address' ]; continue; }
+            if ( $n >= self::MAX_EMAILS ) { $skip[] = [ 'name' => $name, 'team' => $team_of[ (int) $e['id'] ], 'reason' => 'over the ' . self::MAX_EMAILS . ' email limit for one send' ]; continue; }
+            $n++; $send[] = [ 'name' => $name, 'team' => $team_of[ (int) $e['id'] ], 'to' => self::mask_email( (string) $e['email'] ) ];
+        }
+        $first = $send ? $send[0] : null;
+        $blockers = array_values( array_filter( $p['gate'], function ( $c ) { return $c['level'] === 'fail'; } ) );
+        return new WP_REST_Response( [ 'dry_run' => true, 'division' => $div, 'will_send' => count( $send ), 'will_skip' => count( $skip ),
+            'recipients' => array_slice( $send, 0, 60 ), 'skipped' => array_slice( $skip, 0, 30 ), 'blocked_by' => array_column( $blockers, 'text' ),
+            'sample_subject' => $first ? 'Gold Rush ' . $p['division_label'] . ": you're on " . $first['team'] : '',
+            'sample_body' => $first ? 'Rosters are set and you are on ' . $first['team'] . '. A link to every roster is included.' : '' ], 200 );
     }
 
     /** Dry run only: which published rosters line up with existing SportsPress teams/players. Writes nothing. */

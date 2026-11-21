@@ -29,7 +29,12 @@ class GRSH_Captain_Sync {
     const PENDING_TRANSIENT = 'grsh_cs_pending';
     const MAX_DELETE  = 50;
     const NUDGE_COOLDOWN_DAYS = 3;
-    const HISTORY_ACTIONS = [ 'captain_sync_deposit', 'captain_sync_undo', 'captain_sync_division', 'captain_sync_team_deleted', 'captain_sync_team_restored', 'captain_sync_captain' ];
+    const HISTORY_ACTIONS = [ 'captain_sync_deposit', 'captain_sync_undo', 'captain_sync_division', 'captain_sync_team_deleted', 'captain_sync_team_restored', 'captain_sync_captain',
+                              'captain_sync_invite_revoked', 'captain_sync_captain_detached', 'captain_sync_captain_reattached', 'captain_sync_note' ];
+    const NOTES_OPT   = 'grsh_cs_notes';
+    const NOTE_TAGS   = [ '', 'phoned', 'paying_by_check', 'waiting', 'dropped', 'vip' ];
+    const IDLE_DAYS   = 14;           // a team with no activity this long is "idle"
+    const SIMILAR_PCT = 85;           // team names this alike in one division are flagged as possible duplicates
 
     public static function register_hooks(): void {
         // Priority 20: after grsh_register_admin_menu() creates the parent menu.
@@ -76,6 +81,13 @@ class GRSH_Captain_Sync {
         ] );
         register_rest_route( 'grsh/v1', '/captain-sync/nudge', [
             'methods' => WP_REST_Server::CREATABLE, 'callback' => [ __CLASS__, 'rest_nudge' ], 'permission_callback' => $perm,
+        ] );
+        foreach ( [ 'remove-team' => 'rest_remove_team', 'revoke-invite' => 'rest_revoke_invite', 'detach-captain' => 'rest_detach_captain',
+                    'reattach-captain' => 'rest_reattach_captain', 'note' => 'rest_note', 'digest' => 'rest_digest' ] as $route => $cb ) {
+            register_rest_route( 'grsh/v1', '/captain-sync/' . $route, [ 'methods' => WP_REST_Server::CREATABLE, 'callback' => [ __CLASS__, $cb ], 'permission_callback' => $perm ] );
+        }
+        register_rest_route( 'grsh/v1', '/captain-sync/team-detail', [
+            'methods' => WP_REST_Server::READABLE, 'callback' => [ __CLASS__, 'rest_team_detail' ], 'permission_callback' => $perm,
         ] );
     }
 
@@ -220,6 +232,8 @@ class GRSH_Captain_Sync {
         $raw_teams = self::teams( $season['id'] );
         $hist_rows = self::history_rows_by_team( array_map( fn( $r ) => (int) $r['id'], $raw_teams ) );
         $nudged    = self::last_nudges();
+        $notes     = self::notes();
+        $activity  = self::last_activity();
         $now_ts    = strtotime( (string) current_time( 'mysql' ) ) ?: time();
         $issues    = [];
         $teams     = [];
@@ -246,6 +260,8 @@ class GRSH_Captain_Sync {
                 'history_rows' => $hist_rows[ (int) $t['id'] ] ?? 0,
                 'last_nudged_at' => $nudged[ (int) $t['id'] ] ?? null,
                 'test_flags' => self::test_flags( $t ),
+                'note' => $notes[ (int) $t['id'] ] ?? null,
+                'idle_days' => self::idle_days( $t, $activity[ (int) $t['id'] ] ?? '', $now_ts ),
             ];
             $teams[ (int) $t['id'] ]['looks_test'] = ! empty( $teams[ (int) $t['id'] ]['test_flags'] );
             if ( ! $dv_ok ) {
@@ -269,6 +285,33 @@ class GRSH_Captain_Sync {
         foreach ( $by_cap as $pid => $ids ) {
             if ( $pid && count( $ids ) > 1 ) {
                 $issues[] = [ 'key' => 'captain_two_teams', 'level' => 'warn', 'team_id' => $ids[0], 'title' => 'One captain is on ' . count( $ids ) . ' teams', 'detail' => 'Deposit entries can only match one of them. Team ids ' . implode(', ', $ids) . '.' ];
+            }
+        }
+
+        // Possible duplicates: very similar names in one division, or one captain email on two teams.
+        $tl = array_values( $teams ); $n_tl = min( count( $tl ), 200 ); $flagged = [];
+        for ( $i = 0; $i < $n_tl; $i++ ) {
+            for ( $j = $i + 1; $j < $n_tl; $j++ ) {
+                $a = $tl[ $i ]; $b = $tl[ $j ];
+                $an = strtolower( trim( $a['name'] ) ); $bn = strtolower( trim( $b['name'] ) );
+                if ( $an === $bn ) { continue; }   // exact matches already have their own problem above
+                similar_text( $an, $bn, $pct );
+                $same_mail = $a['captain'] && $b['captain'] && $a['captain']['email'] !== '' && strtolower( $a['captain']['email'] ) === strtolower( $b['captain']['email'] ) && $a['captain']['player_id'] !== $b['captain']['player_id'];
+                if ( ( $a['division'] === $b['division'] && $pct >= self::SIMILAR_PCT ) || $same_mail ) {
+                    $k = $a['id'] . '-' . $b['id']; if ( isset( $flagged[ $k ] ) ) { continue; } $flagged[ $k ] = true;
+                    $issues[] = [ 'key' => 'near_duplicate_team', 'level' => 'warn', 'team_id' => $a['id'], 'title' => '"' . $a['name'] . '" and "' . $b['name'] . '" may be the same team',
+                        'detail' => $same_mail ? 'Two captain records share one email address.' : 'The names are ' . (int) round( $pct ) . '% alike in the same division. Team ids ' . $a['id'] . ' and ' . $b['id'] . '.' ];
+                }
+            }
+        }
+        foreach ( $teams as $tm ) {
+            $f = $tm['division_ok'] ? self::format_of( $tm['division'] ) : 'both';
+            if ( $f === 'draft' ) {
+                $issues[] = [ 'key' => 'team_in_draft_division', 'level' => 'warn', 'team_id' => $tm['id'], 'title' => 'Team "' . $tm['name'] . '" is in a division set to Draft only',
+                    'detail' => 'Settings says ' . ( $tm['division_label'] ?: $tm['division'] ) . ' is filled by the draft, not by registered teams. Change the division on the team or the Format in Settings.' ];
+            }
+            if ( ! empty( $tm['note']['follow_up'] ) && $tm['note']['follow_up'] <= substr( (string) current_time( 'mysql' ), 0, 10 ) ) {
+                $issues[] = [ 'key' => 'follow_up_due', 'level' => 'info', 'team_id' => $tm['id'], 'title' => 'Follow-up due for "' . $tm['name'] . '"', 'detail' => (string) ( $tm['note']['note'] ?? '' ) ];
             }
         }
 
@@ -379,6 +422,7 @@ class GRSH_Captain_Sync {
                        'note' => 'Tahoe Champions Cup is a separate tournament with its own divisions. It is not synced into GRSH. It needs its own design first.' ],
             'funnel' => $funnel, 'teams' => array_values( $teams ), 'entries' => $entries, 'issues' => $issues,
             'pending' => $pending, 'history' => self::history(), 'divisions' => self::division_options( $active ),
+            'last_entry_at' => self::last_entry_at( $entries ),
             'min_players' => $min, 'can_write' => $season['exists'],
             'generated_at' => current_time( 'mysql' ),
         ];
@@ -423,16 +467,31 @@ class GRSH_Captain_Sync {
         foreach ( $rows as $r ) {
             $after  = json_decode( (string) $r['after_value'], true ) ?: [];
             $item = [ 'id' => (int) $r['id'], 'action' => $r['action'], 'team_id' => (int) $r['object_id'], 'by' => $r['user_display'], 'at' => $r['created_at'], 'notes' => (string) $r['notes'],
-                      'undone' => isset( $undone[ (int) $r['id'] ] ) || isset( $restored[ (int) $r['id'] ] ), 'can_undo' => false, 'can_restore' => false ];
+                      'undone' => isset( $undone[ (int) $r['id'] ] ) || isset( $restored[ (int) $r['id'] ] ), 'can_undo' => false, 'can_restore' => false, 'can_reattach' => false ];
             if ( $r['action'] === 'captain_sync_deposit' && ! $item['undone'] ) {
                 $item['can_undo'] = self::team_matches( (int) $r['object_id'], $after['after'] ?? [] );
             }
             if ( $r['action'] === 'captain_sync_team_deleted' && ! $item['undone'] ) {
                 $item['can_restore'] = ! self::team_exists( (int) $r['object_id'] ) && is_array( json_decode( (string) $r['before_value'], true ) );
             }
+            if ( $r['action'] === 'captain_sync_captain_detached' && ! $item['undone'] ) {
+                $b = json_decode( (string) $r['before_value'], true ) ?: [];
+                $item['can_reattach'] = ! empty( $b['captain_player_id'] ) && self::team_exists( (int) $r['object_id'] ) && self::team_captain_id( (int) $r['object_id'] ) === 0
+                    && ! self::captain_elsewhere( (int) $b['captain_player_id'], (int) $r['object_id'] );
+            }
             $out[] = $item;
         }
         return $out;
+    }
+
+    private static function team_captain_id( int $team_id ): int {
+        global $wpdb;
+        return (int) $wpdb->get_var( $wpdb->prepare( "SELECT captain_player_id FROM {$wpdb->prefix}grsh_teams WHERE id = %d", $team_id ) );
+    }
+
+    private static function captain_elsewhere( int $player_id, int $except_team ): bool {
+        global $wpdb;
+        return (bool) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$wpdb->prefix}grsh_teams WHERE captain_player_id = %d AND id <> %d AND season_id = %d LIMIT 1", $player_id, $except_team, self::season()['id'] ) );
     }
 
     /** True when the team still holds exactly the deposit values we wrote (nobody changed them since). */
@@ -588,7 +647,7 @@ class GRSH_Captain_Sync {
     }
 
     /** Why a team looks like dummy data. Only a hint: nothing is removed without a human picking it. */
-    private static function test_flags( array $t ): array {
+    public static function test_flags( array $t ): array {
         $flags = [];
         foreach ( [ (string) ( $t['name'] ?? '' ), trim( ( $t['cap_first'] ?? '' ) . ' ' . ( $t['cap_last'] ?? '' ) ) ] as $n ) {
             if ( preg_match( '/\b(test|dummy|demo|sample|fake)\b/i', $n ) ) { $flags[] = 'test_name'; break; }
@@ -651,11 +710,52 @@ class GRSH_Captain_Sync {
         $rows = [];
         $list = class_exists( 'GRSH_Settings' ) && method_exists( 'GRSH_Settings', 'get_active_divisions' ) ? (array) GRSH_Settings::get_active_divisions() : [];
         foreach ( $list as $d ) {
-            $k = (string) $d['key']; $exp = isset( $d['teams'] ) && $d['teams'] !== null ? (int) $d['teams'] : null; $n = $counts[ $k ] ?? 0;
-            $rows[] = [ 'key' => $k, 'label' => (string) ( $d['label'] ?? $k ), 'expected' => $exp, 'actual' => $n, 'delta' => $exp === null ? null : $n - $exp ];
+            $k = (string) $d['key']; $n = $counts[ $k ] ?? 0;
+            $fmt = isset( $d['format'] ) && in_array( $d['format'], [ 'draft', 'teams', 'both' ], true ) ? $d['format'] : 'both';
+            $teams_cfg = isset( $d['teams'] ) && $d['teams'] !== null ? (int) $d['teams'] : null;
+            $reg = (int) ( $d['reg_teams'] ?? 0 );
+            // Registered teams only fill the registered slots. A draft-only division expects none.
+            if ( $fmt === 'draft' )                  { $exp = null; }
+            elseif ( $fmt === 'both' && $reg > 0 )   { $exp = $reg; }
+            else                                     { $exp = $teams_cfg; }
+            $rows[] = [ 'key' => $k, 'label' => (string) ( $d['label'] ?? $k ), 'format' => $fmt, 'expected' => $exp, 'actual' => $n, 'delta' => $exp === null ? null : $n - $exp ];
             unset( $counts[ $k ] );
         }
         return [ 'rows' => $rows, 'other' => array_sum( $counts ) ];
+    }
+
+    /** Format of one division from Settings ('both' when Settings has no such field, as before the Format setting existed). */
+    private static function format_of( string $key ): string {
+        if ( class_exists( 'GRSH_Settings' ) && method_exists( 'GRSH_Settings', 'division_format' ) ) { return (string) GRSH_Settings::division_format( $key ); }
+        return 'both';
+    }
+
+    private static function last_entry_at( array $entries ): ?string {
+        $best = null;
+        foreach ( $entries as $e ) { if ( ( $e['form'] ?? '' ) === 'live' && ( $best === null || (string) $e['date'] > $best ) ) { $best = (string) $e['date']; } }
+        return $best;
+    }
+
+    /** team_id => latest audit-log time for that team (any action), used to spot teams that went quiet. */
+    private static function last_activity(): array {
+        global $wpdb;
+        $rows = $wpdb->get_results( "SELECT object_id, MAX(created_at) AS at FROM {$wpdb->prefix}grsh_audit_logs WHERE object_type = 'team' AND object_id IS NOT NULL GROUP BY object_id", ARRAY_A ) ?: [];
+        $out = [];
+        foreach ( $rows as $r ) { $out[ (int) $r['object_id'] ] = (string) $r['at']; }
+        return $out;
+    }
+
+    /** Days since anything happened to a team that has not paid a deposit yet. Null once a deposit is in (idle no longer matters). */
+    public static function idle_days( array $t, string $last_audit, int $now_ts ): ?int {
+        if ( ! empty( $t['deposit_paid_at'] ) ) { return null; }
+        $best = 0;
+        foreach ( [ (string) ( $t['created_at'] ?? '' ), $last_audit ] as $d ) { $ts = $d !== '' ? strtotime( $d ) : false; if ( $ts && $ts > $best ) { $best = $ts; } }
+        return $best ? max( 0, (int) floor( ( $now_ts - $best ) / 86400 ) ) : null;
+    }
+
+    private static function notes(): array {
+        $v = get_option( self::NOTES_OPT, [] );
+        return is_array( $v ) ? $v : [];
     }
 
     private static function login_url(): string {
@@ -703,7 +803,16 @@ class GRSH_Captain_Sync {
         if ( ! $item['can_restore'] ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'A team with that id exists again, so it cannot be restored.' ], 409 ); }
         $snap = json_decode( (string) $row['before_value'], true );
         if ( ! empty( $snap['captain_player_id'] ) && ! $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$wpdb->prefix}grsh_players WHERE id = %d", (int) $snap['captain_player_id'] ) ) ) { $snap['captain_player_id'] = null; }
+        $rosters = isset( $snap['_rosters'] ) && is_array( $snap['_rosters'] ) ? $snap['_rosters'] : [];
+        unset( $snap['_rosters'], $snap['_forced'] );
         $ok = $wpdb->insert( "{$wpdb->prefix}grsh_teams", $snap );
+        if ( $ok ) {
+            foreach ( $rosters as $rr ) {
+                if ( ! is_array( $rr ) ) { continue; }
+                if ( ! empty( $rr['id'] ) && $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$wpdb->prefix}grsh_rosters WHERE id = %d", (int) $rr['id'] ) ) ) { continue; }
+                $wpdb->insert( "{$wpdb->prefix}grsh_rosters", $rr );
+            }
+        }
         if ( ! $ok ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'The database refused: ' . ( $wpdb->last_error ?: 'unknown reason' ) ], 500 ); }
         self::audit( 'captain_sync_team_restored', (int) $row['object_id'], null, [ 'restored' => $id ], 'Restored deleted team "' . ( $snap['name'] ?? '' ) . '"' );
         self::clear_pending_cache();
@@ -788,6 +897,178 @@ class GRSH_Captain_Sync {
             $results[] = $r;
         }
         return new WP_REST_Response( [ 'success' => true, 'dry_run' => $dry, 'sent' => $sent, 'results' => $results ], 200 );
+    }
+
+    // -------------------------------------------------------------------------
+    // REST: remove a team with things attached, revoke invite, detach captain, notes, detail, digest
+    // -------------------------------------------------------------------------
+
+    private static function find_team( int $id ): ?array {
+        foreach ( self::build_overview()['teams'] as $t ) { if ( $t['id'] === $id ) { return $t; } }
+        return null;
+    }
+
+    /** What removing a team would take and keep. Pure reading. */
+    public static function removal_impact( array $t ): array {
+        $removes = [ 'the team record' ]; $keeps = [ 'captain login accounts', 'player records', 'WPForms entries' ]; $blocked = []; $needs_ack = false;
+        if ( (int) $t['roster_size'] > 0 ) { $removes[] = (int) $t['roster_size'] . ' roster row' . ( (int) $t['roster_size'] === 1 ? '' : 's' ) . ' (the players themselves are kept)'; $needs_ack = true; }
+        if ( $t['payment_status'] !== 'unpaid' || ! empty( $t['deposit_paid_at'] ) || (float) ( $t['deposit_amount'] ?? 0 ) > 0 ) { $removes[] = 'the recorded payment (' . ( $t['payment_status'] ?: 'deposit' ) . ')'; $needs_ack = true; }
+        if ( (int) ( $t['history_rows'] ?? 0 ) > 0 ) { $blocked[] = 'player history points at this team (' . (int) $t['history_rows'] . ' rows), so removing it would orphan them'; }
+        if ( (int) $t['entries'] > 0 ) { $keeps[] = 'the deposit form entry (it stays in WPForms; it will show as unmatched)'; }
+        if ( ( $t['account'] ?? '' ) === 'pending' ) { $keeps[] = 'the captain\'s pending invite link (revoke it separately)'; }
+        return [ 'removes' => $removes, 'keeps' => $keeps, 'blocked' => $blocked, 'needs_ack' => $needs_ack, 'allowed' => ! $blocked ];
+    }
+
+    public static function rest_remove_team( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $b = (array) $request->get_json_params();
+        $id = (int) ( $b['team_id'] ?? 0 );
+        if ( ! self::season()['exists'] ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'The season in Settings does not exist, so nothing can be changed.' ], 409 ); }
+        $t = $id ? self::find_team( $id ) : null;
+        if ( ! $t ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Team not found in this season.' ], 404 ); }
+        $imp = self::removal_impact( $t );
+        if ( ! empty( $b['dry_run'] ) ) { return new WP_REST_Response( [ 'success' => true, 'dry_run' => true, 'team' => [ 'id' => $t['id'], 'name' => $t['name'] ], 'impact' => $imp ], 200 ); }
+        if ( ! $imp['allowed'] ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Kept: ' . implode( ' and ', $imp['blocked'] ) . '.', 'impact' => $imp ], 409 ); }
+        $reason = trim( (string) ( $b['reason'] ?? '' ) );
+        if ( strlen( $reason ) < 3 ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Give a short reason. It goes in the history.' ], 400 ); }
+        if ( strtolower( trim( (string) ( $b['confirm_name'] ?? '' ) ) ) !== strtolower( trim( $t['name'] ) ) ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Type the team name exactly to confirm. Nothing was removed.' ], 400 ); }
+        if ( $imp['needs_ack'] && empty( $b['acknowledge'] ) ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'This team has players or a recorded payment. Tick the box to confirm you understand. Nothing was removed.' ], 400 ); }
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->prefix}grsh_teams WHERE id = %d AND team_type = 'full_team'", $id ), ARRAY_A );
+        if ( ! $row ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Not found.' ], 404 ); }
+        $rosters = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM {$wpdb->prefix}grsh_rosters WHERE team_id = %d", $id ), ARRAY_A ) ?: [];
+        $snap = $row; $snap['_rosters'] = $rosters; $snap['_forced'] = true;
+        if ( $rosters ) { $wpdb->delete( "{$wpdb->prefix}grsh_rosters", [ 'team_id' => $id ] ); }
+        $ok = $wpdb->delete( "{$wpdb->prefix}grsh_teams", [ 'id' => $id ] );
+        if ( ! $ok ) {
+            foreach ( $rosters as $rr ) { $wpdb->insert( "{$wpdb->prefix}grsh_rosters", $rr ); }   // put them back: all or nothing
+            return new WP_REST_Response( [ 'success' => false, 'message' => 'The database refused: ' . ( $wpdb->last_error ?: 'unknown reason' ) . '. Nothing was removed.' ], 500 );
+        }
+        self::audit( 'captain_sync_team_deleted', $id, $snap, null, 'Removed team "' . $t['name'] . '" (' . $reason . ')' . ( $rosters ? ', with ' . count( $rosters ) . ' roster rows' : '' ) );
+        self::clear_pending_cache();
+        return new WP_REST_Response( [ 'success' => true, 'message' => 'Removed "' . $t['name'] . '". You can restore it from History. Captain accounts and player records were not touched.', 'impact' => $imp ], 200 );
+    }
+
+    /** Clear a captain's unused invite link. Returns true when a link was actually cleared. */
+    private static function clear_invite( int $user_id ): bool {
+        global $wpdb;
+        if ( ! $user_id || self::account_state( $user_id ) !== 'pending' ) { return false; }
+        $tbl = isset( $wpdb->users ) && $wpdb->users ? $wpdb->users : $wpdb->prefix . 'users';
+        $wpdb->update( $tbl, [ 'user_activation_key' => '' ], [ 'ID' => $user_id ] );
+        if ( function_exists( 'clean_user_cache' ) ) { clean_user_cache( $user_id ); }
+        return true;
+    }
+
+    public static function rest_revoke_invite( WP_REST_Request $request ): WP_REST_Response {
+        $b = (array) $request->get_json_params();
+        $t = self::find_team( (int) ( $b['team_id'] ?? 0 ) );
+        if ( ! $t ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Team not found in this season.' ], 404 ); }
+        $reason = trim( (string) ( $b['reason'] ?? '' ) );
+        if ( strlen( $reason ) < 3 ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Give a short reason. It goes in the history.' ], 400 ); }
+        if ( ! $t['captain'] || $t['account'] !== 'pending' ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'There is no unused invite on this team. The captain has either signed in already or never had a login.' ], 409 ); }
+        global $wpdb;
+        $uid = (int) $wpdb->get_var( $wpdb->prepare( "SELECT wp_user_id FROM {$wpdb->prefix}grsh_players WHERE id = %d", $t['captain']['player_id'] ) );
+        if ( ! self::clear_invite( $uid ) ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'The invite could not be found.' ], 409 ); }
+        self::audit( 'captain_sync_invite_revoked', $t['id'], [ 'user_id' => $uid, 'captain' => $t['captain']['email'] ], null, 'Invite link revoked for "' . $t['name'] . '" (' . $reason . ')' );
+        self::clear_pending_cache();
+        return new WP_REST_Response( [ 'success' => true, 'message' => 'The invite link no longer works. To invite them again, use Invite Captain; that makes a new link.' ], 200 );
+    }
+
+    public static function rest_detach_captain( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $b = (array) $request->get_json_params();
+        $t = self::find_team( (int) ( $b['team_id'] ?? 0 ) );
+        if ( ! $t ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Team not found in this season.' ], 404 ); }
+        if ( ! $t['captain'] ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'This team has no captain to detach.' ], 409 ); }
+        $reason = trim( (string) ( $b['reason'] ?? '' ) );
+        if ( strlen( $reason ) < 3 ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Give a short reason. It goes in the history.' ], 400 ); }
+        $pid = (int) $t['captain']['player_id'];
+        $revoked = false;
+        if ( ! empty( $b['revoke_invite'] ) ) {
+            $uid = (int) $wpdb->get_var( $wpdb->prepare( "SELECT wp_user_id FROM {$wpdb->prefix}grsh_players WHERE id = %d", $pid ) );
+            $revoked = self::clear_invite( $uid );
+        }
+        $wpdb->update( "{$wpdb->prefix}grsh_teams", [ 'captain_player_id' => null ], [ 'id' => $t['id'] ] );
+        self::audit( 'captain_sync_captain_detached', $t['id'], [ 'captain_player_id' => $pid, 'captain' => $t['captain']['name'], 'invite_revoked' => $revoked ], null, 'Captain ' . $t['captain']['name'] . ' detached from "' . $t['name'] . '" (' . $reason . ')' . ( $revoked ? ', invite revoked' : '' ) );
+        self::clear_pending_cache();
+        return new WP_REST_Response( [ 'success' => true, 'message' => $t['captain']['name'] . ' is no longer captain of "' . $t['name'] . '". Their account and player record are untouched.' . ( $revoked ? ' Their invite link was revoked and cannot be restored by Undo.' : '' ) ], 200 );
+    }
+
+    public static function rest_reattach_captain( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $id = (int) ( ( (array) $request->get_json_params() )['audit_id'] ?? 0 );
+        $row = $id ? $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->prefix}grsh_audit_logs WHERE id = %d AND action = 'captain_sync_captain_detached'", $id ), ARRAY_A ) : null;
+        if ( ! $row ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'That change was not found.' ], 404 ); }
+        $item = null; foreach ( self::history() as $h ) { if ( $h['id'] === $id ) { $item = $h; break; } }
+        if ( ! $item || $item['undone'] || ! $item['can_reattach'] ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'This cannot be undone any more (the team has a captain again, the captain is on another team, or the team is gone).' ], 409 ); }
+        $b = json_decode( (string) $row['before_value'], true );
+        $wpdb->update( "{$wpdb->prefix}grsh_teams", [ 'captain_player_id' => (int) $b['captain_player_id'] ], [ 'id' => (int) $row['object_id'] ] );
+        self::audit( 'captain_sync_captain_reattached', (int) $row['object_id'], null, [ 'restored' => $id, 'captain_player_id' => (int) $b['captain_player_id'] ], 'Captain put back after detach' );
+        self::clear_pending_cache();
+        return new WP_REST_Response( [ 'success' => true, 'message' => 'The captain is back on the team.' . ( ! empty( $b['invite_revoked'] ) ? ' Their invite link stays revoked; send a new one from Invite Captain.' : '' ) ], 200 );
+    }
+
+    public static function rest_note( WP_REST_Request $request ): WP_REST_Response {
+        $b = (array) $request->get_json_params();
+        $id = (int) ( $b['team_id'] ?? 0 );
+        if ( ! $id || ! self::team_exists( $id ) ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Team not found.' ], 404 ); }
+        $text = trim( (string) ( $b['note'] ?? '' ) );
+        if ( strlen( $text ) > 500 ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Keep the note to 500 characters.' ], 400 ); }
+        $tag = (string) ( $b['tag'] ?? '' );
+        if ( ! in_array( $tag, self::NOTE_TAGS, true ) ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Unknown tag.' ], 400 ); }
+        $fu = trim( (string) ( $b['follow_up'] ?? '' ) );
+        if ( $fu !== '' && ( ! preg_match( '/^(\d{4})-(\d{2})-(\d{2})$/', $fu, $m ) || ! checkdate( (int) $m[2], (int) $m[3], (int) $m[1] ) ) ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'The follow-up date is not a real date.' ], 400 ); }
+        $all = self::notes();
+        if ( $text === '' && $tag === '' && $fu === '' ) { unset( $all[ $id ] ); }
+        else { $all[ $id ] = [ 'note' => sanitize_textarea_field( $text ), 'tag' => $tag, 'follow_up' => $fu, 'by' => wp_get_current_user()->display_name ?: 'unknown', 'at' => (string) current_time( 'mysql' ) ]; }
+        update_option( self::NOTES_OPT, $all, false );
+        return new WP_REST_Response( [ 'success' => true, 'note' => $all[ $id ] ?? null, 'message' => isset( $all[ $id ] ) ? 'Note saved.' : 'Note cleared.' ], 200 );
+    }
+
+    public static function rest_team_detail( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $id = (int) $request->get_param( 'team_id' );
+        $t = $id ? self::find_team( $id ) : null;
+        if ( ! $t ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Team not found in this season.' ], 404 ); }
+        $rows = $wpdb->get_results( $wpdb->prepare( "SELECT id, user_display, action, notes, created_at FROM {$wpdb->prefix}grsh_audit_logs WHERE object_type = 'team' AND object_id = %d ORDER BY id DESC LIMIT 30", $id ), ARRAY_A ) ?: [];
+        $timeline = [];
+        foreach ( $rows as $r ) { $timeline[] = [ 'at' => (string) $r['created_at'], 'by' => (string) $r['user_display'], 'action' => (string) $r['action'], 'notes' => (string) $r['notes'] ]; }
+        $players = $wpdb->get_results( $wpdb->prepare( "SELECT p.first_name, p.last_name FROM {$wpdb->prefix}grsh_rosters ro JOIN {$wpdb->prefix}grsh_players p ON p.id = ro.player_id WHERE ro.team_id = %d ORDER BY p.last_name, p.first_name LIMIT 60", $id ), ARRAY_A ) ?: [];
+        $ledger = [];
+        if ( ! empty( $t['deposit_paid_at'] ) ) { $ledger[] = [ 'label' => 'Deposit' . ( $t['fee_tier'] ? ' (' . $t['fee_tier'] . ' fee)' : '' ), 'amount' => (float) ( $t['deposit_amount'] ?? 0 ), 'date' => (string) $t['deposit_paid_at'], 'state' => 'paid' ]; }
+        if ( $t['fee_total'] !== null ) { $ledger[] = [ 'label' => 'Team fee total', 'amount' => (float) $t['fee_total'], 'date' => '', 'state' => 'plan' ]; }
+        if ( $t['balance_due'] !== null && $t['payment_status'] !== 'paid_in_full' ) { $ledger[] = [ 'label' => 'Balance still due', 'amount' => (float) $t['balance_due'], 'date' => (string) ( self::settings()['team_balance_due_date'] ?? '' ), 'state' => 'due' ]; }
+        if ( $t['payment_status'] === 'paid_in_full' ) { $ledger[] = [ 'label' => 'Paid in full', 'amount' => (float) ( $t['fee_total'] ?? 0 ), 'date' => '', 'state' => 'paid' ]; }
+        return new WP_REST_Response( [ 'success' => true, 'timeline' => $timeline, 'players' => array_map( function ( $p ) { return trim( $p['first_name'] . ' ' . $p['last_name'] ); }, $players ), 'ledger' => $ledger, 'impact' => self::removal_impact( $t ) ], 200 );
+    }
+
+    /** Plain-text list of what needs the secretary. Pure: takes the overview, returns text. */
+    public static function digest_text( array $ov ): string {
+        $lines = [];
+        if ( ! empty( $ov['pending'] ) ) { $lines[] = $ov['pending'] . ' deposit' . ( $ov['pending'] === 1 ? '' : 's' ) . ' paid on the form but not on the team.'; }
+        $bad = 0; $warn = 0; foreach ( (array) ( $ov['issues'] ?? [] ) as $i ) { if ( ( $i['level'] ?? '' ) === 'bad' ) { $bad++; } elseif ( ( $i['level'] ?? '' ) === 'warn' ) { $warn++; } }
+        if ( $bad || $warn ) { $lines[] = $bad . ' problem' . ( $bad === 1 ? '' : 's' ) . ' to fix and ' . $warn . ' to look at on the Problems tab.'; }
+        $idle = 0; $due = [];
+        foreach ( (array) ( $ov['teams'] ?? [] ) as $t ) {
+            if ( isset( $t['idle_days'] ) && $t['idle_days'] !== null && $t['idle_days'] >= self::IDLE_DAYS ) { $idle++; }
+            if ( ! empty( $t['note']['follow_up'] ) && $t['note']['follow_up'] <= substr( (string) ( $ov['generated_at'] ?? '' ), 0, 10 ) ) { $due[] = $t['name'] . ( $t['note']['note'] ? ': ' . $t['note']['note'] : '' ); }
+        }
+        if ( $idle ) { $lines[] = $idle . ' team' . ( $idle === 1 ? ' has' : 's have' ) . ' had no activity for ' . self::IDLE_DAYS . ' days or more and no deposit.'; }
+        foreach ( $due as $d ) { $lines[] = 'Follow-up due: ' . $d; }
+        $m = $ov['money'] ?? [];
+        if ( ! empty( $m['tier_now'] ) && $m['tier_now'] === 'early' && isset( $m['days_left'] ) && $m['days_left'] !== null && ! empty( $m['waiting'] ) ) { $lines[] = 'The early fee ends in ' . $m['days_left'] . ' day' . ( $m['days_left'] === 1 ? '' : 's' ) . '; ' . $m['waiting'] . ' team' . ( $m['waiting'] === 1 ? '' : 's' ) . ' still to pay.'; }
+        if ( ! $lines ) { return "Nothing needs you right now. Every deposit is on its team and no team has gone quiet."; }
+        return "Captain Sync: what needs you\n\n- " . implode( "\n- ", $lines );
+    }
+
+    public static function rest_digest( WP_REST_Request $request ): WP_REST_Response {
+        $b = (array) $request->get_json_params();
+        $text = self::digest_text( self::build_overview() );
+        if ( empty( $b['send'] ) ) { return new WP_REST_Response( [ 'success' => true, 'sent' => false, 'text' => $text ], 200 ); }
+        $u = wp_get_current_user();   // only ever the signed-in admin's own address
+        if ( ! $u || ! is_email( $u->user_email ) ) { return new WP_REST_Response( [ 'success' => false, 'message' => 'Your WordPress account has no valid email address.' ], 409 ); }
+        $headers = class_exists( 'GRSH_Settings' ) && method_exists( 'GRSH_Settings', 'mail_headers' ) ? (array) GRSH_Settings::mail_headers() : [];
+        $ok = wp_mail( $u->user_email, 'Captain Sync: what needs you', $text, $headers );
+        return new WP_REST_Response( [ 'success' => (bool) $ok, 'sent' => (bool) $ok, 'to' => $u->user_email, 'text' => $text, 'message' => $ok ? 'Sent to ' . $u->user_email . '.' : 'WordPress could not send the email. Check WP Mail SMTP.' ], $ok ? 200 : 500 );
     }
 
     // -------------------------------------------------------------------------

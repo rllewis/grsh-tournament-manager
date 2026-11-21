@@ -31,10 +31,13 @@ let ov={season:{id:1,year:2027,exists:true},health:[{key:"season",ok:true,text:"
 let calls=[],posts=[];
 g.fetch=async(url,o={})=>{const m=o.method||"GET";calls.push([m,url]);const J=(j,ok=true,s=200)=>({ok,status:s,json:async()=>j});
   if(url.endsWith("/captain-sync/overview"))return J(ov);
+  if(url.includes("/captain-sync/team-detail"))return J({success:true,timeline:[],players:["A Roster"],ledger:[{label:"Deposit",amount:500,date:"2027-01-02 09:00:00",state:"paid"}],impact:{}});
   if(url.includes("/captain-sync/players"))return J({players:[{id:42,name:"Pat Player",email:"pat@x.test",account:"active"}]});
   if(m==="POST"){const b=JSON.parse(o.body);posts.push([url,b]);
     if(url.endsWith("/record")){ov={...ov,entries:ov.entries.map(e=>b.entry_ids.includes(e.entry_id)?{...e,state:"recorded"}:e),pending:0};return J({success:true,recorded:b.entry_ids.length,results:b.entry_ids.map(id=>({entry_id:id,status:"recorded",team:"T",message:"Recorded."}))});}
     if(url.endsWith("/undo"))return J({success:true,message:"Undone."});
+    if(url.endsWith("/remove-team"))return b.dry_run?J({success:true,dry_run:true,impact:{allowed:true,needs_ack:true,removes:["the team record","2 roster rows (the players themselves are kept)"],keeps:["player records"],blocked:[]}}):J({success:true,message:"Removed."});
+    if(url.endsWith("/note"))return J({success:true,message:"Note saved."});
     if(url.endsWith("/team-division"))return J({success:true,message:"Division saved."});
     if(url.endsWith("/team-captain"))return J({success:true,message:"Captain set."});
     if(url.endsWith("/restore-team"))return J({success:true,message:"Restored."});
@@ -45,7 +48,7 @@ const Page=require(path.join(root,".smoke/out/pages/CaptainSync.js")).default;
 const React=(await import(path.join(root,"node_modules/react/index.js"))).default; const {createRoot}=await import(path.join(root,"node_modules/react-dom/client.js")); const {act}=React;
 const tick=(n=40)=>new Promise(r=>setTimeout(r,n)); let fails=0; const ok=(c,m)=>{if(!c){fails++;console.log("FAIL",m)}else console.log("ok  ",m)};
 const text=()=>document.body.textContent; const btn=(t)=>[...document.querySelectorAll("button")].find(b=>b.textContent.includes(t));
-const setVal=(el,v)=>{const proto=el.tagName==="SELECT"?dom.window.HTMLSelectElement.prototype:dom.window.HTMLInputElement.prototype;dom.window.Object.getOwnPropertyDescriptor(proto,"value").set.call(el,v);el.dispatchEvent(new dom.window.Event(el.tagName==="SELECT"?"change":"input",{bubbles:true}));};
+const setVal=(el,v)=>{const proto=el.tagName==="SELECT"?dom.window.HTMLSelectElement.prototype:el.tagName==="TEXTAREA"?dom.window.HTMLTextAreaElement.prototype:dom.window.HTMLInputElement.prototype;dom.window.Object.getOwnPropertyDescriptor(proto,"value").set.call(el,v);el.dispatchEvent(new dom.window.Event(el.tagName==="SELECT"?"change":"input",{bubbles:true}));};
 const el=document.getElementById("root");const root_=createRoot(el);
 await act(async()=>{root_.render(React.createElement(Page));await tick();await tick();});
 ok(!text().includes("NaN")&&!text().includes("undefined"),"no NaN/undefined on first paint");
@@ -54,7 +57,7 @@ ok(text().includes("2 deposits never reached their teams"),"headline names pendi
 ok(document.querySelectorAll(".gc-fun-step").length===5,"5 funnel steps");
 ok(document.querySelectorAll("[role=tab]").length===5,"5 tabs");
 ok(text().includes("Do this next")&&document.querySelectorAll(".gc-act").length>=2,"next-best-action card");
-ok(text().includes("Mail not configured")&&text().includes("2 checks passed"),"failed check shown, passes collapsed");
+ok(text().includes("Mail not configured")&&text().includes("2 setup checks passed"),"failed check shown, passes collapsed");
 ok(text().includes("Division balance")&&text().includes("Women's")&&text().includes("Money")&&text().includes("$1,250.00"),"money and balance");
 ok(text().includes("status: unpaid")&&text().includes("early")&&text().includes("late"),"deposit preview both tiers");
 ok(document.querySelectorAll("tbody input[type=checkbox]").length===2,"only unrecorded entries selectable");
@@ -93,7 +96,20 @@ ok(posts.some(p=>p[0].endsWith("/team-captain")&&p[1].player_id===42),"assign ca
 // drawer
 await act(async()=>{document.querySelector(".gc-team-name").click();await tick();});
 ok(!!document.querySelector(".gc-modal.drawer")&&document.querySelectorAll(".gc-tl li").length===5,"team drawer with 5-step timeline");
-await act(async()=>{document.dispatchEvent(new dom.window.KeyboardEvent("keydown",{key:"Escape",bubbles:true}));await tick();});
+ok(text().includes("Money for this team")&&text().includes("A Roster"),"drawer loads ledger and roster");
+await act(async()=>{setVal(document.getElementById("gc-note"),"Phoned");await tick();});
+await act(async()=>{btn("Save note").click();await tick();await tick();});
+ok(posts.some(p=>p[0].endsWith("/note")&&p[1].note==="Phoned"),"note saved");
+const tname=document.querySelector(".gc-modal.drawer h2").textContent;
+await act(async()=>{btn("Remove team").click();await tick();await tick();});
+ok(posts.some(p=>p[0].endsWith("/remove-team")&&p[1].dry_run===true)&&text().includes("This will keep"),"remove shows impact first");
+const rmBtn=()=>[...document.querySelectorAll("[role=dialog] button.danger")].find(b=>b.textContent.includes("Remove team"));
+ok(rmBtn().disabled,"remove locked until reason, box and name");
+await act(async()=>{setVal(document.getElementById("gc-rm-why"),"Disbanded");setVal(document.getElementById("gc-rm-name"),tname);document.querySelector("[role=dialog] input[type=checkbox]").click();await tick();});
+ok(!rmBtn().disabled,"remove unlocked once all three are given");
+ok(!posts.some(p=>p[0].endsWith("/remove-team")&&!p[1].dry_run),"nothing removed before the click");
+await act(async()=>{rmBtn().click();await tick();await tick();});
+ok(posts.some(p=>p[0].endsWith("/remove-team")&&p[1].confirm_name===tname&&p[1].acknowledge===true&&p[1].reason==="Disbanded"),"remove posted with name, reason and acknowledgement");
 // nudge
 await act(async()=>{btn("Remind captains").click();await tick();await tick();});
 ok(text().includes("will get a short reminder")&&posts.some(p=>p[0].endsWith("/nudge")&&p[1].dry_run===true),"nudge dry-run preview first");
@@ -103,8 +119,8 @@ ok(posts.some(p=>p[0].endsWith("/nudge")&&p[1].confirm===true),"nudge send after
 // clean-up
 await act(async()=>{btn("Clean-up").click();await tick();});
 ok(text().includes("Looks like test data")&&text().includes("Test Dummy")&&text().includes("Orphan FC"),"clean-up groups");
-ok(text().includes("2 teams protected"),"protected group");
-ok(btn("Delete selected").disabled,"delete disabled with nothing selected");
+ok(text().includes("2 teams kept because of real data"),"protected group");
+ok(!document.querySelector(".gc-sticky"),"delete bar hidden with nothing selected");
 await act(async()=>{btn("Select all 1").click();await tick();});
 await act(async()=>{btn("Delete 1 team permanently").click();await tick();});
 ok(text().includes("Type DELETE to confirm"),"typed confirmation dialog");
@@ -134,6 +150,6 @@ await act(async()=>{btn("Undo").click();await tick();});
 await act(async()=>{[...document.querySelectorAll("[role=dialog] button")].find(b=>b.textContent==="Undo").click();await tick();await tick();});
 ok(posts.some(p=>p[0].endsWith("/undo")&&p[1].audit_id===7),"undo posted");
 await act(async()=>{btn("Teams").click();await tick();});
-ok(text().includes("Tahoe Champions Cup is not synced here")&&text().includes("3 entries"),"TCC read-only note");
+ok(!text().includes("Tahoe Champions Cup"),"no TCC note on the page");
 ok(!text().includes("NaN")&&!text().includes("undefined"),"no NaN/undefined at end");
 console.log(fails?`\n${fails} FAILED`:"\nall smoke checks OK"); process.exit(fails?1:0);

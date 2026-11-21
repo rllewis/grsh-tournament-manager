@@ -68,6 +68,8 @@ $grsh_includes = [
     'class-grsh-scoring.php',         // Draft score engine
     'class-grsh-sync-engine.php',     // WPForms sync + /sync REST routes
     'class-grsh-rosters.php',         // GET/POST/PATCH/DELETE /rosters — needed by Draft + Rosters pages
+    'class-grsh-board-summary.php',   // GET /tournament/board-summary — counts for the Board plugin's Player Recruitment panel
+    'class-grsh-team-review.php',     // Post-submit status, captain emails, daily waiver digest
     'class-grsh-captain-roster.php',  // Front-end self-service full-team roster registration
     'class-grsh-captain-frontend.php',// Captain shortcode + asset enqueue
     'class-grsh-captain-provision.php', // Shared name+email → WP account + team (used by Invite + Signup)
@@ -76,6 +78,7 @@ $grsh_includes = [
     'class-grsh-captain-sync.php',    // Captain Sync: reconciles team-form deposits (GRSH only)
     'class-grsh-admin-full-teams.php',// Board view/edit/override for full-team rosters
     'class-grsh-alternates.php',      // Alternates REST routes
+    'class-grsh-player-removal.php',  // Admin-only Remove player (impact preview, undo)
     'class-grsh-renewals.php',        // Renewal invites for returning players (email + tracked link)
     'class-grsh-sub-requests.php',    // Alternates: sub requests, meta, log
     'class-grsh-draft.php',           // Server-side snake draft (picks saved, captain phone links, publish)
@@ -87,7 +90,8 @@ $grsh_includes = [
     'class-grsh-score-sheets.php',    // Batch print-ready game score sheets, rosters auto-filled
     'class-grsh-team-deposit.php',    // Full-team $500 deposit + balance reminder (fee_total set by staff)
     'class-grsh-welcome-packet.php',  // Print-ready captain welcome packet (Invite Captain Round 3)
-    'class-grsh-waiver-page.php',     // Standalone token-gated roster-player waiver signing page
+    'class-grsh-waiver-page.php',     // Standalone token-gated roster-player waiver signing page (legacy, no longer emailed)
+    'class-grsh-waiver-wpforms.php',  // WPForms v2 waiver link + signed-status sync (replaces the above for new emails)
 ];
 
 foreach ( $grsh_includes as $grsh_file ) {
@@ -134,6 +138,9 @@ function grsh_deactivate(): void {
     if ( class_exists( 'GRSH_Team_Deposit' ) ) {
         GRSH_Team_Deposit::unschedule();
     }
+    if ( class_exists( 'GRSH_Team_Review' ) ) {
+        GRSH_Team_Review::unschedule();
+    }
     flush_rewrite_rules();
 }
 register_deactivation_hook( GRSH_PLUGIN_FILE, 'grsh_deactivate' );
@@ -173,6 +180,7 @@ function grsh_bootstrap(): void {
     elseif ( class_exists( 'GRSH_Players' ) )    { GRSH_Players::register_hooks(); }
     if ( class_exists( 'GRSH_Sync_Engine' ) )    { GRSH_Sync_Engine::register_hooks(); }
     if ( class_exists( 'GRSH_Rosters' ) )        { GRSH_Rosters::register_hooks(); }
+    if ( class_exists( 'GRSH_Board_Summary' ) )  { GRSH_Board_Summary::register_hooks(); }
     if ( class_exists( 'GRSH_Captain_Roster' ) )   { GRSH_Captain_Roster::register_hooks(); }
     if ( class_exists( 'GRSH_Captain_Frontend' ) ) { GRSH_Captain_Frontend::register_hooks(); }
     // GRSH_Captain_Provision is a static-only helper (no hooks of its own) —
@@ -183,6 +191,7 @@ function grsh_bootstrap(): void {
     if ( class_exists( 'GRSH_Captain_Sync' ) )     { GRSH_Captain_Sync::register_hooks(); }
     if ( class_exists( 'GRSH_Admin_Full_Teams' ) ) { GRSH_Admin_Full_Teams::register_hooks(); }
     if ( class_exists( 'GRSH_Alternates' ) )     { GRSH_Alternates::register_hooks(); }
+    if ( class_exists( 'GRSH_Player_Removal' ) ) { GRSH_Player_Removal::register_hooks(); }
     if ( class_exists( 'GRSH_Renewals' ) )       { GRSH_Renewals::register_hooks(); }
     if ( class_exists( 'GRSH_Sub_Requests' ) )   { GRSH_Sub_Requests::register_hooks(); }
     if ( class_exists( 'GRSH_Draft' ) )          { GRSH_Draft::register_hooks(); }
@@ -197,6 +206,8 @@ function grsh_bootstrap(): void {
     if ( class_exists( 'GRSH_Team_Deposit' ) )   { GRSH_Team_Deposit::register_hooks(); }
     if ( class_exists( 'GRSH_Welcome_Packet' ) ) { GRSH_Welcome_Packet::register_hooks(); }
     if ( class_exists( 'GRSH_Waiver_Page' ) )    { GRSH_Waiver_Page::register_hooks(); }
+    if ( class_exists( 'GRSH_Waiver_WPForms' ) ) { GRSH_Waiver_WPForms::register_hooks(); }
+if ( class_exists( 'GRSH_Team_Review' ) )     { GRSH_Team_Review::register_hooks(); }
 
     // Admin-only: menu, notices, assets.
     add_action( 'admin_menu',            'grsh_register_admin_menu' );

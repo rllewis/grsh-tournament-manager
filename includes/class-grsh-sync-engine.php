@@ -752,9 +752,19 @@ class GRSH_Sync_Engine {
     private function entry_already_imported( int $entry_id ): bool {
         global $wpdb;
 
-        return (bool) $wpdb->get_var( $wpdb->prepare(
+        if ( $wpdb->get_var( $wpdb->prepare(
             "SELECT id FROM {$wpdb->prefix}grsh_registrations
              WHERE wpforms_entry_id = %d LIMIT 1",
+            $entry_id
+        ) ) ) {
+            return true;
+        }
+
+        // An alternate an admin removed on purpose: do not bring them back
+        // from the same form entry (see GRSH_Alternates::remove_alternate).
+        return (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}grsh_audit_logs
+             WHERE action = 'alternate_removed_tombstone' AND object_id = %d LIMIT 1",
             $entry_id
         ) );
     }

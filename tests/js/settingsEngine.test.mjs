@@ -106,4 +106,44 @@ const p = E.buildPayload({ ...good(), _last_saved_at: "x", form_id: "5047", time
 eq(p.form_id, 5047, "form id to number"); eq(p.timer_seconds, "", "blank stays blank for the server to name"); eq(p.divisions[0].teams, 4, "division number"); ok(!("_last_saved_at" in p), "private keys stripped"); eq(p.base_saved_at, "2026-11-17 10:00:00", "conflict token sent"); eq(p.player_fee, null, "blank fee -> null");
 eq(E.wiringState({ a: { state: "not_connected" } }, "a"), "not_connected", "wiring state"); eq(E.wiringState({}, "zzz"), "active", "unknown defaults to active");
 
+console.log("7. division format, what-if, forecast, gate");
+const mkd = (o) => ({ key: "x", label: "X", enabled: true, teams: 4, min_roster: 8, max_roster: 12, goalie_min: 1, goalie_max: 2, ...o });
+eq(E.fillDivision(mkd({})).format, "both", "missing format = both (old behaviour)"); eq(E.fillDivision(mkd({})).reg_teams, 0, "missing slots = 0");
+eq(E.fillDivision(mkd({ format: "teams", reg_teams: 0 })).reg_teams, 4, "teams format = every slot registered"); eq(E.fillDivision(mkd({ format: "draft", reg_teams: 3 })).reg_teams, 0, "draft format = no registered slots");
+eq(E.fillDivision(mkd({ format: "both", reg_teams: 9 })).reg_teams, 4, "slots clamp to team count"); eq(E.fillDivision(mkd({ format: "nonsense" })).format, "both", "unknown format falls back to both");
+eq(E.slotSplit(mkd({ format: "both", reg_teams: 1 })), { draft: 3, teams: 1, total: 4 }, "4 teams, 1 registered = 3 draft + 1"); eq(E.slotSplit(mkd({ teams: "" })).draft, null, "blank teams -> unknown");
+eq(E.capacity(mkd({})), { slots: 48, needed: 32, goalies: 4 }, "capacity unchanged for a format-less division");
+eq(E.capacity(mkd({ format: "both", reg_teams: 1 })), { slots: 36, needed: 24, goalies: 3 }, "capacity counts only the 3 draft slots");
+eq(E.capacity(mkd({ format: "teams" })), { slots: 0, needed: 0, goalies: 0 }, "a teams division draws nothing from the player pool");
+const w1 = E.whatIf(mkd({}), { registered: 30, goalies: 2 });
+eq([w1.spotsLeft, w1.needMore, w1.goalieGap, w1.runs, w1.pct], [18, 2, 2, false, 63], "what-if: 18 spots left, needs 2 more players and 2 more goalies");
+const w2 = E.whatIf(mkd({}), { registered: 34, goalies: 4 }); ok(w2.runs && w2.needMore === 0 && w2.goalieGap === 0, "what-if: enough players and goalies means it runs");
+const w3 = E.whatIf(mkd({ format: "both", reg_teams: 2 }), { registered: 10, goalies: 1, full_teams: 1 }); eq([w3.draftSlots, w3.teamSlots, w3.teamsLeft, w3.teamsFull], [2, 2, 1, false], "what-if both: draft and team slots tracked apart");
+const w4 = E.whatIf(mkd({ format: "teams" }), { full_teams: 4 }); ok(w4.teamsFull && w4.spotsLeft === undefined, "teams division: full when all registered teams are in, no draft maths");
+eq(E.whatIf(mkd({ teams: "" }), {}), null, "what-if is null while teams is blank");
+const bad2 = E.validate({ ...good(), divisions: [mkd({ format: "weird" }), mkd({ key: "y", format: "both", reg_teams: 9 })] });
+ok(bad2["divisions.0.format"] && bad2["divisions.1.reg_teams"], "validate: bad format and too many registered slots");
+ok(!E.validate({ ...good(), divisions: [mkd({ format: "both", reg_teams: 2 })] })["divisions.0.reg_teams"], "validate: a valid split is accepted");
+ok(!E.validate({ ...good(), divisions: [mkd({})] })["divisions.0.format"], "validate: a row without format is fine");
+const ch = E.diff({ ...good(), divisions: [mkd({ format: "both", reg_teams: 0 })] }, { ...good(), divisions: [mkd({ format: "teams" })] }); ok(ch.some(c => c.key === "divisions.x.format" && c.to === "Registered teams" && c.from === "Both"), "diff shows the format with readable names");
+const ww = E.divisionWarnings({ ...good(), divisions: [mkd({ format: "both" })] }, { ...good(), divisions: [mkd({ format: "draft" })] }, { x: { registered: 0, full_teams: 2 } });
+ok(ww.some(m => /going to Draft but has 2 registered teams/.test(m)), "warns when switching to draft with registered teams");
+const ww2 = E.divisionWarnings({ ...good(), divisions: [mkd({ format: "both" })] }, { ...good(), divisions: [mkd({ format: "teams" })] }, { x: { registered: 0, teams: 1 } }); ok(ww2.some(m => /going to Registered teams but has 1 draft team\./.test(m)), "warns when switching to teams with draft teams");
+eq(E.divisionWarnings({ ...good(), divisions: [mkd({ format: "teams" })] }, { ...good(), divisions: [mkd({ format: "teams" })] }, { x: { registered: 99 } }), [], "a teams division is not warned about the player pool");
+const f1 = E.revenueForecast({ ...good(), team_deposit_amount: 500, team_fee_early_amount: 1750, team_fee_late_amount: 2000, player_fee: 100, divisions: [mkd({ format: "both", reg_teams: 2 }), mkd({ key: "y", format: "draft" }), mkd({ key: "z", format: "teams", teams: 3, enabled: false })] }, { x: { registered: 20 }, y: { registered: 10 } });
+eq([f1.teamSlots, f1.deposits, f1.earlyTotal, f1.lateTotal, f1.upsideIfLate, f1.players, f1.playerRevenue], [2, 1000, 3500, 4000, 500, 30, 3000], "forecast counts only enabled registered-team slots and registered players");
+eq(E.revenueForecast({ ...good(), player_fee: null, divisions: [mkd({})] }, {}).playerRevenue, null, "no player fee -> no player revenue guess");
+const gt = E.gate({ open: [{ level: "ok", text: "a" }, { level: "block", text: "b" }, { level: "warn", text: "c" }] }, "open"); eq([gt.blockers.length, gt.warnings.length, gt.ok.length], [1, 1, 1], "gate splits blockers, warnings, ok"); eq(E.gate({}, "locked").blockers, [], "gate on an unknown status is empty");
+const pl = E.buildPayload({ ...good(), divisions: [mkd({ teams: "4", format: "both", reg_teams: "1" })] }, ""); eq([pl.divisions[0].format, pl.divisions[0].reg_teams], ["both", 1], "payload carries format and numeric slots");
+const pl2 = E.buildPayload({ ...good(), divisions: [mkd({})] }, ""); eq(pl2.divisions[0].format, "both", "payload fills a missing format with both");
+
+const ie = (o, n, r) => E.impactErrors({ ...good(), divisions: [mkd(o)] }, { ...good(), divisions: [mkd(n)] }, r);
+ok(/2 registered teams already exist/.test(ie({ format: "both" }, { format: "draft" }, { x: { full_teams: 2 } })["divisions.0.format"]), "impact: draft while registered teams exist");
+ok(/1 draft team already exist/.test(ie({ format: "both" }, { format: "teams" }, { x: { teams: 1 } })["divisions.0.format"]), "impact: teams while draft teams exist");
+ok(ie({ teams: 4 }, { teams: 1 }, { x: { teams: 2 } })["divisions.0.teams"], "impact: teams below the number created");
+eq(ie({ teams: 4 }, { teams: 2 }, { x: { teams: 1, full_teams: 1 } }), {}, "impact: teams equal to the number created is fine");
+ok(ie({ max_roster: 12 }, { max_roster: 8 }, { x: { max_roster_n: 10 } })["divisions.0.max_roster"], "impact: max roster below the biggest roster");
+eq(ie({ teams: 1, format: "draft" }, { teams: 1, format: "draft" }, { x: { teams: 3, full_teams: 3, max_roster_n: 99 } }), {}, "impact: an unchanged off-spec division never locks the page");
+eq(E.impactErrors({ ...good(), divisions: [mkd({})] }, { ...good(), divisions: [mkd({ key: "new", format: "draft" })] }, { new: { full_teams: 5 } }), {}, "impact: a brand-new division is not checked");
+
 console.log(`\nPASS ${pass}  FAIL ${fail}`); process.exit(fail ? 1 : 0);

@@ -132,15 +132,16 @@ function fresh_db( $file ) {
     CREATE TABLE wp_grsh_players (id INTEGER PRIMARY KEY AUTOINCREMENT, first_name TEXT, last_name TEXT, email TEXT, position TEXT, is_goalie INT DEFAULT 0,
         skill_tier_reported TEXT, skill_tier_assigned TEXT, sandbagging_flag INT DEFAULT 0, years_experience INT, is_alternate INT DEFAULT 0);
     CREATE TABLE wp_grsh_registrations (id INTEGER PRIMARY KEY AUTOINCREMENT, player_id INT, season_id INT, status TEXT DEFAULT 'registered', player_type TEXT DEFAULT 'primary',
-        division_requested TEXT, age INT, payment_status TEXT DEFAULT 'paid');
+        division_requested TEXT, age INT, payment_status TEXT DEFAULT 'paid', amount_paid REAL DEFAULT 0);
     CREATE TABLE wp_grsh_teams (id INTEGER PRIMARY KEY AUTOINCREMENT, season_id INT, division TEXT, team_type TEXT DEFAULT 'draft', name TEXT, colour TEXT,
-        captain_player_id INT, draft_order INT, draft_locked INT DEFAULT 0);
+        captain_player_id INT, draft_order INT, draft_locked INT DEFAULT 0,
+        fee_total REAL, deposit_amount REAL, deposit_paid_at TEXT, balance_due REAL, payment_status TEXT DEFAULT 'unpaid');
     CREATE TABLE wp_grsh_rosters (id INTEGER PRIMARY KEY AUTOINCREMENT, season_id INT, team_id INT, player_id INT, registration_id INT, assignment_type TEXT DEFAULT 'manual',
         draft_round INT, draft_pick INT, is_captain INT DEFAULT 0, is_alternate INT DEFAULT 0, jersey_number INT, position_assigned TEXT, skill_tier_at_draft TEXT,
         assigned_by INT, assigned_at TEXT, UNIQUE (player_id, team_id));
     CREATE TABLE wp_grsh_player_history (id INTEGER PRIMARY KEY AUTOINCREMENT, player_id INT, season_id INT);
     CREATE TABLE wp_grsh_audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, season_id INT, wp_user_id INT, user_display TEXT, action TEXT, object_type TEXT, object_id INT,
-        after_value TEXT, notes TEXT, ip_address TEXT);
+        before_value TEXT, after_value TEXT, notes TEXT, ip_address TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
     " );
     $wpdb->pdo->exec( "INSERT INTO wp_grsh_seasons (id, season_year) VALUES (1, 2027), (2, 2026)" );
     return $wpdb;

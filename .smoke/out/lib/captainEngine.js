@@ -3,7 +3,7 @@
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-exports.TEST_REASON = exports.STAGES = exports.ENTRY_STATES = exports.DELETE_WORD = void 0;
+exports.TEST_REASON = exports.STAGES = exports.NOTE_TAGS = exports.IDLE_DAYS = exports.ENTRY_STATES = exports.DELETE_WORD = void 0;
 exports.actionQueue = actionQueue;
 exports.ageLabel = void 0;
 exports.balanceStatus = balanceStatus;
@@ -18,18 +18,25 @@ exports.filterTeams = filterTeams;
 exports.filterTeamsMore = filterTeamsMore;
 exports.funnelSteps = funnelSteps;
 exports.groupIssues = groupIssues;
+exports.healthLabel = healthLabel;
 exports.healthSummary = healthSummary;
 exports.historyTitle = historyTitle;
+exports.idleFlag = idleFlag;
 exports.issueCounts = issueCounts;
 exports.money = void 0;
 exports.nextStep = nextStep;
+exports.noteTagLabel = void 0;
 exports.nudgeCandidates = nudgeCandidates;
 exports.problemTeamIds = void 0;
+exports.protectedHelp = protectedHelp;
+exports.readiness = readiness;
 exports.recordSummary = recordSummary;
-exports.statusLabel = exports.stageIndex = void 0;
+exports.removalLines = removalLines;
+exports.statusLabel = exports.stageIndex = exports.removalReady = void 0;
 exports.stuckDays = stuckDays;
 exports.stuckTone = void 0;
 exports.tallyResults = tallyResults;
+exports.teamFeeLine = teamFeeLine;
 exports.teamsCSV = teamsCSV;
 exports.testReasons = void 0;
 exports.verdict = verdict;
@@ -67,12 +74,15 @@ function funnelSteps(teams) {
   const total = (teams || []).length;
   return STAGES.map((s, i) => {
     const n = (teams || []).filter(t => stageIndex(t.stage) >= i).length;
+    // Percentages mean nothing with a handful of teams, so callers show "n of total" and only show pct when showPct is true.
     return {
       key: s.key,
       label: s.label,
       help: s.help,
       n,
-      pct: total ? Math.round(n / total * 100) : 0
+      total,
+      pct: total ? Math.round(n / total * 100) : 0,
+      showPct: total >= 8
     };
   });
 }
@@ -343,7 +353,19 @@ function healthSummary(health) {
     allOk: failed.length === 0 && list.length > 0
   };
 }
+
+// The wiring checks say nothing about deposits. When the page headline is not green, say so, so the two never look contradictory.
+function healthLabel(hs, v) {
+  if (!hs || !hs.okCount) return "";
+  const calm = !v || v.tone === "ok";
+  if (hs.allOk) return calm ? `Setup checks: all ${hs.okCount} passed` : `Setup is fine (${hs.okCount} checks). The problem above is in the data, not the wiring.`;
+  return `${hs.okCount} setup checks passed`;
+}
 function balanceStatus(row) {
+  if (row && row.format === "draft") return {
+    tone: "mute",
+    label: row.actual ? `Draft division, ${row.actual} registered` : "Draft"
+  };
   if (!row || row.expected === null || row.expected === undefined) return {
     tone: "mute",
     label: `${row.actual} team${row.actual === 1 ? "" : "s"}`
@@ -467,6 +489,10 @@ function filterTeamsMore(teams, {
 }
 function historyTitle(a) {
   return {
+    captain_sync_invite_revoked: "Invite link revoked",
+    captain_sync_captain_detached: "Captain detached",
+    captain_sync_captain_reattached: "Captain put back",
+    captain_sync_note: "Note",
     captain_sync_deposit: "Deposit recorded",
     captain_sync_undo: "Deposit removed (undo)",
     captain_sync_division: "Division changed",
@@ -474,4 +500,102 @@ function historyTitle(a) {
     captain_sync_team_restored: "Team restored",
     captain_sync_captain: "Captain changed"
   }[a] || a;
+}
+const NOTE_TAGS = exports.NOTE_TAGS = [{
+  key: "",
+  label: "No tag"
+}, {
+  key: "phoned",
+  label: "Phoned"
+}, {
+  key: "paying_by_check",
+  label: "Paying by check"
+}, {
+  key: "waiting",
+  label: "Waiting on them"
+}, {
+  key: "dropped",
+  label: "May drop out"
+}, {
+  key: "vip",
+  label: "Keep close"
+}];
+const noteTagLabel = k => (NOTE_TAGS.find(t => t.key === k) || {}).label || "";
+exports.noteTagLabel = noteTagLabel;
+const IDLE_DAYS = exports.IDLE_DAYS = 14;
+
+// Can this team field a roster yet? One badge, one reason.
+function readiness(t) {
+  if (!t) return {
+    tone: "mute",
+    label: "Unknown",
+    why: ""
+  };
+  const need = t.min_players || 0;
+  const have = t.roster_size || 0;
+  if (!t.captain) return {
+    tone: "bad",
+    label: "No captain",
+    why: "Nobody can log in to build a roster."
+  };
+  if (!have) return {
+    tone: "bad",
+    label: "No roster",
+    why: "No players added yet."
+  };
+  if (need && have < need) return {
+    tone: "warn",
+    label: `${need - have} short`,
+    why: `${have} of ${need} players.`
+  };
+  if (!t.deposit_paid_at) return {
+    tone: "info",
+    label: "Roster ready, no deposit",
+    why: "Roster is full but no deposit is recorded."
+  };
+  return {
+    tone: "ok",
+    label: "Ready",
+    why: "Roster is full and the deposit is in."
+  };
+}
+
+// A team with no deposit and no activity for a while. Teams that paid are never idle.
+function idleFlag(t) {
+  if (!t || t.idle_days === null || t.idle_days === undefined || t.idle_days < IDLE_DAYS) return null;
+  return {
+    tone: t.idle_days >= 30 ? "bad" : "warn",
+    label: `Quiet ${t.idle_days} days`
+  };
+}
+
+// Per-team early fee: what this team would save by paying before the cutoff.
+function teamFeeLine(t, m) {
+  if (!t || !m || t.deposit_paid_at) return "";
+  if (m.tier_now === "early" && m.days_left !== null && m.days_left !== undefined) return `Pays ${money(m.fee_now)} if they pay in ${(0, _importEngine.plural)(m.days_left, "day")}, ${money((m.fee_now || 0) + (m.saves_per_team || 0))} after.`;
+  if (m.tier_now === "late") return `Early fee has ended. They owe ${money(m.fee_now)}.`;
+  return "";
+}
+
+// What the Remove dialog tells the person before they type anything.
+function removalLines(impact) {
+  if (!impact) return {
+    removes: [],
+    keeps: [],
+    blocked: []
+  };
+  return {
+    removes: impact.removes || [],
+    keeps: impact.keeps || [],
+    blocked: impact.blocked || []
+  };
+}
+const removalReady = (impact, name, typed, reason, ack) => !!impact && impact.allowed !== false && String(typed || "").trim().toLowerCase() === String(name || "").trim().toLowerCase() && String(name || "").trim() !== "" && String(reason || "").trim().length >= 3 && (!impact.needs_ack || !!ack);
+
+// Why a team is protected, and the honest next step.
+exports.removalReady = removalReady;
+function protectedHelp(t) {
+  const reasons = t && t.delete && t.delete.reasons || [];
+  if (!reasons.length) return "";
+  return `Kept because it has ${reasons.join(" and ")}. Open the team and use Remove team to take it out on purpose; you will see exactly what goes first, and History can bring it back.`;
 }

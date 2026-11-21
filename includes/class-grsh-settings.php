@@ -35,6 +35,8 @@ class GRSH_Settings {
     const STATUSES     = [ 'setup', 'open', 'draft', 'locked', 'complete' ];
     const DRAFT_TYPES  = [ 'snake', 'linear', 'auto_balance' ];
     const DRAFT_ORDERS = [ 'random', 'weighted', 'lottery', 'manual' ];
+    /** How a division fills its teams: draft pool, captain-registered teams, or a mix. A missing value means 'both' (the old behaviour). */
+    const FORMATS      = [ 'draft', 'teams', 'both' ];
 
     public static function register_hooks(): void {
         add_action( 'rest_api_init', [ __CLASS__, 'register_routes' ] );
@@ -76,6 +78,7 @@ class GRSH_Settings {
         }
         // Player fee lives in its own option so the Reports page and this page edit the same number.
         $fee = get_option( self::FEE_OPT, '' );
+        $merged['divisions'] = array_map( [ __CLASS__, 'fill_division' ], (array) $merged['divisions'] );
         $merged['player_fee'] = ( $fee !== '' && $fee !== false && (float) $fee > 0 ) ? round( (float) $fee, 2 ) : null;
         $merged['season_year'] = self::locked_year();
         return $merged;
@@ -85,6 +88,40 @@ class GRSH_Settings {
         $settings  = self::get();
         $divisions = $settings['divisions'] ?? [];
         return array_values( array_filter( $divisions, function ( $d ) { return ! empty( $d['enabled'] ); } ) );
+    }
+
+    /** Give a saved division row the format fields it may not have yet. Missing format = 'both', so nothing changes until someone picks one. */
+    public static function fill_division( $d ): array {
+        $d = (array) $d;
+        $f = isset( $d['format'] ) && in_array( $d['format'], self::FORMATS, true ) ? $d['format'] : 'both';
+        $d['format'] = $f;
+        $t = (int) ( $d['teams'] ?? 0 );
+        $r = (int) ( $d['reg_teams'] ?? 0 );
+        $d['reg_teams'] = $f === 'draft' ? 0 : ( $f === 'teams' ? $t : max( 0, min( $t, $r ) ) );
+        return $d;
+    }
+
+    /** Format of one division by key ('both' when unknown, so an unrecognised key is never blocked). */
+    public static function division_format( string $key ): string {
+        foreach ( (array) ( self::get()['divisions'] ?? [] ) as $d ) {
+            if ( ( $d['key'] ?? '' ) === $key ) { return self::fill_division( $d )['format']; }
+        }
+        return 'both';
+    }
+
+    /** Enabled divisions that can hold a given kind of team: 'full_team' (registered team) or 'draft'. */
+    public static function divisions_for( string $type ): array {
+        return array_values( array_filter( self::get_active_divisions(), function ( $d ) use ( $type ) {
+            $f = self::fill_division( $d )['format'];
+            return $f === 'both' || ( $type === 'full_team' ? $f === 'teams' : $f === 'draft' );
+        } ) );
+    }
+
+    /** [ draft slots, registered-team slots ] for a division row. */
+    public static function slots( array $d ): array {
+        $d = self::fill_division( $d );
+        $t = (int) $d['teams'];
+        return [ $t - (int) $d['reg_teams'], (int) $d['reg_teams'] ];
     }
 
     /** Draft clock default (seconds) from Settings, clamped to what the Draft page allows. */
@@ -149,8 +186,39 @@ class GRSH_Settings {
             $n = count( $r['errors'] );
             return new WP_REST_Response( [ 'error' => 'Fix ' . $n . ' problem' . ( $n === 1 ? '' : 's' ) . ' before saving.', 'errors' => $r['errors'] ], 422 );
         }
+        $imp = self::impact_errors( $r['clean'], $cur );
+        if ( $imp ) {
+            $n = count( $imp );
+            return new WP_REST_Response( [ 'error' => $n . ' change' . ( $n === 1 ? '' : 's' ) . ' would break teams that already exist.', 'errors' => $imp ], 422 );
+        }
         $res = self::commit( $r['clean'], $cur, 'Saved from Settings' );
         return new WP_REST_Response( $res, 200 );
+    }
+
+    /**
+     * Things a save would break in data that already exists. Only values that CHANGED are checked,
+     * so a division that was already off-spec never locks the whole page.
+     * @return array<string,string> errors keyed like normalize() errors
+     */
+    public static function impact_errors( array $clean, array $cur ): array {
+        $e = [];
+        $m = self::metrics( $clean );
+        $old = [];
+        foreach ( (array) ( $cur['divisions'] ?? [] ) as $d ) { $old[ $d['key'] ] = self::fill_division( $d ); }
+        foreach ( array_values( (array) ( $clean['divisions'] ?? [] ) ) as $i => $d ) {
+            if ( empty( $d['enabled'] ) ) { continue; }
+            $x = ( $m['by_div'][ $d['key'] ] ?? [] ) + [ 'teams' => 0, 'full_teams' => 0, 'max_roster_n' => 0 ];
+            $was = $old[ $d['key'] ] ?? null;
+            $p = 'divisions.' . $i . '.';
+            if ( $was && $was['format'] !== $d['format'] ) {
+                if ( $d['format'] === 'draft' && $x['full_teams'] > 0 ) { $e[ $p . 'format' ] = $x['full_teams'] . ' registered team' . ( $x['full_teams'] === 1 ? '' : 's' ) . ' already exist in ' . $d['label'] . '. Remove or move them before switching to Draft.'; }
+                if ( $d['format'] === 'teams' && $x['teams'] > 0 ) { $e[ $p . 'format' ] = $x['teams'] . ' draft team' . ( $x['teams'] === 1 ? '' : 's' ) . ' already exist in ' . $d['label'] . '. Remove them before switching to Registered teams.'; }
+            }
+            $made = (int) $x['teams'] + (int) $x['full_teams'];
+            if ( $was && (int) $was['teams'] !== (int) $d['teams'] && (int) $d['teams'] < $made ) { $e[ $p . 'teams' ] = $d['label'] . ' already has ' . $made . ' team' . ( $made === 1 ? '' : 's' ) . ' created, so it cannot go below that.'; }
+            if ( $was && (int) $was['max_roster'] !== (int) $d['max_roster'] && (int) $d['max_roster'] < (int) $x['max_roster_n'] ) { $e[ $p . 'max_roster' ] = 'A ' . $d['label'] . ' team already has ' . (int) $x['max_roster_n'] . ' players, so the max cannot go below that.'; }
+        }
+        return $e;
     }
 
     public static function post_restore( WP_REST_Request $request ): WP_REST_Response {
@@ -169,6 +237,8 @@ class GRSH_Settings {
         if ( $r['errors'] ) {
             return new WP_REST_Response( [ 'error' => 'That version no longer passes today\'s rules: ' . implode( ' ', array_slice( array_values( $r['errors'] ), 0, 3 ) ), 'errors' => $r['errors'] ], 422 );
         }
+        $imp = self::impact_errors( $r['clean'], $cur );
+        if ( $imp ) { return new WP_REST_Response( [ 'error' => 'That version would break teams that already exist: ' . implode( ' ', array_slice( array_values( $imp ), 0, 2 ) ), 'errors' => $imp ], 422 ); }
         $res = self::commit( $r['clean'], $cur, 'Restored the version from ' . $hit['at'] );
         return new WP_REST_Response( $res, 200 );
     }
@@ -325,11 +395,23 @@ class GRSH_Settings {
                     $seen[ $key ] = true;
                     if ( $label === '' ) { $e[ $p . 'label' ] = 'Division name is required.'; }
                     $row = [ 'key' => $key, 'label' => $label, 'enabled' => ! empty( $d['enabled'] ) ];
+                    // Format: keep the saved one when the caller does not send it (older clients), else validate.
+                    $was = 'both'; $was_reg = 0;
+                    foreach ( (array) ( $cur['divisions'] ?? [] ) as $cd ) { if ( ( $cd['key'] ?? '' ) === $key ) { $cf = self::fill_division( $cd ); $was = $cf['format']; $was_reg = (int) $cf['reg_teams']; } }
+                    $fmt = array_key_exists( 'format', $d ) ? (string) $d['format'] : $was;
+                    if ( ! in_array( $fmt, self::FORMATS, true ) ) { $e[ $p . 'format' ] = 'Format must be Draft, Registered teams or Both.'; $fmt = 'both'; }
+                    $row['format'] = $fmt;
                     foreach ( [ 'teams' => [ 1, 16, 'Teams' ], 'min_roster' => [ 4, 30, 'Min roster' ], 'max_roster' => [ 4, 40, 'Max roster' ], 'goalie_min' => [ 0, 4, 'Min goalies' ], 'goalie_max' => [ 0, 6, 'Max goalies' ] ] as $f => $rule ) {
                         $n = self::num( $d[ $f ] ?? null );
                         if ( $n === null || floor( $n ) != $n || $n < $rule[0] || $n > $rule[1] ) { $e[ $p . $f ] = $rule[2] . ' must be a whole number from ' . $rule[0] . ' to ' . $rule[1] . '.'; $row[ $f ] = null; }
                         else { $row[ $f ] = (int) $n; }
                     }
+                    $regn = array_key_exists( 'reg_teams', $d ) ? self::num( $d['reg_teams'] ) : $was_reg;
+                    if ( $regn === null || floor( $regn ) != $regn || $regn < 0 ) { $e[ $p . 'reg_teams' ] = 'Registered-team slots must be a whole number, 0 or more.'; $regn = 0; }
+                    if ( $row['format'] === 'draft' ) { $regn = 0; }
+                    elseif ( $row['format'] === 'teams' ) { $regn = (int) $row['teams']; }
+                    elseif ( $row['teams'] !== null && $regn > $row['teams'] ) { $e[ $p . 'reg_teams' ] = 'More registered-team slots than teams in the division.'; }
+                    $row['reg_teams'] = (int) $regn;
                     if ( $row['min_roster'] !== null && $row['max_roster'] !== null && $row['max_roster'] < $row['min_roster'] ) { $e[ $p . 'max_roster' ] = 'Max roster is below min roster.'; }
                     if ( $row['goalie_min'] !== null && $row['goalie_max'] !== null && $row['goalie_max'] < $row['goalie_min'] ) { $e[ $p . 'goalie_max' ] = 'Max goalies is below min goalies.'; }
                     if ( $row['goalie_max'] !== null && $row['max_roster'] !== null && $row['goalie_max'] > $row['max_roster'] ) { $e[ $p . 'goalie_max' ] = 'More goalie spots than roster spots.'; }
@@ -351,7 +433,7 @@ class GRSH_Settings {
             $f[ $k ] = $v;
         }
         foreach ( (array) ( $s['divisions'] ?? [] ) as $d ) {
-            foreach ( [ 'enabled', 'teams', 'min_roster', 'max_roster', 'goalie_min', 'goalie_max', 'label' ] as $x ) {
+            foreach ( [ 'enabled', 'format', 'reg_teams', 'teams', 'min_roster', 'max_roster', 'goalie_min', 'goalie_max', 'label' ] as $x ) {
                 $f[ 'divisions.' . ( $d['key'] ?? '?' ) . '.' . $x ] = $d[ $x ] ?? null;
             }
         }
@@ -459,7 +541,7 @@ class GRSH_Settings {
         $m = [ 'total' => 0, 'by_div' => [], 'teams' => [], 'unassigned' => 0, 'roster' => [] ];
         $divs = (array) ( $s['divisions'] ?? [] );
         $idx = [];
-        foreach ( $divs as $d ) { $idx[ self::nk( $d['key'] ) ] = $d['key']; $idx[ self::nk( $d['label'] ) ] = $d['key']; $m['by_div'][ $d['key'] ] = [ 'registered' => 0, 'goalies' => 0, 'teams' => 0, 'no_captain' => 0 ]; }
+        foreach ( $divs as $d ) { $idx[ self::nk( $d['key'] ) ] = $d['key']; $idx[ self::nk( $d['label'] ) ] = $d['key']; $m['by_div'][ $d['key'] ] = [ 'registered' => 0, 'goalies' => 0, 'teams' => 0, 'no_captain' => 0, 'full_teams' => 0, 'max_roster_n' => 0 ]; }
         $sid = self::season_row_id();
         if ( ! $sid ) { return $m; }
         $p = $wpdb->prefix;
@@ -479,6 +561,12 @@ class GRSH_Settings {
             $m['by_div'][ $k ]['teams']++;
             if ( empty( $t['captain_player_id'] ) ) { $m['by_div'][ $k ]['no_captain']++; }
             $m['roster'][] = [ 'division' => $k, 'team' => $t['name'], 'n' => (int) $t['n'] ];
+            if ( (int) $t['n'] > $m['by_div'][ $k ]['max_roster_n'] ) { $m['by_div'][ $k ]['max_roster_n'] = (int) $t['n']; }
+        }
+        $fts = $wpdb->get_results( $wpdb->prepare( "SELECT t.division, COUNT(*) AS n FROM {$p}grsh_teams t WHERE t.season_id = %d AND t.team_type = 'full_team' GROUP BY t.division", $sid ), ARRAY_A ) ?: [];
+        foreach ( $fts as $t ) {
+            $k = $idx[ self::nk( $t['division'] ) ] ?? null;
+            if ( $k !== null ) { $m['by_div'][ $k ]['full_teams'] += (int) $t['n']; }
         }
         $m['unassigned'] = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$p}grsh_registrations r WHERE r.season_id = %d AND r.player_type = 'primary' AND r.status NOT IN ('withdrawn','waitlist')
             AND NOT EXISTS (SELECT 1 FROM {$p}grsh_rosters ro WHERE ro.player_id = r.player_id AND ro.season_id = r.season_id)", $sid ) );
@@ -498,13 +586,21 @@ class GRSH_Settings {
 
         $out['draft'][] = $m['total'] > 0 ? $c( 'ok', $m['total'] . ' players registered.' ) : $c( 'block', 'Nobody has registered yet.' );
         foreach ( $enabled as $d ) {
-            $x = $m['by_div'][ $d['key'] ] ?? [ 'registered' => 0, 'goalies' => 0, 'teams' => 0, 'no_captain' => 0 ];
-            $need = (int) $d['teams'] * (int) $d['min_roster'];
-            if ( $x['registered'] < $need ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['registered'] . ' registered, ' . $need . ' needed for ' . $d['teams'] . ' teams.', 'divisions' ); }
-            $gneed = (int) $d['teams'] * (int) $d['goalie_min'];
-            if ( $x['goalies'] < $gneed ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['goalies'] . ' goalie' . ( $x['goalies'] === 1 ? '' : 's' ) . ' registered, ' . $gneed . ' needed.', 'divisions' ); }
-            if ( $x['teams'] < (int) $d['teams'] ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['teams'] . ' of ' . $d['teams'] . ' teams created.' ); }
-            if ( $x['no_captain'] > 0 ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['no_captain'] . ' team' . ( $x['no_captain'] === 1 ? ' has' : 's have' ) . ' no captain.' ); }
+            $x = ( $m['by_div'][ $d['key'] ] ?? [] ) + [ 'registered' => 0, 'goalies' => 0, 'teams' => 0, 'no_captain' => 0, 'full_teams' => 0 ];
+            list( $dslots, $tslots ) = self::slots( $d );
+            $fmt = self::fill_division( $d )['format'];
+            if ( $fmt !== 'teams' && $dslots > 0 ) {
+                // Only the draft slots draw from the player pool, so only they set what is needed.
+                $need = $dslots * (int) $d['min_roster'];
+                if ( $x['registered'] < $need ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['registered'] . ' registered, ' . $need . ' needed for ' . $dslots . ' draft team' . ( $dslots === 1 ? '' : 's' ) . '.', 'divisions' ); }
+                $gneed = $dslots * (int) $d['goalie_min'];
+                if ( $x['goalies'] < $gneed ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['goalies'] . ' goalie' . ( $x['goalies'] === 1 ? '' : 's' ) . ' registered, ' . $gneed . ' needed.', 'divisions' ); }
+                if ( $x['teams'] < $dslots ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['teams'] . ' of ' . $dslots . ' draft teams created.' ); }
+                if ( $x['no_captain'] > 0 ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['no_captain'] . ' team' . ( $x['no_captain'] === 1 ? ' has' : 's have' ) . ' no captain.' ); }
+            }
+            if ( $fmt !== 'draft' && $tslots > 0 && $x['full_teams'] < $tslots ) { $out['draft'][] = $c( 'warn', $d['label'] . ': ' . $x['full_teams'] . ' of ' . $tslots . ' registered teams are in.', 'divisions' ); }
+            if ( $fmt === 'draft' && $x['full_teams'] > 0 ) { $out['draft'][] = $c( 'warn', $d['label'] . ' is set to Draft but has ' . $x['full_teams'] . ' registered team' . ( $x['full_teams'] === 1 ? '' : 's' ) . '.', 'divisions' ); }
+            if ( $fmt === 'teams' && $x['teams'] > 0 ) { $out['draft'][] = $c( 'warn', $d['label'] . ' is set to Registered teams but has ' . $x['teams'] . ' draft team' . ( $x['teams'] === 1 ? '' : 's' ) . '.', 'divisions' ); }
         }
         $out['draft'][] = $s['draft_date'] !== '' ? $c( 'ok', 'Draft date is set.' ) : $c( 'warn', 'No draft date is set.', 'season' );
 
@@ -560,6 +656,16 @@ class GRSH_Settings {
         if ( $s['status'] === 'setup' && $o !== '' && $c !== '' && $o <= $today && $today <= $c ) { $out[] = $h( 'warn', 'The registration window is open but status is still Setup.', 'season' ); }
         if ( $d !== '' && $d < $today && in_array( $s['status'], [ 'setup', 'open' ], true ) ) { $out[] = $h( 'warn', 'The draft date is in the past but status is still ' . ucfirst( $s['status'] ) . '.', 'season' ); }
         $out[] = $s['player_fee'] ? $h( 'ok', 'Player fee is set.' ) : $h( 'warn', 'No player fee is set.', 'fees' );
+        $bad_fmt = 0;
+        foreach ( self::get_enabled( $s ) as $d ) {
+            $x = $m['by_div'][ $d['key'] ] ?? [];
+            $fmt = self::fill_division( $d )['format'];
+            if ( ( $fmt === 'draft' && ! empty( $x['full_teams'] ) ) || ( $fmt === 'teams' && ! empty( $x['teams'] ) ) ) {
+                $bad_fmt++;
+                $out[] = $h( 'warn', $d['label'] . ' is set to ' . ( $fmt === 'draft' ? 'Draft' : 'Registered teams' ) . ' but has teams of the other kind. Captain Sync and the deposit emails still see them.', 'divisions' );
+            }
+        }
+        if ( ! $bad_fmt ) { $out[] = $h( 'ok', 'Every division\'s teams match its format.' ); }
         $out[] = self::get_enabled( $s ) ? $h( 'ok', count( self::get_enabled( $s ) ) . ' divisions enabled.' ) : $h( 'bad', 'No division is enabled.', 'divisions' );
         $out[] = self::smtp_detected() ? $h( 'ok', 'An SMTP mail plugin is active.' ) : $h( 'warn', 'No SMTP plugin detected. Emails may land in spam or not send.', 'email' );
         $se = trim( (string) $s['sender_email'] );
@@ -635,11 +741,11 @@ class GRSH_Settings {
             'registration_opens' => '2026-12-01', 'registration_closes' => '2027-02-28', 'draft_date' => '2027-03-15',
             'timer_enabled' => true, 'timer_seconds' => 90, 'draft_type' => 'snake', 'draft_order' => 'random',
             'divisions' => [
-                [ 'key' => 'gold_open', 'label' => 'Gold Open', 'enabled' => true, 'teams' => 4, 'min_roster' => 8, 'max_roster' => 12, 'goalie_min' => 1, 'goalie_max' => 2 ],
-                [ 'key' => '45a',       'label' => '45A',       'enabled' => true, 'teams' => 3, 'min_roster' => 7, 'max_roster' => 11, 'goalie_min' => 1, 'goalie_max' => 2 ],
-                [ 'key' => 'senior_b',  'label' => 'Senior B',  'enabled' => true, 'teams' => 3, 'min_roster' => 7, 'max_roster' => 11, 'goalie_min' => 1, 'goalie_max' => 2 ],
-                [ 'key' => 'senior_c',  'label' => 'Senior C',  'enabled' => true, 'teams' => 2, 'min_roster' => 8, 'max_roster' => 12, 'goalie_min' => 1, 'goalie_max' => 2 ],
-                [ 'key' => 'womens',    'label' => 'Womens',    'enabled' => true, 'teams' => 2, 'min_roster' => 8, 'max_roster' => 12, 'goalie_min' => 1, 'goalie_max' => 2 ],
+                [ 'key' => 'gold_open', 'label' => 'Gold Open', 'enabled' => true, 'format' => 'both', 'reg_teams' => 0, 'teams' => 4, 'min_roster' => 8, 'max_roster' => 12, 'goalie_min' => 1, 'goalie_max' => 2 ],
+                [ 'key' => '45a',       'label' => '45A',       'enabled' => true, 'format' => 'both', 'reg_teams' => 0, 'teams' => 3, 'min_roster' => 7, 'max_roster' => 11, 'goalie_min' => 1, 'goalie_max' => 2 ],
+                [ 'key' => 'senior_b',  'label' => 'Senior B',  'enabled' => true, 'format' => 'both', 'reg_teams' => 0, 'teams' => 3, 'min_roster' => 7, 'max_roster' => 11, 'goalie_min' => 1, 'goalie_max' => 2 ],
+                [ 'key' => 'senior_c',  'label' => 'Senior C',  'enabled' => true, 'format' => 'both', 'reg_teams' => 0, 'teams' => 2, 'min_roster' => 8, 'max_roster' => 12, 'goalie_min' => 1, 'goalie_max' => 2 ],
+                [ 'key' => 'womens',    'label' => 'Womens',    'enabled' => true, 'format' => 'both', 'reg_teams' => 0, 'teams' => 2, 'min_roster' => 8, 'max_roster' => 12, 'goalie_min' => 1, 'goalie_max' => 2 ],
             ],
             'email_registration' => true, 'email_roster' => true, 'email_payment' => true, 'email_alternate' => true,
             'email_team_balance' => true, 'email_team_deposit_nudge' => true, 'sender_name' => '', 'sender_email' => '',

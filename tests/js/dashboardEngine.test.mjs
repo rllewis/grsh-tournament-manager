@@ -45,6 +45,17 @@ ok(a.some((x) => x.key === "teams_gold_open" && x.params === "?division=gold_ope
 ok(a.some((x) => /1 player still owes/.test(x.text)), "singular grammar: 1 player still owes"); ok(a.some((x) => /5 players not approved/.test(x.text)), "5 not approved");
 ok(D.nextActions({ ...base, divisions: [div({ configured: false, teams: 0 })] }).every((x) => !x.key.startsWith("teams_")), "unconfigured division ignored");
 eq(D.nextActions(base, { unsynced: null }).some((x) => x.key === "unsynced"), false, "unknown unsynced doesn't raise a false alarm");
+console.log("division formats");
+const fmtDiv = (o) => div({ registered: 5, teams: 0, planned_teams: 4, goalies: 0, ...o });
+const teamsOnly = D.nextActions({ ...base, divisions: [fmtDiv({ format: "teams", draft_slots: 0, reg_slots: 4, full_teams: 1, goalie_need: 0 })] });
+ok(!teamsOnly.some((x) => x.key.startsWith("goalies_") || x.key.startsWith("teams_")), "registered-teams-only division never asks for draft teams or goalies");
+ok(teamsOnly.some((x) => x.key === "regteams_gold_open" && /1 of 4 registered teams is in/.test(x.text) && x.page === "grsh-captain-sync"), "points at Captain Sync: 1 of 4 registered teams");
+const mixed = D.nextActions({ ...base, divisions: [fmtDiv({ format: "both", draft_slots: 3, reg_slots: 1, full_teams: 1, goalie_need: 3, goalies: 1 })] });
+ok(mixed.some((x) => x.key === "goalies_gold_open" && /2 more goalies for 3 draft teams/.test(x.text)), "mixed: goalies sized on the 3 draft slots (not all 4 teams)");
+ok(!mixed.some((x) => x.key === "regteams_gold_open"), "mixed: all registered teams in -> no nag");
+const legacy = D.nextActions({ ...base, divisions: [fmtDiv({ planned_teams: 3, goalies: 1 })] });
+ok(legacy.some((x) => x.key === "goalies_gold_open" && /2 more goalies for 3 draft teams/.test(x.text)), "old payload without draft_slots reads as all-draft");
+eq(D.fillState({ registered: 5, min_needed: 0, capacity: 0, format: "teams" }).state, "unknown", "teams-only: no player minimum to measure");
 
 console.log("fill state");
 eq(D.fillState({ registered: 10, min_needed: 21, capacity: 36 }).state, "short", "short"); eq(D.fillState({ registered: 10, min_needed: 21, capacity: 36 }).short, 11, "11 short");

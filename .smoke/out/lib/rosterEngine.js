@@ -3,12 +3,21 @@
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-exports.bandOf = exports.assignMap = exports.POS_SHORT = exports.POS_LABEL = void 0;
+exports.bandOf = exports.assignMap = exports.POS_SHORT = exports.POS_LABEL = exports.KEY_ITEMS = void 0;
+exports.blockers = blockers;
+exports.comparePlans = comparePlans;
+exports.currentAssign = void 0;
 exports.diffAssign = diffAssign;
+exports.divisionTabLabel = divisionTabLabel;
+exports.explainSwap = explainSwap;
 exports.fillSlots = fillSlots;
 exports.findSwaps = findSwaps;
+exports.lockBlock = lockBlock;
+exports.lockSummary = lockSummary;
 exports.pinIndex = pinIndex;
 exports.pinViolations = pinViolations;
+exports.plannedTeamNames = plannedTeamNames;
+exports.positionNeeds = positionNeeds;
 exports.projectMove = projectMove;
 exports.proposeBalance = proposeBalance;
 exports.scoreOf = void 0;
@@ -19,6 +28,8 @@ exports.targetSize = targetSize;
 exports.teamHealth = teamHealth;
 exports.teamStats = teamStats;
 exports.tierOf = void 0;
+exports.warnings = warnings;
+exports.whyDisabled = whyDisabled;
 var _playerScoring = require("./playerScoring");
 // rosterEngine.js — pure functions behind the Rosters board (no React, no network).
 // Scores come from playerScoring.js so the board, the Draft page and the PHP gate agree.
@@ -259,8 +270,9 @@ function proposeBalance(teams, pool, pins, cfg, opts = {}) {
     assignment: assignMap(teams),
     error: "Every team is locked."
   };
-  const fixedFor = t => t.locked || mode === "fill" ? t.players : [];
-  const movable = [...pool, ...(mode === "rebalance" ? open.flatMap(t => t.players) : [])].sort(byIdAsc);
+  const held = new Set(opts.locks || []); // players locked to their team
+  const fixedFor = t => t.locked || mode === "fill" ? t.players : t.players.filter(p => held.has(p.id));
+  const movable = [...pool, ...(mode === "rebalance" ? open.flatMap(t => t.players.filter(p => !held.has(p.id))) : [])].sort(byIdAsc);
   const origin = new Map(); // playerId → current team id or null
   pool.forEach(p => origin.set(p.id, null));
   teams.forEach(t => t.players.forEach(p => origin.set(p.id, t.id)));
@@ -410,6 +422,7 @@ function findSwaps(teams, pins, cfg, opts = {}) {
     pins
   };
   const open = teams.filter(t => !t.locked);
+  const held = new Set(opts.locks || []);
   const baseBuckets = teams.map(t => ({
     id: t.id,
     players: [...t.players]
@@ -422,7 +435,9 @@ function findSwaps(teams, pins, cfg, opts = {}) {
   for (let i = 0; i < open.length; i++) {
     for (let j = i + 1; j < open.length; j++) {
       for (const pa of open[i].players) {
+        if (held.has(pa.id)) continue;
         for (const pb of open[j].players) {
+          if (held.has(pb.id)) continue;
           const bs = baseBuckets.map(b => {
             if (b.id === open[i].id) return {
               id: b.id,
@@ -560,4 +575,308 @@ function teamHealth(team, teams, pins, cfg, th, MAX = 32) {
     issues,
     band
   };
+}
+
+// ───────────────────────── v4 additions ─────────────────────────
+
+// Tab label: what the numbers mean, and nothing at all when a division has no players.
+function divisionTabLabel(d) {
+  if (!d || !d.total) return {
+    text: "no players",
+    muted: true,
+    title: "No players are registered in this division yet."
+  };
+  return {
+    text: `${d.assigned} of ${d.total} placed`,
+    muted: false,
+    title: `${d.assigned} of ${d.total} players are on a team (${d.pct}%).`
+  };
+}
+
+// Per-team position counts against what the division needs. Only goalies have a configured minimum; the others warn when empty.
+function positionNeeds(team, cfg) {
+  const n = {
+    goaltender: 0,
+    defenseman: 0,
+    center: 0,
+    winger: 0
+  };
+  (team.players || []).forEach(p => {
+    const k = effPos(p);
+    if (n[k] !== undefined) n[k]++;
+  });
+  const total = (team.players || []).length;
+  const gMin = Math.max(1, cfg.goalie_min || 1),
+    gMax = cfg.goalie_max || gMin;
+  const row = (pos, tone, need) => ({
+    pos,
+    short: POS_SHORT[pos],
+    label: POS_LABEL[pos],
+    have: n[pos],
+    need,
+    tone
+  });
+  return [row("goaltender", n.goaltender < gMin ? "bad" : n.goaltender > gMax ? "warn" : "ok", `${gMin}${gMax > gMin ? `-${gMax}` : ""}`), ...["defenseman", "center", "winger"].map(pos => row(pos, total >= 4 && n[pos] === 0 ? "warn" : "ok", ""))];
+}
+
+// One plain sentence for why a swap helps.
+function explainSwap(s, teams, MAX = 32) {
+  const st = teamStats(teams, MAX);
+  const get = id => st.rows.find(r => r.id === id);
+  const a = get(s.teamA),
+    b = get(s.teamB);
+  const nm = id => (teams.find(t => t.id === id) || {}).name || "?";
+  if (!a || !b || a.raw === null || b.raw === null) return "";
+  const hi = a.raw >= b.raw ? {
+    id: s.teamA,
+    r: a,
+    give: s.a,
+    get: s.b
+  } : {
+    id: s.teamB,
+    r: b,
+    give: s.b,
+    get: s.a
+  };
+  const lo = hi.id === s.teamA ? {
+    id: s.teamB,
+    r: b
+  } : {
+    id: s.teamA,
+    r: a
+  };
+  const diff = Math.abs(scoreOf(hi.give) - scoreOf(hi.get));
+  return `${nm(hi.id)} averages ${hi.r.raw.toFixed(1)} and ${nm(lo.id)} ${lo.r.raw.toFixed(1)}. This moves ${diff.toFixed(1)} score points of strength from ${nm(hi.id)} to ${nm(lo.id)}.`;
+}
+
+// Compare two assignments (player id -> team id; missing = pool). Used for "plan vs now" and "plan vs plan".
+function comparePlans(from, to, byId, teams, MAX = 32) {
+  const moves = [];
+  const ids = new Set([...Object.keys(from || {}), ...Object.keys(to || {})].map(Number));
+  ids.forEach(id => {
+    const a = (from || {})[id] ?? null,
+      b = (to || {})[id] ?? null;
+    if (a !== b && byId.get(id)) moves.push({
+      player: byId.get(id),
+      from: a,
+      to: b
+    });
+  });
+  const build = asg => {
+    const all = [...byId.values()];
+    return teams.map(t => ({
+      ...t,
+      players: all.filter(p => (asg || {})[p.id] === t.id)
+    }));
+  };
+  const spread = asg => spreadOf(teamStats(build(asg), MAX));
+  moves.sort((x, y) => scoreOf(y.player) - scoreOf(x.player) || x.player.id - y.player.id);
+  return {
+    moves,
+    spreadFrom: spread(from),
+    spreadTo: spread(to)
+  };
+}
+
+// Current rosters as an assignment map, so a plan can be compared with "now".
+const currentAssign = teams => {
+  const m = {};
+  teams.forEach(t => t.players.forEach(p => {
+    m[p.id] = t.id;
+  }));
+  return m;
+};
+
+// Next free team names: "Team A", "Team B"... skipping names already used (case-insensitive).
+exports.currentAssign = currentAssign;
+function plannedTeamNames(existing, count) {
+  const used = new Set((existing || []).map(n => String(n).trim().toLowerCase()));
+  const out = [];
+  let i = 0;
+  while (out.length < count && i < 702) {
+    const letters = i < 26 ? String.fromCharCode(65 + i) : String.fromCharCode(64 + Math.floor(i / 26)) + String.fromCharCode(65 + i % 26);
+    const name = `Team ${letters}`;
+    i++;
+    if (!used.has(name.toLowerCase())) out.push(name);
+  }
+  return out;
+}
+
+// What blocks publishing, with the one thing to press to fix it.
+const FIX = {
+  teams: {
+    act: "newteams",
+    label: "Add teams"
+  },
+  goalies: {
+    act: "balance",
+    label: "Fill goalies"
+  },
+  locked: {
+    act: "lockall",
+    label: "Lock all teams"
+  },
+  pool: {
+    act: "balance",
+    label: "Auto-balance"
+  },
+  min: {
+    act: "balance",
+    label: "Auto-balance"
+  },
+  max: {
+    act: "balance",
+    label: "Auto-balance"
+  },
+  parity: {
+    act: "swaps",
+    label: "Find swaps"
+  },
+  pins: {
+    act: "swaps",
+    label: "Find swaps"
+  }
+};
+function blockers(gate) {
+  return (gate || []).filter(g => g.level === "fail").map(g => ({
+    key: g.key,
+    text: g.text,
+    fix: FIX[g.key] || null
+  }));
+}
+function warnings(gate) {
+  return (gate || []).filter(g => g.level === "warn").map(g => ({
+    key: g.key,
+    text: g.text,
+    fix: FIX[g.key] || null
+  }));
+}
+
+// Why a control is switched off ("" when it is on).
+function whyDisabled(kind, {
+  readOnly,
+  teams,
+  undo
+}) {
+  if (readOnly) return "Editing is off while the draft is running or rosters are published.";
+  if (kind === "balance" && !teams) return "Add a team first.";
+  if (kind === "swaps" && teams < 2) return "Needs at least two teams.";
+  if (kind === "undo" && !undo) return "Nothing to undo yet.";
+  return "";
+}
+const KEY_ITEMS = exports.KEY_ITEMS = [{
+  mark: "●",
+  label: "Red dot",
+  text: "Payment not marked paid."
+}, {
+  mark: "B2",
+  label: "Tier chip",
+  text: "Skill tier (A, B, C, then R for recreational), with its level."
+}, {
+  mark: "13.0",
+  label: "Number",
+  text: "Player score: tier plus years played."
+}, {
+  mark: "R1",
+  label: "Purple chip",
+  text: "Returning player, with seasons played."
+}, {
+  mark: "⚑",
+  label: "Flag",
+  text: "Sandbagging flag to review."
+}, {
+  mark: "🔒",
+  label: "Lock",
+  text: "Locked to this team: auto-balance and swaps leave them here, and moving them by hand is blocked."
+}, {
+  mark: "📌",
+  label: "Pin",
+  text: "Has a keep-together or keep-apart rule."
+}, {
+  mark: "C",
+  label: "Gold C",
+  text: "Team captain."
+}];
+
+// ── v5: per-player locks and the rules summary ──
+/**
+ * One row per player who has any lock, rule or role that limits where they can go.
+ * Rows: { player, teamId, teamName, held, teamLocked, captain, rules:[{type, other, met, otherTeam}], broken }
+ * Players who only sit on a locked team are counted in `onLockedTeams`, not listed.
+ */
+function lockSummary(teams, pins, locks, byId) {
+  const where = new Map(),
+    name = new Map(),
+    tl = new Map();
+  teams.forEach(t => {
+    name.set(t.id, t.name);
+    tl.set(t.id, !!t.locked);
+    t.players.forEach(p => where.set(p.id, t.id));
+  });
+  const held = new Set(locks || []);
+  const rows = new Map();
+  const row = id => {
+    if (!rows.has(id)) {
+      const player = byId.get(id);
+      if (!player) return null;
+      const tid = where.has(id) ? where.get(id) : null;
+      rows.set(id, {
+        player,
+        teamId: tid,
+        teamName: tid === null ? "Unassigned" : name.get(tid),
+        held: false,
+        teamLocked: tid !== null && tl.get(tid),
+        captain: false,
+        rules: [],
+        broken: 0
+      });
+    }
+    return rows.get(id);
+  };
+  held.forEach(id => {
+    const r = row(id);
+    if (r) r.held = true;
+  });
+  teams.forEach(t => {
+    if (t.captain_player_id) {
+      const r = row(t.captain_player_id);
+      if (r) r.captain = true;
+    }
+  });
+  (pins || []).forEach(x => {
+    [[x.a, x.b], [x.b, x.a]].forEach(([me, other]) => {
+      const r = row(me);
+      const o = byId.get(other);
+      if (!r || !o) return;
+      const ta = where.has(me) ? where.get(me) : null,
+        tb = where.has(other) ? where.get(other) : null;
+      const placed = ta !== null && tb !== null;
+      const met = !placed ? null : x.type === "together" ? ta === tb : ta !== tb;
+      r.rules.push({
+        type: x.type,
+        other: o,
+        met,
+        otherTeam: tb === null ? "Unassigned" : name.get(tb)
+      });
+      if (met === false) r.broken++;
+    });
+  });
+  const list = [...rows.values()].sort((a, b) => b.broken - a.broken || Number(b.held) - Number(a.held) || String(a.player.last_name).localeCompare(String(b.player.last_name)));
+  const onLockedTeams = teams.filter(t => t.locked).reduce((n, t) => n + t.players.length, 0);
+  return {
+    rows: list,
+    held: list.filter(r => r.held).length,
+    ruled: list.filter(r => r.rules.length).length,
+    broken: pinViolations(pins || [], teams).length,
+    captains: list.filter(r => r.captain).length,
+    onLockedTeams
+  };
+}
+
+/** Why a move would be refused because of a player lock; null when allowed. */
+function lockBlock(playerId, toTeamId, teams, locks) {
+  if (!(locks || []).includes(playerId)) return null;
+  const cur = teams.find(t => t.players.some(p => p.id === playerId));
+  if (!cur || cur.id === toTeamId) return null;
+  return `Locked to ${cur.name}. Unlock the player first.`;
 }

@@ -135,7 +135,7 @@ ok(btn("Save 1 change").disabled, "irreversible status needs the checkbox"); awa
 await run(async () => btn("Keep editing").click()); await run(async () => btn("Discard changes").click());
 
 // J. disabling a division with players
-await tabTo("divisions"); ok(text().includes("24 registered") && text().includes("48 spots") && text().includes("32 needed"), "capacity math: 24 registered, 48 spots, 32 needed");
+await tabTo("divisions"); ok(text().includes("24 of 48") && text().includes("32 to run"), "capacity math: 24 of 48 spots, 32 to run");
 await run(async () => $("[aria-label='Enable Gold Open']").click());
 ok(text().includes("24 registered players will be hidden"), "inline warning when turning a division off");
 await run(async () => btn("Review & save").click()); ok(text().includes("is being turned off but has 24 registered players"), "review warns too"); await run(async () => btn("Keep editing").click()); await run(async () => btn("Discard changes").click());
@@ -167,5 +167,35 @@ ok(text().includes("Loaded 1 settings from s.json") && text().includes("Ignored:
 await run(async () => btn("Discard changes").click());
 await run(async () => { const f2 = new dom.window.File(["{nope"], "bad.json"); Object.defineProperty(input, "files", { value: [f2], configurable: true }); input.dispatchEvent(new dom.window.Event("change", { bubbles: true })); await new Promise((r) => setTimeout(r, 80)); });
 ok(text().includes("not valid JSON"), "bad import file refused");
+
+
+// N. division format
+await run(async () => btn("Discard changes") && btn("Discard changes").click());
+await tabTo("divisions");
+ok(!!document.querySelector('[role=radiogroup][aria-label="Gold Open format"]'), "format selector is on each division");
+const seg = (div, name) => [...document.querySelectorAll(`[role=radiogroup][aria-label="${div} format"] button`)].find((b) => b.textContent === name);
+ok(seg("Gold Open", "Both").getAttribute("aria-checked") === "true", "a division with no saved format shows Both (old behaviour)");
+ok(text().includes("Season at a glance") && text().includes("Draft teams"), "what-if table shown");
+ok(!!document.querySelector('button[aria-label="One more team in Gold Open"]'), "teams stepper");
+await run(async () => seg("45A", "Registered teams").click());
+ok(seg("45A", "Registered teams").getAttribute("aria-checked") === "true" && text().includes("1 unsaved change") || text().includes("unsaved change"), "picking a format marks the page unsaved");
+ok(text().includes("Registered teams in") || text().includes("registered teams in"), "teams division shows registered-team tile");
+await run(async () => seg("Gold Open", "Draft").click());
+ok(!!document.querySelector(".gs-dot"), "tab shows an unsaved-changes dot");
+await run(async () => btn("Review").click());
+ok(text().includes("format") && text().includes("Registered teams"), "review lists the format change in plain words");
+await run(async () => btn("Keep editing").click());
+await run(async () => { mode.post = "ok"; btn("Review & save") && 0; });
+await run(async () => btn("Discard changes").click());
+// both: registered-team stepper
+await run(async () => seg("Gold Open", "Both").click());
+ok(!!document.querySelector('button[aria-label="One more registered team in Gold Open"]'), "Both shows the registered-team stepper");
+await run(async () => document.querySelector('button[aria-label="One more registered team in Gold Open"]').click());
+ok(text().includes("1 registered + 3 drafted"), "split shown as 1 registered + 3 drafted");
+ok(text().includes("6 players") === false, "no stray text");
+await run(async () => btn("Discard changes").click());
+// toggle label + fees forecast
+ok(text().includes("Enabled"), "division toggle says Enabled");
+await tabTo("fees"); ok(text().includes("Revenue forecast") && text().includes("registered-team slots"), "fee forecast panel");
 
 console.log(fails ? `\n${fails} FAILED` : "\nall smoke checks passed"); process.exit(fails ? 1 : 0);

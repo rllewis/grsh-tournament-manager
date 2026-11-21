@@ -17,7 +17,8 @@ export function funnelSteps(teams) {
   const total = (teams || []).length;
   return STAGES.map((s, i) => {
     const n = (teams || []).filter((t) => stageIndex(t.stage) >= i).length;
-    return { key: s.key, label: s.label, help: s.help, n, pct: total ? Math.round((n / total) * 100) : 0 };
+    // Percentages mean nothing with a handful of teams, so callers show "n of total" and only show pct when showPct is true.
+    return { key: s.key, label: s.label, help: s.help, n, total, pct: total ? Math.round((n / total) * 100) : 0, showPct: total >= 8 };
   });
 }
 
@@ -166,7 +167,16 @@ export function healthSummary(health) {
   return { failed, okCount: list.length - failed.length, allOk: failed.length === 0 && list.length > 0 };
 }
 
+// The wiring checks say nothing about deposits. When the page headline is not green, say so, so the two never look contradictory.
+export function healthLabel(hs, v) {
+  if (!hs || !hs.okCount) return "";
+  const calm = !v || v.tone === "ok";
+  if (hs.allOk) return calm ? `Setup checks: all ${hs.okCount} passed` : `Setup is fine (${hs.okCount} checks). The problem above is in the data, not the wiring.`;
+  return `${hs.okCount} setup checks passed`;
+}
+
 export function balanceStatus(row) {
+  if (row && row.format === "draft") return { tone: "mute", label: row.actual ? `Draft division, ${row.actual} registered` : "Draft" };
   if (!row || row.expected === null || row.expected === undefined) return { tone: "mute", label: `${row.actual} team${row.actual === 1 ? "" : "s"}` };
   if (row.delta === 0) return { tone: "ok", label: "On target" };
   if (row.delta > 0) return { tone: "warn", label: `${row.delta} over` };
@@ -209,5 +219,53 @@ export function filterTeamsMore(teams, { stuck = 0, noCaptain = false } = {}) {
 }
 
 export function historyTitle(a) {
-  return { captain_sync_deposit: "Deposit recorded", captain_sync_undo: "Deposit removed (undo)", captain_sync_division: "Division changed", captain_sync_team_deleted: "Team deleted", captain_sync_team_restored: "Team restored", captain_sync_captain: "Captain changed" }[a] || a;
+  return { captain_sync_invite_revoked: "Invite link revoked", captain_sync_captain_detached: "Captain detached", captain_sync_captain_reattached: "Captain put back", captain_sync_note: "Note", captain_sync_deposit: "Deposit recorded", captain_sync_undo: "Deposit removed (undo)", captain_sync_division: "Division changed", captain_sync_team_deleted: "Team deleted", captain_sync_team_restored: "Team restored", captain_sync_captain: "Captain changed" }[a] || a;
+}
+
+export const NOTE_TAGS = [
+  { key: "", label: "No tag" }, { key: "phoned", label: "Phoned" }, { key: "paying_by_check", label: "Paying by check" },
+  { key: "waiting", label: "Waiting on them" }, { key: "dropped", label: "May drop out" }, { key: "vip", label: "Keep close" },
+];
+export const noteTagLabel = (k) => (NOTE_TAGS.find((t) => t.key === k) || {}).label || "";
+export const IDLE_DAYS = 14;
+
+// Can this team field a roster yet? One badge, one reason.
+export function readiness(t) {
+  if (!t) return { tone: "mute", label: "Unknown", why: "" };
+  const need = t.min_players || 0; const have = t.roster_size || 0;
+  if (!t.captain) return { tone: "bad", label: "No captain", why: "Nobody can log in to build a roster." };
+  if (!have) return { tone: "bad", label: "No roster", why: "No players added yet." };
+  if (need && have < need) return { tone: "warn", label: `${need - have} short`, why: `${have} of ${need} players.` };
+  if (!t.deposit_paid_at) return { tone: "info", label: "Roster ready, no deposit", why: "Roster is full but no deposit is recorded." };
+  return { tone: "ok", label: "Ready", why: "Roster is full and the deposit is in." };
+}
+
+// A team with no deposit and no activity for a while. Teams that paid are never idle.
+export function idleFlag(t) {
+  if (!t || t.idle_days === null || t.idle_days === undefined || t.idle_days < IDLE_DAYS) return null;
+  return { tone: t.idle_days >= 30 ? "bad" : "warn", label: `Quiet ${t.idle_days} days` };
+}
+
+// Per-team early fee: what this team would save by paying before the cutoff.
+export function teamFeeLine(t, m) {
+  if (!t || !m || t.deposit_paid_at) return "";
+  if (m.tier_now === "early" && m.days_left !== null && m.days_left !== undefined) return `Pays ${money(m.fee_now)} if they pay in ${plural(m.days_left, "day")}, ${money((m.fee_now || 0) + (m.saves_per_team || 0))} after.`;
+  if (m.tier_now === "late") return `Early fee has ended. They owe ${money(m.fee_now)}.`;
+  return "";
+}
+
+// What the Remove dialog tells the person before they type anything.
+export function removalLines(impact) {
+  if (!impact) return { removes: [], keeps: [], blocked: [] };
+  return { removes: impact.removes || [], keeps: impact.keeps || [], blocked: impact.blocked || [] };
+}
+export const removalReady = (impact, name, typed, reason, ack) => !!impact && impact.allowed !== false
+  && String(typed || "").trim().toLowerCase() === String(name || "").trim().toLowerCase() && String(name || "").trim() !== ""
+  && String(reason || "").trim().length >= 3 && (!impact.needs_ack || !!ack);
+
+// Why a team is protected, and the honest next step.
+export function protectedHelp(t) {
+  const reasons = (t && t.delete && t.delete.reasons) || [];
+  if (!reasons.length) return "";
+  return `Kept because it has ${reasons.join(" and ")}. Open the team and use Remove team to take it out on purpose; you will see exactly what goes first, and History can bring it back.`;
 }

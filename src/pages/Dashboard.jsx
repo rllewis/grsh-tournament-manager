@@ -34,7 +34,7 @@ const btn = (kind = "ghost", extra = {}) => ({
   border: kind === "primary" ? `1px solid ${INK}` : `1px solid ${LINE}`, background: kind === "primary" ? INK : WHITE, color: kind === "primary" ? WHITE : INK, ...extra,
 });
 const SEV = { high: { bg: "#FEE2E2", color: "#991B1B", label: "Urgent" }, medium: { bg: "#FEF3C7", color: "#92400E", label: "Soon" }, low: { bg: "#E0F2FE", color: "#075985", label: "When ready" } };
-const STAGE = { draft: { label: "Drafting", bg: "#F3F4F6", color: "#4B5563" }, locked: { label: "Locked", bg: "#FEF3C7", color: "#92400E" }, published: { label: "Published", bg: "#DCFCE7", color: "#166534" } };
+const STAGE = { teams: { label: "Registered teams", bg: "#E0ECFF", color: "#1E3A8A" }, draft: { label: "Drafting", bg: "#F3F4F6", color: "#4B5563" }, locked: { label: "Locked", bg: "#FEF3C7", color: "#92400E" }, published: { label: "Published", bg: "#DCFCE7", color: "#166534" } };
 
 function Card({ title, right, children, id, error, onRetry, pad = true }) {
   return (
@@ -288,14 +288,31 @@ export default function Dashboard() {
                   const f = fillState(v), tot = Object.values(v.tiers).reduce((a, b) => a + b, 0);
                   const st = STAGE[v.stage] || STAGE.draft;
                   const pctBar = f.cap ? Math.min(100, (f.have / f.cap) * 100) : 0, mark = f.cap ? (f.need / f.cap) * 100 : null;
-                  const goalieNeed = v.planned_teams;
+                  // Follow the division's format from Settings: "draft", "teams" (captain-registered) or "both".
+                  const fmt = v.format || "draft";
+                  const ds = v.draft_slots ?? v.planned_teams, rs = v.reg_slots || 0, inTeams = v.full_teams || 0;
+                  const isTeams = fmt === "teams" || (v.configured && ds === 0 && rs > 0);   // nothing to draft here
+                  const isBoth = !isTeams && fmt === "both" && rs > 0;
+                  const goalieNeed = v.goalie_need ?? ds;
+                  const s1 = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+                  const caption = !v.configured ? "" : isTeams ? s1(rs, "registered team") : isBoth ? `${ds} draft + ${s1(rs, "registered team")}` : s1(ds, "draft team");
+                  const teamsBar = rs ? Math.min(100, (inTeams / rs) * 100) : 0;
                   return (
-                    <div key={v.key} style={{ padding: "16px 18px", borderRight: `1px solid ${LINE}`, borderBottom: `1px solid ${LINE}`, borderTop: `4px solid ${v.color}` }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <h3 style={{ margin: 0, fontFamily: F_HEAD, fontSize: 18, color: v.color, flex: 1 }}>{v.label}</h3>
-                        <span style={{ background: st.bg, color: st.color, borderRadius: 99, padding: "2px 9px", fontSize: 12, fontWeight: 700 }}>{v.draft_status === "active" || v.draft_status === "paused" ? `Draft ${v.draft_status}` : st.label}</span>
+                    <div key={v.key} style={{ minWidth: 0, padding: "16px 18px", borderRight: `1px solid ${LINE}`, borderBottom: `1px solid ${LINE}`, borderTop: `4px solid ${v.color}` }}>
+                      <div style={{ marginBottom: 6 }}>
+                        <span style={{ display: "inline-block", background: st.bg, color: st.color, borderRadius: 99, padding: "2px 10px", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" }}>{v.draft_status === "active" || v.draft_status === "paused" ? `Draft ${v.draft_status}` : st.label}</span>
                       </div>
-                      <div style={{ fontSize: 14, margin: "8px 0 4px" }}><b style={{ fontFamily: F_HEAD, fontSize: 24 }}>{v.registered}</b> registered{f.need ? <span style={{ color: SOFT }}> · need {f.need}, room for {f.room} more</span> : <span style={{ color: SOFT }}> · set teams in Settings</span>}</div>
+                      <h3 style={{ margin: 0, fontFamily: F_HEAD, fontSize: 18, lineHeight: 1.2, color: v.color, minHeight: 44, overflowWrap: "anywhere" }}>{v.label}</h3>
+                      {caption && <div style={{ fontSize: 12.5, color: SOFT, marginTop: 2 }} title="From Settings → Divisions">{caption}</div>}
+                      {isTeams ? (
+                        <>
+                          <div style={{ fontSize: 14, margin: "8px 0 4px" }}><b style={{ fontFamily: F_HEAD, fontSize: 24 }}>{inTeams}</b> of {rs} registered team{rs === 1 ? "" : "s"} in</div>
+                          {rs > 0 && <div style={{ height: 8, background: "#EEECE4", borderRadius: 99, margin: "6px 0 10px" }} title={`${inTeams} of ${rs} registered teams`}><div style={{ width: `${teamsBar}%`, height: "100%", borderRadius: 99, background: inTeams < rs ? "#f59e0b" : v.color }} /></div>}
+                          {inTeams < rs && <div style={{ fontSize: 13, color: "#92400E" }}>{rs - inTeams} team{rs - inTeams === 1 ? "" : "s"} still to register</div>}
+                          {v.registered > 0 && <div style={{ fontSize: 13, color: "#92400E", marginTop: 4 }}>{v.registered} individual player{v.registered === 1 ? " is" : "s are"} registered here, but this division has no draft. Move them or change the division's format in Settings.</div>}
+                        </>
+                      ) : (<>
+                      <div style={{ fontSize: 14, margin: "8px 0 4px" }}><b style={{ fontFamily: F_HEAD, fontSize: 24 }}>{v.registered}</b> player{v.registered === 1 ? "" : "s"} registered{f.need ? <span style={{ color: SOFT }}> · need {f.need}, room for {f.room} more</span> : <span style={{ color: SOFT }}> · set teams in Settings</span>}</div>
                       {f.cap ? (
                         <div style={{ position: "relative", height: 8, background: "#EEECE4", borderRadius: 99, margin: "6px 0 10px" }} title={`${f.have} registered; minimum ${f.need}; capacity ${f.cap}`}>
                           <div style={{ width: `${pctBar}%`, height: "100%", borderRadius: 99, background: f.state === "short" ? "#f59e0b" : v.color }} />
@@ -303,13 +320,15 @@ export default function Dashboard() {
                         </div>
                       ) : null}
                       {f.state === "short" && <div style={{ fontSize: 13, color: "#92400E" }}>{f.short} short of the minimum</div>}
+                      </>)}
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 12px", fontSize: 13, margin: "10px 0" }}>
-                        <span><b>{v.paid}</b> of {v.registered} paid{v.unpaid > 0 ? <span style={{ color: "#92400E" }}> ({v.unpaid} owe)</span> : ""}</span>
-                        <span><b>{v.goalies}</b> goalie{v.goalies === 1 ? "" : "s"}{goalieNeed ? <span style={{ color: v.goalies < goalieNeed ? "#991B1B" : SOFT }}> (need {goalieNeed})</span> : ""}</span>
+                        {!isTeams && <span><b>{v.paid}</b> of {v.registered} paid{v.unpaid > 0 ? <span style={{ color: "#92400E" }}> ({v.unpaid} owe)</span> : ""}</span>}
+                        {!isTeams && <span><b>{v.goalies}</b> goalie{v.goalies === 1 ? "" : "s"}{goalieNeed ? <span style={{ color: v.goalies < goalieNeed ? "#991B1B" : SOFT }}> (need {goalieNeed})</span> : ""}</span>}
                         <span><b>{v.subs}</b> alternate{v.subs === 1 ? "" : "s"}</span>
-                        <span><b>{v.teams}</b> of {v.planned_teams} team{v.planned_teams === 1 ? "" : "s"} · {v.rostered} rostered</span>
+                        {!isTeams && <span><b>{v.teams}</b> of {ds} draft team{ds === 1 ? "" : "s"} · {v.rostered} rostered</span>}
+                        {isBoth && <span><b>{inTeams}</b> of {rs} registered team{rs === 1 ? "" : "s"} in</span>}
                       </div>
-                      {tot > 0 && (
+                      {!isTeams && tot > 0 && (
                         <div aria-label="Skill tier mix" style={{ marginBottom: 10 }}>
                           <div style={{ display: "flex", height: 8, borderRadius: 99, overflow: "hidden", gap: 1 }}>
                             {[["A", "#E8A0A0"], ["B", "#EDBA94"], ["C", "#EAD08A"], ["R", "#9CB8EC"]].filter(([k]) => v.tiers[k] > 0).map(([k, c]) => <div key={k} title={`Tier ${k}: ${v.tiers[k]}`} style={{ flex: v.tiers[k], background: c, minWidth: 4 }} />)}
@@ -318,8 +337,10 @@ export default function Dashboard() {
                         </div>
                       )}
                       <div className="grsh-noprint" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                        <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-rosters", `?division=${encodeURIComponent(v.key)}`)}>Rosters</a>
-                        <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-draft")}>Draft</a>
+                        {!isTeams && <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-rosters", `?division=${encodeURIComponent(v.key)}`)}>Rosters</a>}
+                        {!isTeams && <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-draft")}>Draft</a>}
+                        {(isTeams || isBoth) && <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-full-teams")}>Full teams</a>}
+                        {isTeams && <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-captain-sync")}>Captain Sync</a>}
                         <a style={btn("ghost", { padding: "5px 10px", fontSize: 13 })} href={adminUrl("grsh-tm-players")}>Players</a>
                       </div>
                     </div>

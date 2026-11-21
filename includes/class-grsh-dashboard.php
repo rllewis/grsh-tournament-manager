@@ -70,10 +70,18 @@ class GRSH_Dashboard {
         $out = [];
         foreach ( (array) ( $settings['divisions'] ?? [] ) as $d ) {
             if ( empty( $d['key'] ) || empty( $d['enabled'] ) ) { continue; }
+            // Format follows Settings: 'draft' (all teams drafted), 'teams' (all captain-registered) or 'both'
+            // (reg_teams of the teams are registered, the rest are drafted). A missing format means 'both' with 0
+            // registered slots, which is the same as all-draft, so older installs read exactly as before.
+            $fmt   = (string) ( $d['format'] ?? 'both' );
+            if ( ! in_array( $fmt, [ 'draft', 'teams', 'both' ], true ) ) { $fmt = 'both'; }
+            $teams = max( 0, (int) ( $d['teams'] ?? 0 ) );
+            $reg   = $fmt === 'draft' ? 0 : ( $fmt === 'teams' ? $teams : max( 0, min( $teams, (int) ( $d['reg_teams'] ?? 0 ) ) ) );
             $out[ (string) $d['key'] ] = [
                 'key' => (string) $d['key'], 'label' => (string) ( $d['label'] ?? $d['key'] ),
-                'teams' => (int) ( $d['teams'] ?? 0 ), 'min_roster' => (int) ( $d['min_roster'] ?? 0 ),
+                'teams' => $teams, 'min_roster' => (int) ( $d['min_roster'] ?? 0 ),
                 'max_roster' => (int) ( $d['max_roster'] ?? 0 ), 'goalie_min' => (int) ( $d['goalie_min'] ?? 1 ),
+                'format' => $fmt, 'reg_slots' => $reg, 'draft_slots' => $teams - $reg,
             ];
         }
         return $out;
@@ -131,7 +139,11 @@ class GRSH_Dashboard {
                     'color' => self::$colours[ $k ] ?? '#666666', 'configured' => (bool) $c,
                     'registered' => 0, 'paid' => 0, 'unpaid' => 0, 'approved' => 0, 'subs' => 0, 'goalies' => 0,
                     'tiers' => [ 'A' => 0, 'B' => 0, 'C' => 0, 'R' => 0, '?' => 0 ],
-                    'planned_teams' => $c ? $c['teams'] : 0, 'min_needed' => $c ? $c['teams'] * $c['min_roster'] : 0, 'capacity' => $c ? $c['teams'] * $c['max_roster'] : 0,
+                    // Players are drafted into draft slots only; registered-team slots bring their own roster.
+                    'format' => $c ? $c['format'] : 'draft', 'draft_slots' => $c ? $c['draft_slots'] : 0, 'reg_slots' => $c ? $c['reg_slots'] : 0, 'full_teams' => 0,
+                    'planned_teams' => $c ? $c['teams'] : 0,
+                    'min_needed' => $c ? $c['draft_slots'] * $c['min_roster'] : 0, 'capacity' => $c ? $c['draft_slots'] * $c['max_roster'] : 0,
+                    'goalie_need' => $c ? $c['draft_slots'] * max( 0, $c['goalie_min'] ) : 0,
                     'teams' => 0, 'rostered' => 0, 'teams_ready' => 0, 'locked' => 0, 'draft_status' => 'ready', 'stage' => 'draft', 'published_at' => '',
                 ];
             }
@@ -171,6 +183,12 @@ class GRSH_Dashboard {
               WHERE t.season_id = %d AND t.team_type = 'draft'
            GROUP BY t.id, t.division, t.draft_locked", $sid
         ), ARRAY_A ) ?: [];
+        // registered (captain) teams per division
+        foreach ( ( $wpdb->get_results( $wpdb->prepare(
+            "SELECT division, COUNT(*) AS n FROM {$wpdb->prefix}grsh_teams WHERE season_id = %d AND team_type = 'full_team' GROUP BY division", $sid
+        ), ARRAY_A ) ?: [] ) as $ft ) {
+            $k = (string) $ft['division']; $ensure( $k ); $divs[ $k ]['full_teams'] = (int) $ft['n'];
+        }
         $teams_total = 0; $teams_ready = 0;
         foreach ( $trows as $t ) {
             $k = (string) $t['division']; $ensure( $k );
@@ -185,6 +203,7 @@ class GRSH_Dashboard {
             $meta = get_option( self::META_OPT . $k, [] );
             $d['published_at'] = ( is_array( $meta ) && ! empty( $meta['published_at'] ) ) ? (string) $meta['published_at'] : '';
             $d['stage'] = $d['published_at'] ? 'published' : ( $d['teams'] > 0 && $d['locked'] === $d['teams'] ? 'locked' : 'draft' );
+            if ( $d['format'] === 'teams' && ! $d['published_at'] ) { $d['stage'] = 'teams'; }   // nothing is drafted here
         }
         unset( $d );
 
@@ -213,7 +232,7 @@ class GRSH_Dashboard {
         usort( $miles, function ( $a, $b ) { return strcmp( $a['date'], $b['date'] ); } );
 
         $need = 0; $cap = 0;
-        foreach ( $cfgs as $c ) { $need += $c['teams'] * $c['min_roster']; $cap += $c['teams'] * $c['max_roster']; }
+        foreach ( $cfgs as $c ) { $need += $c['draft_slots'] * $c['min_roster']; $cap += $c['draft_slots'] * $c['max_roster']; }
 
         $div_list = array_values( $divs );
         usort( $div_list, function ( $a, $b ) use ( $cfgs ) {

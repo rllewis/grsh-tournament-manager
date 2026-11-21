@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { normalizeDivisions, applyDivisions, capacityView, offListCount } from "../lib/divisionsEngine";
 import { computeScore, formatReturningBadge } from "../lib/playerScoring";
 import CommitteeAdjustmentEditor from "../components/CommitteeAdjustmentEditor";
 
@@ -61,7 +62,9 @@ const TIER_COLOR = (t) => {
   return { bg:"#E8F0FE",color:"#1A3F8F" };
 };
 const TIERS = ["A1","A2","A3","B1","B2","B3","C1","C2","R1","R2","R3"];
-const ALL_DIVISIONS = ["gold_open","45a","senior_b","senior_c","womens"];
+const ALL_DIVISIONS = ["gold_open","45a","senior_b","senior_c","womens"];   // replaced in place by Settings (GET /players/divisions)
+const DIV_REG = { order:ALL_DIVISIONS, labels:DIVISION_LABEL, caps:DIV_CAPS, formats:{}, info:{} };
+const capOf = (div) => (DIV_CAPS[div] ?? 30);
 const ALL_POSITIONS = ["defenseman","center","winger","goaltender"];
 const ALL_STATUSES  = ["returning","registered","approved","draft_eligible","assigned","withdrawn"];
 const ALL_PAYMENTS  = ["paid","pending","waived","refunded"];
@@ -766,7 +769,7 @@ function BalanceMeter({ player, tier, allPlayers }) {
   const delta=after-before;
   const rank=[...mateScores,myScore].sort((a,b)=>b-a).indexOf(myScore)+1;
   const count=mates.length+1;
-  const cap=DIV_CAPS[div]||30;
+  const cap=capOf(div);
   const goalies=mates.filter(p=>p.position==="goaltender").length+(player.position==="goaltender"?1:0);
   const letters=["A","B","C","R"];
   const dist=letters.map(L=>({L,n:mates.filter(p=>(p.skill_tier_assigned||p.skill_tier_reported||"")[0]===L).length+(((tier||savedTier||"")[0]===L)?1:0)}));
@@ -811,7 +814,121 @@ function BalanceMeter({ player, tier, allPlayers }) {
 }
 
 // Player drawer
-function PlayerDrawer({ player, onClose, onSave, allPlayers }) {
+
+// ─── Remove player (admin) ────────────────────────────────────────────────────
+const apiJson=async(path,opts={})=>{
+  const res=await fetch(`${API}${path}`,{...opts,headers:{"X-WP-Nonce":NONCE,"Content-Type":"application/json",...(opts.headers||{})}});
+  const d=await res.json().catch(()=>({}));
+  return { ok:res.ok, status:res.status, d };
+};
+const MODAL_BTN={ fontFamily:"'DM Mono',monospace",fontSize:12,padding:"9px 16px",borderRadius:8,cursor:"pointer" };
+
+function RemovePlayerModal({ player, onClose, onDone }) {
+  const [impact,setImpact]=useState(null);
+  const [loadErr,setLoadErr]=useState("");
+  const [typed,setTyped]=useState("");
+  const [busy,setBusy]=useState(false);
+  const [err,setErr]=useState("");
+  useEffect(()=>{
+    let live=true;
+    apiJson(`/players/${player.id}/removal-impact`).then(({ok,status,d})=>{
+      if(!live) return;
+      if(!ok) setLoadErr(status===403?"Only an administrator can remove players.":(d?.error||d?.message||"Could not check what removal would touch."));
+      else setImpact(d);
+    }).catch(()=>live&&setLoadErr("Network error — nothing was changed."));
+    return ()=>{ live=false; };
+  },[player.id]);
+  const go=async()=>{
+    setBusy(true); setErr("");
+    try{
+      const {ok,d}=await apiJson(`/players/${player.id}/remove`,{method:"POST",body:JSON.stringify({confirm:"DELETE"})});
+      if(!ok){ setErr(d?.error||d?.message||"Removal failed. Nothing was changed."); setBusy(false); return; }
+      onDone(d);
+    }catch{ setErr("Network error — nothing was changed."); setBusy(false); }
+  };
+  const row={ fontFamily:"'DM Mono',monospace",fontSize:12,color:"#444",lineHeight:1.55,margin:"4px 0" };
+  const canGo=impact&&impact.can_remove&&!(impact.blockers||[]).length&&typed==="DELETE"&&!busy;
+  return (
+    <div role="dialog" aria-modal="true" aria-label="Remove player" style={{ position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:2100,display:"flex",alignItems:"center",justifyContent:"center",padding:20 }}>
+      <div style={{ background:"#fff",borderRadius:14,maxWidth:520,width:"100%",boxShadow:"0 24px 60px rgba(0,0,0,.22)",overflow:"hidden" }}>
+        <div style={{ padding:"18px 22px 14px",borderBottom:"1px solid #F0EEE8",display:"flex",justifyContent:"space-between" }}>
+          <h2 style={{ fontFamily:"'Fraunces',serif",fontSize:17,fontWeight:700,color:"#991B1B",margin:0 }}>Remove {player.first_name} {player.last_name} from 2027?</h2>
+          <button onClick={onClose} aria-label="Close" style={{ background:"none",border:"none",fontSize:14,color:"#aaa",cursor:"pointer" }}>✕</button>
+        </div>
+        <div style={{ padding:"16px 22px",maxHeight:"60vh",overflowY:"auto" }}>
+          {loadErr?<p style={{ ...row,color:"#991B1B" }}>{loadErr}</p>
+           :!impact?<p style={row}>Checking what this would touch…</p>:(<>
+            <p style={{ ...row,color:"#888" }}>{impact.email}{impact.division?` · ${impact.division}`:""}</p>
+            {(impact.blockers||[]).map((b,i)=><p key={i} style={{ ...row,background:"#FEF2F2",border:"1px solid #FCA5A5",color:"#991B1B",padding:"8px 10px",borderRadius:8 }}>⛔ {b}</p>)}
+            {!impact.can_remove&&!(impact.blockers||[]).length&&<p style={{ ...row,color:"#92400E" }}>This player has no 2027 registration, so there is nothing to remove.</p>}
+            {impact.can_remove&&(<>
+              <p style={{ ...row,fontWeight:600,marginTop:10 }}>This will remove:</p>
+              <ul style={{ ...row,margin:"0 0 6px 18px",padding:0 }}>
+                {impact.has_registration&&<li>their 2027 registration{impact.payment_status?` (${impact.payment_status})`:""}</li>}
+                {(impact.roster_spots||[]).map((t,i)=><li key={i}>their spot on {t}</li>)}
+                {impact.sub_requests>0&&<li>{impact.sub_requests} sub request{impact.sub_requests===1?"":"s"}</li>}
+                {impact.delete_player&&<li>the player record itself (nothing else uses it)</li>}
+              </ul>
+              {!impact.delete_player&&<p style={row}>The player record is <b>kept</b> because they {(impact.keep_reasons||[]).join(", ")}.</p>}
+              {(impact.warnings||[]).map((w,i)=><p key={i} style={{ ...row,color:"#92400E" }}>⚠ {w}</p>)}
+              <p style={{ ...row,color:"#666" }}>A copy is saved, so you can undo this. The team itself is not changed.</p>
+              <label style={{ ...row,display:"block",marginTop:12 }}>Type <b>DELETE</b> to confirm
+                <input value={typed} onChange={e=>setTyped(e.target.value)} autoFocus autoComplete="off"
+                  style={{ display:"block",width:"100%",boxSizing:"border-box",marginTop:6,padding:"9px 10px",border:"1px solid #E8E6DF",borderRadius:8,fontFamily:"'DM Mono',monospace",fontSize:13 }}/>
+              </label>
+            </>)}
+            {err&&<p style={{ ...row,color:"#991B1B" }}>{err}</p>}
+          </>)}
+        </div>
+        <div style={{ display:"flex",gap:10,justifyContent:"flex-end",padding:"12px 22px 18px",borderTop:"1px solid #F0EEE8" }}>
+          <button onClick={onClose} style={{ ...MODAL_BTN,background:"#F6F5F0",border:"1px solid #E8E6DF",color:"#666" }}>Cancel</button>
+          <button onClick={go} disabled={!canGo} style={{ ...MODAL_BTN,background:"#991B1B",border:"none",color:"#fff",fontWeight:600,opacity:canGo?1:0.4,cursor:canGo?"pointer":"not-allowed" }}>{busy?"Removing…":"Remove player"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RemovedModal({ onClose, onRestored }) {
+  const [rows,setRows]=useState(null);
+  const [busy,setBusy]=useState(null);
+  const [err,setErr]=useState("");
+  const load=()=>apiJson("/players/removed").then(({ok,d})=>setRows(ok&&Array.isArray(d)?d:[])).catch(()=>setRows([]));
+  useEffect(()=>{ load(); },[]);
+  const restore=async(id)=>{
+    setBusy(id); setErr("");
+    try{
+      const {ok,d}=await apiJson(`/players/removed/${id}/restore`,{method:"POST"});
+      if(!ok){ setErr(d?.error||d?.message||"Restore failed."); setBusy(null); return; }
+      onRestored(d); await load();
+    }catch{ setErr("Network error — nothing was changed."); }
+    setBusy(null);
+  };
+  return (
+    <div role="dialog" aria-modal="true" aria-label="Recently removed players" style={{ position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:2100,display:"flex",alignItems:"center",justifyContent:"center",padding:20 }}>
+      <div style={{ background:"#fff",borderRadius:14,maxWidth:520,width:"100%",boxShadow:"0 24px 60px rgba(0,0,0,.22)",overflow:"hidden" }}>
+        <div style={{ padding:"18px 22px 14px",borderBottom:"1px solid #F0EEE8",display:"flex",justifyContent:"space-between" }}>
+          <h2 style={{ fontFamily:"'Fraunces',serif",fontSize:17,fontWeight:700,color:"#1a1a2e",margin:0 }}>Recently removed</h2>
+          <button onClick={onClose} aria-label="Close" style={{ background:"none",border:"none",fontSize:14,color:"#aaa",cursor:"pointer" }}>✕</button>
+        </div>
+        <div style={{ padding:"12px 22px",maxHeight:"60vh",overflowY:"auto" }}>
+          {rows===null?<p style={{ fontFamily:"'DM Mono',monospace",fontSize:12,color:"#888" }}>Loading…</p>
+           :rows.length===0?<p style={{ fontFamily:"'DM Mono',monospace",fontSize:12,color:"#888" }}>Nothing has been removed.</p>
+           :rows.map(x=>(
+            <div key={x.log_id} style={{ display:"flex",alignItems:"center",gap:10,padding:"9px 0",borderBottom:"1px solid #F3F2ED" }}>
+              <div style={{ flex:1,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#333" }}>
+                <b>{x.name}</b><div style={{ fontSize:10,color:"#999" }}>removed by {x.removed_by||"admin"} · {x.removed_at}</div>
+              </div>
+              <button onClick={()=>restore(x.log_id)} disabled={busy===x.log_id} style={{ ...MODAL_BTN,padding:"5px 12px",fontSize:11,background:"#fff",border:"1px solid #E8E6DF",color:"#1a1a2e" }}>{busy===x.log_id?"Restoring…":"↩ Restore"}</button>
+            </div>))}
+          {err&&<p style={{ fontFamily:"'DM Mono',monospace",fontSize:12,color:"#991B1B" }}>{err}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlayerDrawer({ player, onClose, onSave, allPlayers, onRemove }) {
   const [tier,   setTier]   = useState(player.skill_tier_assigned||player.skill_tier_reported||"");
   const [notes,  setNotes]  = useState(player.notes||"");
   const [status, setStatus] = useState(player.status||"registered");
@@ -995,6 +1112,10 @@ function PlayerDrawer({ player, onClose, onSave, allPlayers }) {
 
       {/* Sticky action bar */}
       <div style={{ display:"flex",gap:10,padding:"14px 18px",borderTop:"1px solid #F0EEE8",background:"#fff",flexShrink:0 }}>
+        {onRemove&&player.registered_this_season!==false&&(
+          <button onClick={()=>onRemove(player)} title="Remove this player from 2027 (admin)"
+            style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#991B1B",background:"#fff",border:"1px solid #FCA5A5",padding:"8px 12px",borderRadius:8,cursor:"pointer" }}>🗑 Remove</button>
+        )}
         <a href={`/wp-admin/admin.php?page=grsh-tm-history&search=${encodeURIComponent(player.email||"")}`}
           style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"#1a1a2e",
             textDecoration:"none",border:"1px solid #E8E6DF",padding:"8px 12px",
@@ -1054,6 +1175,10 @@ export default function Players() {
   const [showJersey,    setShowJersey]    = useState(false);  // #8
   const [showDraftPrev, setShowDraftPrev] = useState(false);  // WOW 4
   const [showDupes,     setShowDupes]     = useState(false);  // WOW 5
+  const [removing,      setRemoving]      = useState(null);   // player being removed
+  const [showRemoved,   setShowRemoved]   = useState(false);
+  const [removedUndo,   setRemovedUndo]   = useState(null);   // { log_id, name }
+  const undoTimer = useRef(null);
   const [dismissedDupes,setDismissedDupes]=useState([]);
   const [showEmail,     setShowEmail]     = useState(false);  // WOW 6
   const [showShortcuts, setShowShortcuts] = useState(false);  // #23
@@ -1105,6 +1230,15 @@ export default function Players() {
   };
   useEffect(()=>{ loadInvites(); },[]);
 
+  // Divisions come from Settings so this page matches Settings and Rosters
+  const [divTick,setDivTick]=useState(0);
+  useEffect(()=>{
+    fetch(`${API}/players/divisions`,{headers:{"X-WP-Nonce":NONCE}})
+      .then(r=>r.ok?r.json():null)
+      .then(d=>{ if(applyDivisions(normalizeDivisions(d),DIV_REG)) setDivTick(t=>t+1); })
+      .catch(()=>{});
+  },[]);
+
   // Fetch players
   useEffect(()=>{
     setLoading(true);
@@ -1113,6 +1247,20 @@ export default function Players() {
       .then(d=>{ setPlayers(Array.isArray(d)?d:(Array.isArray(d?.players)?d.players:MOCK_PLAYERS)); if(Array.isArray(d?.dismissed_duplicates)) setDismissedDupes(d.dismissed_duplicates); setLoading(false); })
       .catch(()=>{ setPlayers(MOCK_PLAYERS); setLoading(false); });
   },[]);
+
+  const reloadPlayers=()=>fetch(`${API}/players`,{headers:{"X-WP-Nonce":NONCE}}).then(r=>r.ok?r.json():null)
+    .then(d=>{ const list=Array.isArray(d)?d:(Array.isArray(d?.players)?d.players:null); if(list) setPlayers(list); }).catch(()=>{});
+  const afterRemove=(d)=>{
+    setRemoving(null); setSelected(null); reloadPlayers();
+    setRemovedUndo({ log_id:d.log_id, name:d.name });
+    clearTimeout(undoTimer.current); undoTimer.current=setTimeout(()=>setRemovedUndo(null),15000);
+  };
+  const undoRemove=async()=>{
+    if(!removedUndo) return;
+    const {ok,d}=await apiJson(`/players/removed/${removedUndo.log_id}/restore`,{method:"POST"}).catch(()=>({ok:false,d:{}}));
+    setRemovedUndo(null);
+    if(ok){ reloadPlayers(); showToast(`↩ ${d?.name||"Player"} restored`); } else showToast(d?.error||"Restore failed.",5000);
+  };
 
   // Keyboard shortcuts — #23
   useEffect(()=>{
@@ -1146,7 +1294,7 @@ export default function Players() {
   const capWarnings = useMemo(()=>{
     const counts={};
     players.forEach(p=>{ if(p.division_requested){counts[p.division_requested]=(counts[p.division_requested]||0)+1; }});
-    return Object.entries(counts).filter(([div,n])=>n>(DIV_CAPS[div]||30));
+    return Object.entries(counts).filter(([div,n])=>capOf(div)>0&&n>capOf(div));
   },[players]);
 
   // Duplicates — WOW 5
@@ -1220,7 +1368,7 @@ export default function Players() {
     const items=[]; const n=(f)=>players.filter(f).length;
     const unpaid=n(QUEUE_FILTERS.unpaid_on_team);
     if(unpaid) items.push({key:"unpaid_on_team",sev:"high",count:unpaid,text:`player${unpaid!==1?"s are":" is"} on a team but ha${unpaid!==1?"ven't":"sn't"} paid`});
-    capWarnings.forEach(([div,c])=>items.push({key:`cap_${div}`,sev:"high",count:c-(DIV_CAPS[div]||30),text:`over capacity in ${DIVISION_LABEL[div]||div} (${c}/${DIV_CAPS[div]||30})`,div,cta:"Show division"}));
+    capWarnings.forEach(([div,c])=>items.push({key:`cap_${div}`,sev:"high",count:c-capOf(div),text:`over capacity in ${DIVISION_LABEL[div]||div} (${c}/${capOf(div)})`,div,cta:"Show division"}));
     const inc=n(QUEUE_FILTERS.incomplete);
     if(inc) items.push({key:"incomplete",sev:"med",count:inc,text:`registrant${inc!==1?"s":""} missing a division or position`});
     if(dupeCount) items.push({key:"duplicates",sev:"med",count:dupeCount,text:`possible duplicate record${dupeCount!==1?"s":""}`,cta:"Review"});
@@ -1347,6 +1495,8 @@ export default function Players() {
       {/* WOW 4, 5 modals */}
       {showDraftPrev&&<DraftPreviewModal players={players} divisions={ALL_DIVISIONS} onClose={()=>setShowDraftPrev(false)}/>}
       {showInvite&&<RenewalInviteModal targets={inviteTargets} settings={renewSettings} onClose={()=>setShowInvite(false)} onSent={loadInvites}/>}
+      {removing&&<RemovePlayerModal player={removing} onClose={()=>setRemoving(null)} onDone={afterRemove}/>}
+      {showRemoved&&<RemovedModal onClose={()=>setShowRemoved(false)} onRestored={(d)=>{ reloadPlayers(); showToast(`↩ ${d?.name||"Player"} restored`); }}/>}
       {showDupes&&<DuplicateModal players={players} dismissed={dismissedDupes} onClose={()=>setShowDupes(false)}
         onMerge={async(keepId,removeId)=>{
           try{
@@ -1400,7 +1550,7 @@ export default function Players() {
           {/* #13 capacity warnings */}
           {capWarnings.map(([div,n])=>(
             <div key={div} style={{ background:"#FEF2F2",border:"1px solid #FCA5A5",borderRadius:8,padding:"8px 14px",marginBottom:8,fontFamily:"'DM Mono',monospace",fontSize:11,color:"#991B1B" }}>
-              ⚠ {DIVISION_LABEL[div]||div} over capacity — {n} registered, cap is {DIV_CAPS[div]||30}
+              ⚠ {DIVISION_LABEL[div]||div} over capacity — {n} registered, cap is {capOf(div)}
               <a href="/wp-admin/admin.php?page=grsh-tm-alternates" style={{ marginLeft:8,color:"#991B1B",fontWeight:600 }}>Review alternates →</a>
             </div>
           ))}
@@ -1439,6 +1589,7 @@ export default function Players() {
               <button onClick={()=>setShowJersey(j=>!j)} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:showJersey?"#1a1a2e":"#fff",color:showJersey?"#D4A017":"#666",border:`1px solid ${showJersey?"#1a1a2e":"#E8E6DF"}`,padding:"7px 12px",borderRadius:8,cursor:"pointer" }}>🎽 Jerseys</button>
               {/* Export */}
               <button onClick={exportCSV} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#F6F5F0",border:"1px solid #E8E6DF",color:"#666",padding:"7px 12px",borderRadius:8,cursor:"pointer" }}>↓ Export CSV</button>
+              <button onClick={()=>setShowRemoved(true)} title="Players removed from 2027 can be restored here" style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#F6F5F0",border:"1px solid #E8E6DF",color:"#666",padding:"7px 12px",borderRadius:8,cursor:"pointer" }}>↩ Removed</button>
               {/* #23 shortcuts */}
               <button onClick={()=>setShowShortcuts(true)} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#F6F5F0",border:"1px solid #E8E6DF",color:"#888",padding:"7px 10px",borderRadius:8,cursor:"pointer" }}>?</button>
             </div>
@@ -1469,26 +1620,28 @@ export default function Players() {
               <div style={{ display:"flex",gap:10,flexWrap:"wrap" }}>
                 {ALL_DIVISIONS.map(div=>{
                   const n=players.filter(p=>p.division_requested===div).length;
-                  const cap=DIV_CAPS[div]||30;
-                  const pct=Math.min(100,Math.round(n/cap*100));
-                  const col=pct>=100?"#991B1B":pct>=85?"#92400E":"#166534";
+                  const cv=capacityView(n,div,DIV_REG);
+                  const col=cv.kind!=="draft"?"#6B7280":cv.over?"#991B1B":cv.pct>=85?"#92400E":"#166534";
                   const dc=DIVISION_COLOR[div]||{};
                   return (
-                    <div key={div} onClick={()=>setFilterDiv(f=>f===div?"":div)}
+                    <div key={div} onClick={()=>setFilterDiv(f=>f===div?"":div)} title={cv.title}
                       style={{ flex:1,minWidth:80,cursor:"pointer",padding:"8px 10px",
                         background:filterDiv===div?dc.bg||"#F6F5F0":"#F6F5F0",borderRadius:8,
                         border:`1px solid ${filterDiv===div?dc.border||"#E8E6DF":"transparent"}` }}>
-                      <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:dc.color||"#888",textTransform:"uppercase",marginBottom:4 }}>{DIVISION_LABEL[div]}</div>
+                      <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:dc.color||"#888",textTransform:"uppercase",marginBottom:4 }}>{DIVISION_LABEL[div]||div}</div>
                       <div style={{ height:4,background:"#E8E6DF",borderRadius:99,overflow:"hidden",marginBottom:3 }}>
-                        <div style={{ height:"100%",width:`${pct}%`,background:col,borderRadius:99,transition:"width .5s" }}/>
+                        <div style={{ height:"100%",width:`${cv.pct}%`,background:col,borderRadius:99,transition:"width .5s" }}/>
                       </div>
                       <div style={{ fontFamily:"'DM Mono',monospace",fontSize:9,color:col,fontWeight:500 }}>
-                        {n}/{cap} {pct>=100&&"⚠ over"}
+                        {cv.text} {cv.over&&"⚠ over"}
                       </div>
                     </div>
                   );
                 })}
               </div>
+              {offListCount(players,ALL_DIVISIONS)>0&&<div style={{ fontFamily:"'DM Mono',monospace",fontSize:10,color:"#92400E",marginTop:8 }}>
+                {offListCount(players,ALL_DIVISIONS)} registrant{offListCount(players,ALL_DIVISIONS)===1?"":"s"} asked for a division that is switched off in Settings.
+              </div>}
             </div>
           )}
 
@@ -1859,7 +2012,7 @@ export default function Players() {
                   style={{ fontFamily:"'DM Mono',monospace",fontSize:11,background:"#fff",border:"1px solid #E8E6DF",color:"#555",padding:"3px 10px",borderRadius:6,cursor:"pointer",opacity:filtered.findIndex(p=>p.id===selected.id)===filtered.length-1?0.35:1 }}>↓ Next</button>
               </div>
             </div>
-            <PlayerDrawer player={selected} onClose={()=>setSelected(null)} onSave={handleSave} allPlayers={players}/>
+            <PlayerDrawer player={selected} onClose={()=>setSelected(null)} onSave={handleSave} allPlayers={players} onRemove={setRemoving}/>
           </div>
         )}
 
@@ -1875,6 +2028,13 @@ export default function Players() {
           boxShadow:"0 8px 24px rgba(0,0,0,.2)",zIndex:1000,animation:"slideUp .25s ease" }}>
           <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"rgba(212,160,23,.7)" }}>Change made</span>
           <button onClick={handleUndo} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:500,background:"#D4A017",color:"#1a1a2e",border:"none",padding:"3px 12px",borderRadius:99,cursor:"pointer" }}>↩ Undo (Ctrl+Z)</button>
+        </div>
+      )}
+
+      {removedUndo&&(
+        <div style={{ position:"fixed",bottom:70,right:24,display:"flex",alignItems:"center",gap:10,background:"#1a1a2e",borderRadius:99,padding:"8px 16px",boxShadow:"0 8px 24px rgba(0,0,0,.2)",zIndex:2000 }}>
+          <span style={{ fontFamily:"'DM Mono',monospace",fontSize:11,color:"rgba(212,160,23,.85)" }}>{removedUndo.name} removed</span>
+          <button onClick={undoRemove} style={{ fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:500,background:"#D4A017",color:"#1a1a2e",border:"none",padding:"3px 12px",borderRadius:99,cursor:"pointer" }}>↩ Undo</button>
         </div>
       )}
 

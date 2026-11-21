@@ -136,6 +136,11 @@ class GRSH_Captain_Invite {
         $team_name = (string) ( $body['team_name'] ?? '' );
         $division  = (string) ( $body['division'] ?? '' );
 
+        // Settings > Divisions > Format: a draft-only division takes no registered teams.
+        if ( $division !== '' && class_exists( 'GRSH_Settings' ) && method_exists( 'GRSH_Settings', 'division_format' ) && GRSH_Settings::division_format( $division ) === 'draft' ) {
+            return new WP_REST_Response( [ 'error' => 'That division is set to Draft in Settings, so it does not take registered teams. Change its Format to "Registered teams" or "Both" first.' ], 400 );
+        }
+
         $result = GRSH_Captain_Provision::provision( $name, $email, $team_name, $division );
 
         if ( empty( $result['ok'] ) ) {
@@ -239,7 +244,7 @@ class GRSH_Captain_Invite {
             'checkUrl'      => esc_url_raw( rest_url( 'grsh/v1/admin/captains/check' ) ),
             'resetLinkUrl'  => esc_url_raw( rest_url( 'grsh/v1/admin/captains/reset-link' ) ),
             'nonce'         => wp_create_nonce( 'wp_rest' ),
-            'divisions'     => class_exists( 'GRSH_Settings' ) ? GRSH_Settings::get_active_divisions() : [],
+            'divisions'     => class_exists( 'GRSH_Settings' ) ? GRSH_Settings::divisions_for( 'full_team' ) : [],
             'rosterUrl'     => self::get_roster_page_url(),
             'fullTeamsUrl'  => admin_url( 'admin.php?page=grsh-tm-full-teams' ),
         ] );

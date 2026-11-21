@@ -3,7 +3,7 @@
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-exports.addDays = exports.STATUSES = exports.IRREVERSIBLE = exports.FIELD_LABELS = void 0;
+exports.addDays = exports.STATUSES = exports.IRREVERSIBLE = exports.FORMAT_LABEL = exports.FORMAT_HELP = exports.FORMATS = exports.FIELD_LABELS = void 0;
 exports.addYears = addYears;
 exports.buildPayload = buildPayload;
 exports.capacity = capacity;
@@ -13,19 +13,25 @@ exports.diff = diff;
 exports.divisionWarnings = divisionWarnings;
 exports.errorTabCounts = errorTabCounts;
 exports.exportPayload = exportPayload;
+exports.fillDivision = fillDivision;
 exports.fmtDate = fmtDate;
 exports.fmtValue = fmtValue;
+exports.gate = gate;
+exports.impactErrors = impactErrors;
 exports.importPayload = importPayload;
 exports.labelFor = labelFor;
 exports.localToday = localToday;
 exports.mapServerErrors = mapServerErrors;
 exports.money = void 0;
+exports.revenueForecast = revenueForecast;
 exports.rolloverPlan = rolloverPlan;
+exports.slotSplit = slotSplit;
 exports.tabOfError = tabOfError;
 exports.teamFeeFor = teamFeeFor;
 exports.timelineModel = timelineModel;
 exports.toNum = toNum;
 exports.validate = validate;
+exports.whatIf = whatIf;
 exports.wiringState = wiringState;
 exports.ymdToDays = ymdToDays;
 // Pure helpers for the Settings page. No React, no network, no Date-timezone surprises:
@@ -33,6 +39,18 @@ exports.ymdToDays = ymdToDays;
 
 const STATUSES = exports.STATUSES = ["setup", "open", "draft", "locked", "complete"];
 const IRREVERSIBLE = exports.IRREVERSIBLE = ["locked", "complete"];
+/** How a division fills its teams. A row with no format is "both", which is how every division behaved before this setting existed. */
+const FORMATS = exports.FORMATS = ["draft", "teams", "both"];
+const FORMAT_LABEL = exports.FORMAT_LABEL = {
+  draft: "Draft",
+  teams: "Registered teams",
+  both: "Both"
+};
+const FORMAT_HELP = exports.FORMAT_HELP = {
+  draft: "Players register one by one and the draft builds the teams.",
+  teams: "Captains register whole teams and pay a deposit. No draft.",
+  both: "Some slots are registered teams, the rest are filled by the draft."
+};
 const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 function toNum(v) {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -197,6 +215,8 @@ const FIELD_LABELS = exports.FIELD_LABELS = {
 };
 const DIV_FIELDS = {
   enabled: "enabled",
+  format: "format",
+  reg_teams: "registered-team slots",
   teams: "teams",
   min_roster: "min roster",
   max_roster: "max roster",
@@ -226,6 +246,7 @@ function fmtValue(key, v) {
   if (v === null || v === undefined || v === "") return "not set";
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (key.endsWith(".enabled")) return v ? "On" : "Off";
+  if (key.endsWith(".format")) return FORMAT_LABEL[v] || String(v);
   if (MONEY.has(key)) return money(v);
   if (DATES.has(key)) return fmtDate(v);
   return String(v);
@@ -319,6 +340,10 @@ function validate(cfg) {
     if (!String(dv.label || "").trim()) w(p + "label", "Name is required.");
     if (seen.has(dv.key)) w(p + "key", "Duplicate division.");
     seen.add(dv.key);
+    if (dv.format !== undefined && !FORMATS.includes(dv.format)) w(p + "format", "Pick Draft, Registered teams or Both.");
+    const rt = toNum(dv.reg_teams),
+      tm = toNum(dv.teams);
+    if (dv.format === "both" && dv.reg_teams !== undefined && dv.reg_teams !== "" && (rt === null || !Number.isInteger(rt) || rt < 0)) w(p + "reg_teams", "0 or more.");else if (dv.format === "both" && rt !== null && tm !== null && rt > tm) w(p + "reg_teams", "More registered-team slots than teams.");
     const R = {
       teams: [1, 16],
       min_roster: [4, 30],
@@ -371,32 +396,154 @@ function teamFeeFor(cfg, paidYmd) {
     saving: la - ea
   };
 }
+/** Fill the format fields a saved row may not have. Mirrors GRSH_Settings::fill_division(). */
+function fillDivision(d) {
+  const f = FORMATS.includes(d && d.format) ? d.format : "both";
+  const t = toNum(d && d.teams),
+    r = toNum(d && d.reg_teams) || 0;
+  const reg = f === "draft" ? 0 : f === "teams" ? t || 0 : Math.max(0, Math.min(t || 0, r));
+  return {
+    ...d,
+    format: f,
+    reg_teams: reg
+  };
+}
+/** Teams a division fills from the draft pool vs by captain registration. Null while Teams is blank. */
+function slotSplit(dv) {
+  const d = fillDivision(dv),
+    t = toNum(d.teams);
+  if (t === null) return {
+    draft: null,
+    teams: null,
+    total: null
+  };
+  return {
+    draft: t - d.reg_teams,
+    teams: d.reg_teams,
+    total: t
+  };
+}
+/** Draft pool math. Only draft slots draw on registered players, so a "teams" division needs none. */
 function capacity(dv) {
-  const t = toNum(dv.teams),
+  const sp = slotSplit(dv),
     mx = toNum(dv.max_roster),
     mn = toNum(dv.min_roster),
     g = toNum(dv.goalie_min);
-  if (t === null || mx === null || mn === null) return {
+  if (sp.draft === null || mx === null || mn === null) return {
     slots: null,
     needed: null,
     goalies: null
   };
   return {
-    slots: t * mx,
-    needed: t * mn,
-    goalies: g === null ? null : t * g
+    slots: sp.draft * mx,
+    needed: sp.draft * mn,
+    goalies: g === null ? null : sp.draft * g
+  };
+}
+/** The what-if panel: given who has registered, what does this division still need. */
+function whatIf(dv, reg) {
+  const sp = slotSplit(dv),
+    cap = capacity(dv),
+    n = reg && reg.registered || 0,
+    g = reg && reg.goalies || 0;
+  const full = reg && reg.full_teams || 0;
+  if (sp.total === null || cap.slots === null) return null;
+  const fmt = fillDivision(dv).format;
+  const out = {
+    format: fmt,
+    draftSlots: sp.draft,
+    teamSlots: sp.teams,
+    registered: n,
+    goalies: g,
+    fullTeams: full
+  };
+  if (fmt !== "teams") {
+    out.spotsLeft = cap.slots - n;
+    out.needMore = Math.max(0, cap.needed - n);
+    out.goalieGap = cap.goalies === null ? 0 : Math.max(0, cap.goalies - g);
+    out.pct = cap.slots ? Math.min(100, Math.round(n / cap.slots * 100)) : 0;
+    out.runs = n >= cap.needed && out.goalieGap === 0;
+  }
+  if (fmt !== "draft") {
+    out.teamsLeft = Math.max(0, sp.teams - full);
+    out.teamsFull = sp.teams > 0 && full >= sp.teams;
+  }
+  return out;
+}
+/** Changes that would break teams that already exist. Mirrors GRSH_Settings::impact_errors(); only values that CHANGED are checked. */
+function impactErrors(oldCfg, newCfg, registered) {
+  const e = {},
+    old = new Map((oldCfg && oldCfg.divisions || []).map(d => [d.key, fillDivision(d)]));
+  (newCfg && newCfg.divisions || []).forEach((d0, i) => {
+    const d = fillDivision(d0);
+    if (!d.enabled) return;
+    const rg = registered && registered[d.key] || {},
+      was = old.get(d.key),
+      p = `divisions.${i}.`;
+    if (!was) return;
+    const full = rg.full_teams || 0,
+      drafts = rg.teams || 0,
+      made = full + drafts;
+    if (was.format !== d.format) {
+      if (d.format === "draft" && full > 0) e[p + "format"] = `${plural(full, "registered team")} already exist in ${d.label}. Remove or move them before switching to Draft.`;
+      if (d.format === "teams" && drafts > 0) e[p + "format"] = `${plural(drafts, "draft team")} already exist in ${d.label}. Remove them before switching to Registered teams.`;
+    }
+    const t = toNum(d.teams),
+      mx = toNum(d.max_roster);
+    if (t !== null && toNum(was.teams) !== t && t < made) e[p + "teams"] = `${d.label} already has ${plural(made, "team")} created, so it cannot go below that.`;
+    if (mx !== null && toNum(was.max_roster) !== mx && mx < (rg.max_roster_n || 0)) e[p + "max_roster"] = `A ${d.label} team already has ${plural(rg.max_roster_n, "player")}, so the max cannot go below that.`;
+  });
+  return e;
+}
+/** Revenue forecast from what the settings say (not what has been paid). */
+function revenueForecast(cfg, regd) {
+  const n = k => toNum(cfg[k]) || 0;
+  let teamSlots = 0,
+    players = 0;
+  (cfg.divisions || []).forEach(d => {
+    if (!d.enabled) return;
+    teamSlots += slotSplit(d).teams || 0;
+    players += regd && regd[d.key] && regd[d.key].registered || 0;
+  });
+  const early = teamSlots * n("team_fee_early_amount"),
+    late = teamSlots * n("team_fee_late_amount"),
+    dep = teamSlots * n("team_deposit_amount");
+  const pf = toNum(cfg.player_fee);
+  return {
+    teamSlots,
+    deposits: dep,
+    earlyTotal: early,
+    lateTotal: late,
+    upsideIfLate: late - early,
+    players,
+    playerRevenue: pf === null ? null : players * pf
+  };
+}
+/** Go-live gate: what stands between the saved season and a new status. */
+function gate(readiness, status) {
+  const list = readiness && readiness[status] || [];
+  return {
+    blockers: list.filter(c => c.level === "block"),
+    warnings: list.filter(c => c.level === "warn"),
+    ok: list.filter(c => c.level === "ok")
   };
 }
 function divisionWarnings(oldCfg, newCfg, registered) {
   const out = [];
-  const old = new Map((oldCfg && oldCfg.divisions || []).map(d => [d.key, d]));
-  (newCfg && newCfg.divisions || []).forEach(d => {
-    const n = registered && registered[d.key] && registered[d.key].registered || 0;
-    const was = old.get(d.key);
+  const old = new Map((oldCfg && oldCfg.divisions || []).map(d => [d.key, fillDivision(d)]));
+  (newCfg && newCfg.divisions || []).forEach(d0 => {
+    const d = fillDivision(d0),
+      rg = registered && registered[d.key] || {};
+    const n = rg.registered || 0,
+      was = old.get(d.key);
     if (was && was.enabled && !d.enabled && n > 0) out.push(`${d.label} is being turned off but has ${plural(n, "registered player")}. They will disappear from Players, Rosters and Reports.`);
     if (d.enabled) {
       const cap = capacity(d).slots;
-      if (cap !== null && n > cap) out.push(`${d.label}: ${plural(n, "player")} registered but only ${cap} roster spots (${d.teams} teams × ${d.max_roster}).`);
+      if (cap !== null && d.format !== "teams" && n > cap) out.push(`${d.label}: ${plural(n, "player")} registered but only ${cap} roster spots (${slotSplit(d).draft} draft teams × ${d.max_roster}).`);
+      if (was && was.format !== d.format) {
+        if (d.format === "draft" && rg.full_teams > 0) out.push(`${d.label} is going to Draft but has ${plural(rg.full_teams, "registered team")}. Captain Sync and deposit emails will still see them.`);
+        if (d.format === "teams" && rg.teams > 0) out.push(`${d.label} is going to Registered teams but has ${plural(rg.teams, "draft team")}.`);
+      }
     }
   });
   return out;
@@ -483,7 +630,11 @@ function buildPayload(cfg, savedAt) {
   });
   out.player_fee = cfg.player_fee === null || cfg.player_fee === undefined || String(cfg.player_fee).trim() === "" ? null : n(cfg.player_fee);
   out.divisions = (cfg.divisions || []).map(d => ({
-    ...d,
+    ...fillDivision(d),
+    reg_teams: fillDivision({
+      ...d,
+      teams: n(d.teams)
+    }).reg_teams,
     teams: n(d.teams),
     min_roster: n(d.min_roster),
     max_roster: n(d.max_roster),

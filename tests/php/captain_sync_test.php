@@ -7,7 +7,9 @@ class GRSH_Settings {
                   'team_fee_early_cutoff_date' => '2027-01-06', 'team_balance_due_date' => '2027-03-08' ];
     static function get() { return self::$s; }
     static function mail_headers() { return []; }
-    static function get_active_divisions() { return [ [ 'key' => 'gold_open', 'label' => 'Gold Open', 'teams' => 3 ], [ 'key' => '45a', 'label' => '45A', 'teams' => 2 ] ]; }
+    static $extra = [];   // per-division format overrides for the format tests
+    static function get_active_divisions() { $o = []; foreach ( [ [ 'key' => 'gold_open', 'label' => 'Gold Open', 'teams' => 3 ], [ 'key' => '45a', 'label' => '45A', 'teams' => 2 ] ] as $d ) { $o[] = array_merge( $d, self::$extra[ $d['key'] ] ?? [] ); } return $o; }
+    static function division_format( $k ) { return self::$extra[ $k ]['format'] ?? 'both'; }
 }
 class GRSH_Scoring { const FULL_TEAM_MIN_PLAYERS = 11; }
 $GLOBALS['users'] = [];
@@ -297,5 +299,104 @@ $bal = []; foreach ( $o['balance']['rows'] as $x ) { $bal[ $x['key'] ] = $x; }
 eq( [ $bal['gold_open']['expected'], $bal['gold_open']['actual'], $bal['gold_open']['delta'] ], [ 3, 6, 3 ], 'Gold Open count against Settings' ); eq( $bal['45a']['actual'], 3, '45A count' ); eq( $o['balance']['other'], 0, 'no teams outside the divisions' );
 $db->pdo->exec( "UPDATE wp_grsh_teams SET division = '' WHERE id = $h" ); eq( ov()['balance']['other'], 1, 'a team with a bad division is counted as other' );
 GRSH_Settings::$s['season_year'] = 2099; eq( GRSH_Captain_Sync::rest_delete_teams( req( [ 'team_ids' => [ $d2 ], 'confirm' => 'DELETE' ] ) )->status, 409, 'nothing is deleted when the season is missing' ); eq( GRSH_Captain_Sync::rest_team_captain( req( [ 'team_id' => $d2, 'player_id' => $pz ] ) )->status, 409, 'nor re-assigned' ); eq( GRSH_Captain_Sync::rest_nudge( req( [ 'team_ids' => [ $a ], 'dry_run' => true ] ) )->status, 409, 'nor nudged' ); GRSH_Settings::$s['season_year'] = 2027;
+
+
+echo "15. division balance follows the Format setting\n";
+GRSH_Settings::$s['season_year'] = 2027;
+GRSH_Settings::$extra = [ '45a' => [ 'format' => 'draft' ], 'gold_open' => [ 'format' => 'both', 'reg_teams' => 2 ] ];
+$bal = []; foreach ( ov()['balance']['rows'] as $x ) { $bal[ $x['key'] ] = $x; }
+eq( [ $bal['45a']['format'], $bal['45a']['expected'], $bal['45a']['delta'] ], [ 'draft', null, null ], 'a draft-only division expects no registered teams' );
+eq( [ $bal['gold_open']['format'], $bal['gold_open']['expected'] ], [ 'both', 2 ], 'a mixed division expects only its registered slots' );
+GRSH_Settings::$extra = [ 'gold_open' => [ 'format' => 'teams' ] ];
+$bal = []; foreach ( ov()['balance']['rows'] as $x ) { $bal[ $x['key'] ] = $x; } eq( $bal['gold_open']['expected'], 3, 'a teams division expects all its teams' );
+GRSH_Settings::$extra = [ '45a' => [ 'format' => 'draft' ] ];
+ok( has_issue( ov(), 'team_in_draft_division' ), 'a team sitting in a draft-only division is flagged' );
+GRSH_Settings::$extra = [];
+ok( ! has_issue( ov(), 'team_in_draft_division' ), 'and not when formats allow it' );
+
+echo "16. possible duplicates\n";
+$pX = mk_player( 'Xan', null, 'dupe@x.test' ); $pY = mk_player( 'Yul', null, 'DUPE@x.test' );
+$tX = mk_team( 'Mountain Wolves', '45a', $pX ); $tY = mk_team( 'Mountain Wolvez', '45a', $pY );
+ok( has_issue( ov(), 'near_duplicate_team' ), 'near-identical names in one division are flagged' );
+$tZ = mk_team( 'Completely Different', 'gold_open', mk_player( 'Zed', null, 'dupe@x.test' ) );
+$dups = array_filter( ov()['issues'], function ( $i ) { return $i['key'] === 'near_duplicate_team'; } ); ok( count( $dups ) >= 2, 'a shared captain email is flagged even with different names' );
+$db->pdo->exec( "DELETE FROM wp_grsh_teams WHERE id IN ($tX,$tY,$tZ)" );
+ok( ! has_issue( ov(), 'near_duplicate_team' ), 'no duplicate flag once they are gone' );
+
+echo "17. removing a team that has things attached\n";
+$db->pdo->exec( "CREATE TABLE IF NOT EXISTS wp_users (ID INTEGER PRIMARY KEY, user_activation_key TEXT); DELETE FROM wp_users;" );
+$pR = mk_player( 'Rae', 31 ); $tR = mk_team( 'Real Team', '45a', $pR, 1, [ 'deposit_paid_at' => '2027-01-02 09:00:00', 'fee_total' => 1750, 'fee_tier' => 'early', 'deposit_amount' => 500, 'balance_due' => 1250, 'payment_status' => 'deposit_paid' ] ); mk_roster( $tR, 3 );
+$GLOBALS['users'][31] = (object) [ 'user_activation_key' => '' ];
+$r = GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => $tR, 'dry_run' => true ] ) );
+eq( $r->status, 200, 'preview works' ); ok( $r->data['impact']['needs_ack'] && count( $r->data['impact']['removes'] ) === 3 && in_array( 'player records', $r->data['impact']['keeps'], true ), 'preview lists what goes (team, roster rows, payment) and what stays' );
+eq( (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_teams WHERE id = $tR" ), 1, 'a preview removes nothing' );
+eq( GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => $tR, 'reason' => 'x', 'confirm_name' => 'Real Team', 'acknowledge' => true ] ) )->status, 400, 'a one-letter reason is refused' );
+eq( GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => $tR, 'reason' => 'Disbanded', 'confirm_name' => 'Wrong', 'acknowledge' => true ] ) )->status, 400, 'the wrong team name is refused' );
+eq( GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => $tR, 'reason' => 'Disbanded', 'confirm_name' => 'real team' ] ) )->status, 400, 'players or money need the acknowledgement box' );
+eq( (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_teams WHERE id = $tR" ) + (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_rosters WHERE team_id = $tR" ), 4, 'every refusal left the team and its roster alone' );
+$db->insert( 'wp_grsh_player_history', [ 'player_id' => 1, 'season_id' => 1, 'team_id' => $tR ] );
+$r = GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => $tR, 'reason' => 'Disbanded', 'confirm_name' => 'Real Team', 'acknowledge' => true ] ) );
+eq( $r->status, 409, 'player history still blocks removal (it would be orphaned)' ); ok( strpos( $r->data['message'], 'player history' ) !== false, 'and says why' );
+$db->pdo->exec( "DELETE FROM wp_grsh_player_history WHERE team_id = $tR" );
+$r = GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => $tR, 'reason' => 'Disbanded', 'confirm_name' => 'Real Team', 'acknowledge' => true ] ) );
+eq( $r->status, 200, 'removal works with reason, name and acknowledgement' );
+eq( [ (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_teams WHERE id = $tR" ), (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_rosters WHERE team_id = $tR" ) ], [ 0, 0 ], 'team and roster rows are gone' );
+eq( (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_players WHERE id = $pR" ), 1, 'the captain player record is untouched' );
+$hx = null; foreach ( ov()['history'] as $x ) { if ( $x['action'] === 'captain_sync_team_deleted' && $x['team_id'] === $tR ) { $hx = $x; } }
+ok( $hx && $hx['can_restore'] && strpos( $hx['notes'], 'Disbanded' ) !== false, 'history records the reason and offers restore' );
+eq( GRSH_Captain_Sync::rest_restore_team( req( [ 'audit_id' => $hx['id'] ] ) )->status, 200, 'restore works' );
+eq( [ team( $tR )['name'], team( $tR )['payment_status'], (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_rosters WHERE team_id = $tR" ) ], [ 'Real Team', 'deposit_paid', 3 ], 'restore brings back the team, its payment and its 3 roster rows' );
+eq( GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => 99999, 'dry_run' => true ] ) )->status, 404, 'unknown team' );
+GRSH_Settings::$s['season_year'] = 2099; eq( GRSH_Captain_Sync::rest_remove_team( req( [ 'team_id' => $tR, 'dry_run' => true ] ) )->status, 409, 'no removals while the season is missing' ); GRSH_Settings::$s['season_year'] = 2027;
+
+echo "18. revoke invite and detach captain\n";
+$pI = mk_player( 'Ivy', 32 ); $tI = mk_team( 'Ivy Team', 'gold_open', $pI );
+$db->insert( 'wp_users', [ 'ID' => 32, 'user_activation_key' => 'keyabc' ] ); $GLOBALS['users'][32] = (object) [ 'user_activation_key' => 'keyabc' ];
+eq( GRSH_Captain_Sync::rest_revoke_invite( req( [ 'team_id' => $tI, 'reason' => '' ] ) )->status, 400, 'revoke needs a reason' );
+eq( GRSH_Captain_Sync::rest_revoke_invite( req( [ 'team_id' => $tR, 'reason' => 'no longer needed' ] ) )->status, 409, 'revoke refuses when there is no unused invite' );
+$r = GRSH_Captain_Sync::rest_revoke_invite( req( [ 'team_id' => $tI, 'reason' => 'Sent to wrong person' ] ) );
+eq( $r->status, 200, 'revoke works' ); eq( (string) $db->get_var( "SELECT user_activation_key FROM wp_users WHERE ID = 32" ), '', 'the link key is cleared' );
+eq( (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_audit_logs WHERE action = 'captain_sync_invite_revoked' AND object_id = $tI" ), 1, 'logged in the audit trail' );
+eq( (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_players WHERE id = $pI" ), 1, 'the player record is untouched' );
+$GLOBALS['users'][32]->user_activation_key = '';
+$db->pdo->exec( "UPDATE wp_users SET user_activation_key = 'again' WHERE ID = 32" ); $GLOBALS['users'][32]->user_activation_key = 'again';
+$r = GRSH_Captain_Sync::rest_detach_captain( req( [ 'team_id' => $tI, 'reason' => 'Captain stepped down', 'revoke_invite' => true ] ) );
+eq( $r->status, 200, 'detach works' ); eq( team( $tI )['captain_player_id'], null, 'the team has no captain now' ); eq( (string) $db->get_var( "SELECT user_activation_key FROM wp_users WHERE ID = 32" ), '', 'detach with revoke also kills the invite' );
+eq( (int) $db->get_var( "SELECT COUNT(*) FROM wp_grsh_players WHERE id = $pI" ), 1, 'detach never deletes the player' );
+eq( GRSH_Captain_Sync::rest_detach_captain( req( [ 'team_id' => $tI, 'reason' => 'again' ] ) )->status, 409, 'a team with no captain cannot be detached' );
+$hd = null; foreach ( ov()['history'] as $x ) { if ( $x['action'] === 'captain_sync_captain_detached' && $x['team_id'] === $tI ) { $hd = $x; } }
+ok( $hd && $hd['can_reattach'], 'history offers to put the captain back' );
+$r = GRSH_Captain_Sync::rest_reattach_captain( req( [ 'audit_id' => $hd['id'] ] ) ); eq( $r->status, 200, 'reattach works' ); eq( (int) team( $tI )['captain_player_id'], $pI, 'captain is back' );
+eq( GRSH_Captain_Sync::rest_reattach_captain( req( [ 'audit_id' => $hd['id'] ] ) )->status, 409, 'cannot reattach twice' );
+GRSH_Captain_Sync::rest_detach_captain( req( [ 'team_id' => $tI, 'reason' => 'again' ] ) );
+$tJ = mk_team( 'Other', '45a', $pI ); $hd2 = null; foreach ( ov()['history'] as $x ) { if ( $x['action'] === 'captain_sync_captain_detached' && ! $x['undone'] && $x['team_id'] === $tI ) { $hd2 = $x; } }
+ok( $hd2 && ! $hd2['can_reattach'], 'no reattach when that player now captains another team' ); $db->pdo->exec( "DELETE FROM wp_grsh_teams WHERE id IN ($tJ,$tI)" );
+
+echo "19. notes, idle days, digest, detail\n";
+$pN = mk_player( 'Nia', null ); $tN = mk_team( 'Note Team', 'gold_open', $pN );
+eq( GRSH_Captain_Sync::rest_note( req( [ 'team_id' => $tN, 'note' => str_repeat( 'x', 501 ) ] ) )->status, 400, 'long note refused' );
+eq( GRSH_Captain_Sync::rest_note( req( [ 'team_id' => $tN, 'note' => 'ok', 'tag' => 'bogus' ] ) )->status, 400, 'unknown tag refused' );
+eq( GRSH_Captain_Sync::rest_note( req( [ 'team_id' => $tN, 'note' => 'ok', 'follow_up' => '2027-02-30' ] ) )->status, 400, 'a made-up date is refused' );
+eq( GRSH_Captain_Sync::rest_note( req( [ 'team_id' => 99999, 'note' => 'ok' ] ) )->status, 404, 'note on an unknown team' );
+$r = GRSH_Captain_Sync::rest_note( req( [ 'team_id' => $tN, 'note' => 'Phoned, paying by check', 'tag' => 'paying_by_check', 'follow_up' => '2020-01-01' ] ) );
+eq( $r->status, 200, 'note saves' ); $tm = null; foreach ( ov()['teams'] as $x ) { if ( $x['id'] === $tN ) { $tm = $x; } }
+eq( [ $tm['note']['note'], $tm['note']['tag'], $tm['note']['follow_up'] ], [ 'Phoned, paying by check', 'paying_by_check', '2020-01-01' ], 'the note comes back on the team' );
+ok( has_issue( ov(), 'follow_up_due', 'team_id', $tN ), 'a follow-up date in the past becomes a problem entry' );
+GRSH_Captain_Sync::rest_note( req( [ 'team_id' => $tN ] ) ); $tm = null; foreach ( ov()['teams'] as $x ) { if ( $x['id'] === $tN ) { $tm = $x; } } eq( $tm['note'], null, 'an empty save clears the note' );
+$now = time();
+eq( GRSH_Captain_Sync::idle_days( [ 'created_at' => gmdate( 'Y-m-d H:i:s', $now - 20 * 86400 ) ], '', $now ), 20, 'idle days from creation' );
+eq( GRSH_Captain_Sync::idle_days( [ 'created_at' => gmdate( 'Y-m-d H:i:s', $now - 20 * 86400 ) ], gmdate( 'Y-m-d H:i:s', $now - 2 * 86400 ), $now ), 2, 'recent activity resets idle days' );
+eq( GRSH_Captain_Sync::idle_days( [ 'created_at' => '2020-01-01 00:00:00', 'deposit_paid_at' => '2027-01-01' ], '', $now ), null, 'a team that paid is never idle' );
+$dg = GRSH_Captain_Sync::digest_text( [ 'pending' => 2, 'issues' => [ [ 'level' => 'bad' ], [ 'level' => 'warn' ], [ 'level' => 'info' ] ], 'teams' => [ [ 'name' => 'A', 'idle_days' => 20, 'note' => null ], [ 'name' => 'B', 'idle_days' => 3, 'note' => [ 'follow_up' => '2026-11-01', 'note' => 'call Sam' ] ] ], 'generated_at' => '2026-11-17 10:00:00', 'money' => [ 'tier_now' => 'early', 'days_left' => 1, 'waiting' => 2 ] ] );
+ok( strpos( $dg, '2 deposits paid on the form' ) !== false && strpos( $dg, '1 problem to fix and 1 to look at' ) !== false && strpos( $dg, '1 team has had no activity' ) !== false && strpos( $dg, 'Follow-up due: B: call Sam' ) !== false && strpos( $dg, 'ends in 1 day;' ) !== false, "digest lists each thing that needs the secretary ($dg)" );
+ok( strpos( GRSH_Captain_Sync::digest_text( [ 'pending' => 0, 'issues' => [], 'teams' => [], 'money' => [] ] ), 'Nothing needs you' ) === 0, 'digest says so when nothing is needed' );
+$GLOBALS['mails'] = []; $r = GRSH_Captain_Sync::rest_digest( req( [] ) ); ok( $r->data['sent'] === false && $GLOBALS['mails'] === [], 'digest preview sends nothing' );
+$r = GRSH_Captain_Sync::rest_digest( req( [ 'send' => true ] ) ); eq( [ $r->status, $GLOBALS['mails'][0][0] ?? '' ], [ 200, 'admin@test.test' ], 'digest goes only to the signed-in admin' );
+for ( $i = 0; $i < 3; $i++ ) { $db->insert( 'wp_grsh_players', [ 'id' => 1000 + $tR * 100 + $i, 'first_name' => 'P' . $i, 'last_name' => 'Roster' ] ); }
+$rq = new WP_REST_Request( [ 'team_id' => $tR ], [] ); $r = GRSH_Captain_Sync::rest_team_detail( $rq );
+ok( $r->status === 200 && count( $r->data['players'] ) === 3 && count( $r->data['ledger'] ) >= 2 && is_array( $r->data['timeline'] ), 'team detail returns roster, ledger and timeline' );
+eq( GRSH_Captain_Sync::rest_team_detail( new WP_REST_Request( [ 'team_id' => 99999 ], [] ) )->status, 404, 'detail of an unknown team' );
+$o = ov(); ok( array_key_exists( 'last_entry_at', $o ) && $o['last_entry_at'] !== null, 'overview reports when the last live form entry arrived' );
+foreach ( [ 'remove-team', 'revoke-invite', 'detach-captain', 'reattach-captain', 'note', 'digest', 'team-detail' ] as $rt ) { GRSH_Captain_Sync::register_routes(); ok( isset( $GLOBALS['routes'][ 'grsh/v1/captain-sync/' . $rt ] ), "route $rt is registered" ); }
 
 echo "\nPASS $pass  FAIL $fail\n"; exit( $fail ? 1 : 0 );

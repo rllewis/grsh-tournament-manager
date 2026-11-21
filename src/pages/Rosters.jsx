@@ -11,6 +11,7 @@ import { formatReturningBadge, scoreBreakdown, TIER_DESCRIPTIONS } from "../lib/
 import {
   POS_LABEL, POS_SHORT, tierOf, scoreOf, teamStats, bandOf, spreadOf, targetSize, slotTemplate, fillSlots,
   pinViolations, assignMap, diffAssign, proposeBalance, findSwaps, projectMove, suggestFor, teamHealth,
+  divisionTabLabel, lockSummary, lockBlock, positionNeeds, explainSwap, comparePlans, currentAssign, plannedTeamNames, blockers as blockersOf, warnings as warningsOf, whyDisabled, KEY_ITEMS,
 } from "../lib/rosterEngine";
 
 const API   = window.grshConfig?.apiUrl || "/wp-json/grsh/v1";
@@ -61,7 +62,7 @@ function PosDot({ p }) {
   return <span title={POS_LABEL[effPos(p)] || "No position"} style={{ ...chip(c), width: 20, textAlign: "center", padding: "2px 0", fontFamily: F_NUM }}>{POS_SHORT[effPos(p)] || "?"}</span>;
 }
 
-function PlayerRow({ p, dense, onPeek, draggable, onDragStart, onDragEnd, captain, pinned, selected }) {
+function PlayerRow({ p, dense, onPeek, draggable, onDragStart, onDragEnd, captain, pinned, held, selected }) {
   const tier = tierOf(p), tc = TIER_COLOR(tier), rb = formatReturningBadge((p.returning_seasons || []).length);
   return (
     <div draggable={draggable} onDragStart={onDragStart} onDragEnd={onDragEnd} onClick={() => onPeek && onPeek(p)}
@@ -71,6 +72,7 @@ function PlayerRow({ p, dense, onPeek, draggable, onDragStart, onDragEnd, captai
       <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>
         {fullName(p)}{captain && <span title="Captain" style={{ marginLeft: 5, color: GOLD, fontWeight: 800 }}>C</span>}
       </span>
+      {held && <span title="Locked to this team: auto-balance and swaps will not move them" style={{ fontSize: 11 }}>🔒</span>}
       {pinned && <span title="Has a keep-together / keep-apart rule" style={{ fontSize: 11 }}>📌</span>}
       {p.payment_status !== "paid" && <span title={`Payment: ${p.payment_status}`} style={{ width: 7, height: 7, borderRadius: 4, background: "#DC2626" }} />}
       {p.sandbagging_flag && <span title="Sandbagging flag" style={{ fontSize: 11 }}>⚑</span>}
@@ -118,6 +120,7 @@ export default function Rosters() {
   const [suggestTeam, setSuggestTeam] = useState(null);
   const [reveal, setReveal]   = useState(null);       // {i, shown}
   const [printing, setPrinting] = useState(false);
+  const [keyOpen, setKeyOpen] = useState(false);
   const dataRef = useRef(null); dataRef.current = data;
 
   const flash = useCallback((msg, kind = "ok") => { setToast({ msg, kind }); window.clearTimeout(flash.t); flash.t = window.setTimeout(() => setToast(null), kind === "err" ? 7000 : 3500); }, []);
@@ -149,7 +152,7 @@ export default function Rosters() {
   const cfg   = data?.config || { min_roster: 8, max_roster: 12, goalie_min: 1, goalie_max: 2 };
   const th    = data?.parity || { rebalance_low: 60, review_low: 65, review_high: 80, rebalance_high: 85 };
   const MAX   = data?.max_player_score || 32;
-  const teams = data?.teams || [], pool = data?.pool || [], pins = data?.pins || [];
+  const teams = data?.teams || [], pool = data?.pool || [], pins = data?.pins || [], locks = data?.locks || [];
   const live  = data && (data.draft_status === "active" || data.draft_status === "paused");
   const readOnly = !!live || data?.stage === "published";
   const stats = useMemo(() => teamStats(teams, MAX), [teams, MAX]);
@@ -157,9 +160,11 @@ export default function Rosters() {
   const target = targetSize(cfg, teams.length, totalPlayers);
   const template = useMemo(() => slotTemplate(cfg, target), [cfg, target]);
   const violations = useMemo(() => pinViolations(pins, teams), [pins, teams]);
+  const heldSet = useMemo(() => new Set(locks), [locks]);
   const pinned = useMemo(() => { const s = new Set(); pins.forEach((p) => { s.add(p.a); s.add(p.b); }); return s; }, [pins]);
   const allPlayers = useMemo(() => [...pool, ...teams.flatMap((t) => t.players)], [pool, teams]);
   const byId = useMemo(() => { const m = new Map(); allPlayers.forEach((p) => m.set(p.id, p)); return m; }, [allPlayers]);
+  const lockSum = useMemo(() => lockSummary(teams, pins, locks, byId), [teams, pins, locks, byId]);
   const teamOf = useMemo(() => assignMap(teams), [teams]);
   const counts = useMemo(() => ({ all: pool.length, goaltender: pool.filter((p) => effPos(p) === "goaltender").length, defenseman: pool.filter((p) => effPos(p) === "defenseman").length, center: pool.filter((p) => effPos(p) === "center").length, winger: pool.filter((p) => effPos(p) === "winger").length }), [pool]);
   const shownPool = useMemo(() => {
@@ -220,6 +225,7 @@ export default function Rosters() {
     const cur = teamOf[id] ?? null; if (cur === to) return;
     const t = to === null ? null : teams.find((x) => x.id === to);
     if (t && t.locked) { flash(`${t.name} is locked. Unlock it to add players.`, "err"); return; }
+    const lb = lockBlock(id, to, teams, locks); if (lb) { flash(lb, "err"); return; }
     const from = cur === null ? null : teams.find((x) => x.id === cur);
     if (from && from.locked) { flash(`${from.name} is locked. Unlock it to move players.`, "err"); return; }
     doMoves([{ player_id: id, team_id: to }], { note: `${fullName(byId.get(id))} → ${t ? t.name : "pool"}` });
@@ -233,6 +239,8 @@ export default function Rosters() {
     catch (e) { if (e.status === 409 && e.json?.players) { if (window.confirm(`${t.name} has ${e.json.players} player(s). Delete it and send them back to the pool?`)) { try { await call(`/rosters/teams/${t.id}?force=1`, "DELETE"); } catch (e2) { flash(e2.message, "err"); } } } else flash(e.message, "err"); }
   };
   const setCaptain = async (t, p) => { if (guard()) return; try { await call("/rosters/captain", "POST", { team_id: t.id, player_id: p.id }); flash(`${fullName(p)} is captain of ${t.name}`); } catch (e) { flash(e.message, "err"); } };
+  const saveLocks = async (next) => { try { await call("/rosters/locks", "POST", { division: data.division, locks: next }); } catch (e) { flash(e.message, "err"); } };
+  const toggleLock = (id) => { if (guard()) return; const on = heldSet.has(id); const pl = byId.get(id); saveLocks(on ? locks.filter((x) => x !== id) : [...locks, id]).then(() => flash(`${fullName(pl)} ${on ? "unlocked" : "locked to their team"}`)); };
   const savePins = async (next) => { try { await call("/rosters/pins", "POST", { division: data.division, pins: next }); } catch (e) { flash(e.message, "err"); } };
   const lockAll = async (lock) => { if (guard()) return; try { for (const t of teams) { if (!!t.locked !== lock) await call(`/rosters/teams/${t.id}`, "PATCH", { draft_locked: lock }); } flash(lock ? "All teams locked" : "All teams unlocked"); } catch (e) { flash(e.message, "err"); } };
 
@@ -248,15 +256,30 @@ export default function Rosters() {
 
   const rowFor = (id) => stats.rows.find((r) => r.id === id);
   const stageIdx = STAGES.findIndex((s) => s.key === data.stage);
+  const blockList = blockersOf(data.gate), warnList = warningsOf(data.gate);
+  const planned = cfg.planned_teams || 0;
+  const createPlanned = async () => {
+    if (guard()) return;
+    const want = Math.max(0, planned - teams.length); if (!want) return;
+    const names = plannedTeamNames(teams.map((t) => t.name), want); let made = 0;
+    try { for (const n of names) { await call("/rosters/teams", "POST", { division: data.division, name: n }); made++; } flash(`Created ${made} team${made === 1 ? "" : "s"}.`); }
+    catch (e) { flash(`${made ? `Created ${made}, then stopped: ` : ""}${e.message}`, "err"); }
+  };
+  const runFix = (act) => {
+    if (act === "newteams") { planned > teams.length ? createPlanned() : setModal({ kind: "newteam" }); }
+    else if (act === "balance") setModal({ kind: "balance", mode: pool.length && teams.some((t) => t.players.length) ? "fill" : "rebalance" });
+    else if (act === "swaps") setModal({ kind: "swaps" });
+    else if (act === "lockall") lockAll(true);
+  };
 
   return (
-    <div style={{ fontFamily: F_UI, color: INK, padding: "16px 20px 60px", maxWidth: 1700, margin: "0 auto" }} onDragEnd={() => { setDrag(null); setHover(null); }}>
-      <style>{`@media print{body *{visibility:hidden!important}.grsh-print,.grsh-print *{visibility:visible!important}.grsh-print{position:absolute;left:0;top:0;width:100%}}`}</style>
+    <div className="gr" style={{ fontFamily: F_UI, color: INK, padding: "16px 20px 60px", maxWidth: 1700, margin: "0 auto" }} onDragEnd={() => { setDrag(null); setHover(null); }}>
+      <style>{`.gr button:disabled{opacity:.4;cursor:not-allowed}.gr button:focus-visible,.gr select:focus-visible,.gr input:focus-visible{outline:3px solid ${GOLD};outline-offset:2px}.gr .gr-key{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:12px;color:${MUTED};background:${PAPER};border-radius:8px;padding:8px 10px;margin-bottom:8px}@media print{body *{visibility:hidden!important}.grsh-print,.grsh-print *{visibility:visible!important}.grsh-print{position:absolute;left:0;top:0;width:100%}}`}</style>
 
       {/* header */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
         <h1 style={{ margin: 0, fontFamily: F_HEAD, fontSize: 28 }}>Rosters</h1>
-        <span style={{ fontSize: 12, color: SOFT }}>{saving > 0 ? "Saving…" : savedAt ? `All changes saved ${savedAt}` : "Changes save automatically"}</span>
+        <span role="status" aria-live="polite" style={{ fontSize: 13, color: saving > 0 ? "#92400E" : savedAt ? "#166534" : MUTED, fontWeight: 600 }}>{saving > 0 ? "Saving…" : savedAt ? `✓ All changes saved ${savedAt}` : "Changes save automatically"}</span>
         <span style={{ flex: 1 }} />
       </div>
 
@@ -265,7 +288,7 @@ export default function Rosters() {
         {data.divisions.map((d) => (
           <button key={d.key} role="tab" aria-selected={d.key === data.division} onClick={() => d.key !== data.division && load(d.key)}
             style={{ ...btn(d.key === data.division ? "primary" : "ghost"), display: "flex", gap: 8, alignItems: "center" }}>
-            {d.label}<span style={{ fontFamily: F_NUM, fontSize: 11, opacity: .8 }}>{d.assigned}/{d.total} · {d.pct}%</span>
+            {d.label}<span title={divisionTabLabel(d).title} style={{ fontSize: 11, opacity: divisionTabLabel(d).muted ? .6 : .85 }}>{divisionTabLabel(d).text}</span>
           </button>
         ))}
       </div>
@@ -274,7 +297,7 @@ export default function Rosters() {
         The draft for this division is <b>{data.draft_status}</b>. Editing is off here until it finishes or is reset on the Draft page — otherwise the two pages would overwrite each other.
       </div>}
       {data.stage === "published" && <div style={{ background: "#DCFCE7", border: "1px solid #86EFAC", color: "#166534", padding: "10px 14px", borderRadius: 10, marginBottom: 12, fontSize: 14 }}>
-        Published {data.published.at}. Rosters are read-only.</div>}
+        Published {data.published.at}. Rosters are read-only.{data.changes_since_publish > 0 && <> <b>{data.changes_since_publish} roster move{data.changes_since_publish > 1 ? "s were" : " was"} made after publishing.</b> Open Activity to see them, then resend the emails if players should be told.</>}</div>}
 
       {/* stepper */}
       <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
@@ -284,16 +307,28 @@ export default function Rosters() {
             {i < stageIdx ? "✓ " : `${i + 1}. `}{s.label}
           </button>
         ))}
-        <span style={{ fontSize: 12, color: SOFT, alignSelf: "center", marginLeft: 6 }}>
-          {data.gate.filter((g) => g.level === "fail").length ? `${data.gate.filter((g) => g.level === "fail").length} blocker${data.gate.filter((g) => g.level === "fail").length > 1 ? "s" : ""} before publishing` : "No blockers"}
-        </span>
+        <span style={{ fontSize: 12, color: SOFT, alignSelf: "center", marginLeft: 6 }}>Click a step to open its checklist.</span>
       </div>
+      {blockList.length > 0 && data.stage !== "published" && (
+        <div role="region" aria-label="What blocks publishing" style={{ background: "#FEF2F2", border: "1px solid #FCA5A5", borderRadius: 10, padding: "8px 12px", marginBottom: 12, fontSize: 13 }}>
+          <b style={{ color: "#991B1B" }}>{blockList.length} thing{blockList.length > 1 ? "s" : ""} to fix before you can publish</b>
+          {blockList.map((b) => <div key={b.key} style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
+            <span style={{ flex: 1 }}>⛔ {b.text}</span>
+            {b.fix && <button style={btn("ghost", { padding: "3px 9px", fontSize: 12 })} onClick={() => runFix(b.fix.act)}>{b.fix.label}</button>}
+          </div>)}
+        </div>
+      )}
+      {!blockList.length && warnList.length > 0 && data.stage !== "published" && (
+        <div style={{ background: "#FFFBEB", border: "1px solid #FCD34D", borderRadius: 10, padding: "6px 12px", marginBottom: 12, fontSize: 13, color: "#92400E" }}>
+          Nothing blocks publishing. {warnList.length} thing{warnList.length > 1 ? "s" : ""} worth a look: {warnList.slice(0, 2).map((w) => w.text).join("; ")}{warnList.length > 2 ? "…" : ""} <button className="gr-link" style={{ background: "none", border: 0, color: "#92400E", textDecoration: "underline", cursor: "pointer", fontSize: 13 }} onClick={() => setModal({ kind: "publish", focus: "review" })}>See all</button>
+        </div>
+      )}
 
       {/* sticky balance bar */}
       <div style={{ position: "sticky", top: 32, zIndex: 50, background: PAPER, paddingBottom: 8 }}>
         <div style={{ background: WHITE, border: `1px solid ${LINE}`, borderRadius: 12, padding: "10px 12px", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", flex: 1, minWidth: 260 }}>
-            {teams.length === 0 && <span style={{ color: SOFT, fontSize: 13 }}>Add teams to see balance.</span>}
+            {teams.length === 0 && <span style={{ color: SOFT, fontSize: 13 }}>Balance appears once teams have players.</span>}
             {teams.map((t) => {
               const r = rowFor(t.id), b = BAND[bandOf(r?.parity ?? null, th)];
               return (
@@ -311,10 +346,12 @@ export default function Rosters() {
             <div>{pool.length} unassigned · target {target}/team</div>
           </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            <button style={btn("primary")} disabled={readOnly || !teams.length} onClick={() => setModal({ kind: "balance", mode: pool.length && teams.some((t) => t.players.length) ? "fill" : "rebalance" })}>Auto-balance…</button>
-            <button style={btn()} disabled={readOnly || teams.length < 2} onClick={() => setModal({ kind: "swaps" })}>Find swaps</button>
-            <button style={btn()} disabled={!undo.length || readOnly} onClick={doUndo} title="Ctrl+Z">Undo{undo.length ? ` (${undo.length})` : ""}</button>
+            <button style={btn("primary")} disabled={readOnly || !teams.length} title={whyDisabled("balance", { readOnly, teams: teams.length })} onClick={() => setModal({ kind: "balance", mode: pool.length && teams.some((t) => t.players.length) ? "fill" : "rebalance" })}>Auto-balance…</button>
+            <button style={btn()} disabled={readOnly || teams.length < 2} title={whyDisabled("swaps", { readOnly, teams: teams.length }) || "Find one-for-one swaps that even out the teams"} onClick={() => setModal({ kind: "swaps" })}>Find swaps</button>
+            <button style={btn()} disabled={!undo.length || readOnly} onClick={doUndo} title={whyDisabled("undo", { readOnly, undo: undo.length }) || "Ctrl+Z"}>Undo{undo.length ? ` (${undo.length})` : ""}</button>
             <button style={btn()} onClick={() => setModal({ kind: "plans" })}>Plans ({data.plans.length})</button>
+            <button style={btn()} onClick={() => setModal({ kind: "rules" })} title="Every player with a lock, rule or captain role">Rules &amp; locks{lockSum.broken > 0 ? ` (${lockSum.broken} broken)` : lockSum.held ? ` (${lockSum.held} 🔒)` : ""}</button>
+            <button style={btn()} onClick={() => setModal({ kind: "activity" })}>Activity</button>
             <button style={btn()} onClick={() => setModal({ kind: "print" })}>Print / Reveal</button>
           </div>
         </div>
@@ -348,6 +385,9 @@ export default function Rosters() {
                   <span>Avg score <b style={{ fontFamily: F_NUM }}>{r?.raw != null ? r.raw.toFixed(1) : "—"}</b></span>
                   {h.score !== null && <span title={h.issues.join(" · ") || "No issues"}>Health <b style={{ fontFamily: F_NUM, color: h.score >= 80 ? "#166534" : h.score >= 60 ? "#92400E" : "#991B1B" }}>{h.score}</b></span>}
                 </div>
+                <div style={{ display: "flex", gap: 4, margin: "0 0 8px", flexWrap: "wrap" }} aria-label="Players by position">
+                  {positionNeeds(t, cfg).map((x) => <span key={x.pos} title={`${x.label}: ${x.have}${x.need ? ` (needs ${x.need})` : ""}`} style={chip(x.tone === "bad" ? { bg: "#FEE2E2", color: "#991B1B" } : x.tone === "warn" ? { bg: "#FEF3C7", color: "#92400E" } : { bg: "#F3F4F6", color: MUTED }, { fontFamily: F_NUM })}>{x.short} {x.have}{x.need && x.tone !== "ok" ? `/${x.need}` : ""}</span>)}
+                </div>
                 {isHover && proj && (
                   <div style={{ background: "#FFF8E1", border: `1px dashed ${GOLD}`, borderRadius: 8, padding: "5px 8px", fontSize: 12, marginBottom: 8 }}>
                     If dropped here: balance <b>{proj.before?.parity != null ? proj.before.parity.toFixed(0) : "—"}</b> → <b>{proj.after?.parity != null ? proj.after.parity.toFixed(0) : "—"}</b>
@@ -356,8 +396,8 @@ export default function Rosters() {
                 )}
                 <div style={{ display: "grid", gap: 4 }}>
                   {slots.map((s) => s.player ? (
-                    <PlayerRow key={s.player.id} p={s.player} dense captain={t.captain_player_id === s.player.id} pinned={pinned.has(s.player.id)} selected={peek === s.player.id}
-                      draggable={!readOnly && !t.locked} onPeek={(p) => setPeek(p.id)}
+                    <PlayerRow key={s.player.id} p={s.player} dense captain={t.captain_player_id === s.player.id} pinned={pinned.has(s.player.id)} held={heldSet.has(s.player.id)} selected={peek === s.player.id}
+                      draggable={!readOnly && !t.locked && !heldSet.has(s.player.id)} onPeek={(p) => setPeek(p.id)}
                       onDragStart={(e) => { e.dataTransfer.setData("text/plain", String(s.player.id)); e.dataTransfer.effectAllowed = "move"; setDrag(s.player.id); }} onDragEnd={() => { setDrag(null); setHover(null); }} />
                   ) : (
                     <button key={s.slot.key} disabled={readOnly || t.locked} onClick={() => setSuggestTeam(suggestTeam === t.id ? null : t.id)}
@@ -387,7 +427,20 @@ export default function Rosters() {
               </div>
             );
           })}
-          {!readOnly && (
+          {!readOnly && teams.length === 0 && (
+            <div style={{ gridColumn: "1 / -1", background: WHITE, border: `2px dashed ${LINE}`, borderRadius: 12, padding: "28px 20px", textAlign: "center" }}>
+              <div style={{ fontFamily: F_HEAD, fontSize: 20, fontWeight: 700, marginBottom: 6 }}>No teams in {data.division_label} yet</div>
+              <p style={{ margin: "0 auto 14px", maxWidth: 460, fontSize: 14, color: MUTED }}>{planned ? `Settings plans ${planned} team${planned === 1 ? "" : "s"} for this division. Create them now, then drag players from the list on the right, or let Auto-balance fill them.` : "Add a team, then drag players from the list on the right, or let Auto-balance fill it."}</p>
+              {planned > 0 && <button style={btn("primary", { marginRight: 8 })} onClick={createPlanned}>Create {planned} team{planned === 1 ? "" : "s"}</button>}
+              <button style={btn()} onClick={() => setModal({ kind: "newteam" })}>Add one team</button>
+            </div>
+          )}
+          {!readOnly && teams.length > 0 && planned > teams.length && (
+            <button onClick={createPlanned} style={{ border: `2px dashed ${GOLD}`, borderRadius: 12, background: "#FFFBEB", color: INK, minHeight: 60, cursor: "pointer", fontFamily: F_UI, fontSize: 14, fontWeight: 600 }}>
+              Create the other {planned - teams.length} planned team{planned - teams.length === 1 ? "" : "s"}
+            </button>
+          )}
+          {!readOnly && teams.length > 0 && (
             <button onClick={() => setModal({ kind: "newteam" })} style={{ border: `2px dashed ${LINE}`, borderRadius: 12, background: "transparent", color: MUTED, minHeight: 120, cursor: "pointer", fontFamily: F_UI, fontSize: 14, fontWeight: 600 }}>
               + Add team{cfg.planned_teams ? ` (${teams.length}/${cfg.planned_teams} planned)` : ""}
             </button>
@@ -401,7 +454,9 @@ export default function Rosters() {
             <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
               <div style={{ fontFamily: F_HEAD, fontSize: 18, fontWeight: 700, flex: 1 }}>Unassigned</div>
               <span style={{ fontSize: 12, color: SOFT }}>{pool.length} players</span>
+              <button type="button" aria-expanded={keyOpen} onClick={() => setKeyOpen(!keyOpen)} style={btn("ghost", { padding: "2px 8px", fontSize: 12 })} title="What the dots, chips and numbers mean">Key</button>
             </div>
+            {keyOpen && <div className="gr-key" role="note" style={{ marginTop: 8 }}>{KEY_ITEMS.map((k) => <div key={k.label} style={{ display: "contents" }}><b style={{ fontFamily: F_NUM }}>{k.mark}</b><span><b>{k.label}.</b> {k.text}</span></div>)}</div>}
             <div style={{ display: "flex", gap: 4, flexWrap: "wrap", margin: "8px 0" }}>
               {[["all", "All"], ["goaltender", "Goalies"], ["defenseman", "Defense"], ["center", "Center"], ["winger", "Wing"]].map(([k, l]) => (
                 <button key={k} onClick={() => setPosF(k)} style={{ ...btn(posF === k ? "primary" : "ghost"), padding: "3px 8px", fontSize: 12 }}>{l} <span style={{ fontFamily: F_NUM, opacity: .8 }}>{counts[k]}</span></button>
@@ -409,7 +464,7 @@ export default function Rosters() {
             </div>
             <div style={{ display: "flex", gap: 6 }}>
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search name…" aria-label="Search players" style={{ flex: 1, padding: "6px 8px", border: `1px solid ${LINE}`, borderRadius: 8, fontFamily: F_UI, fontSize: 13 }} />
-              <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} aria-label="Sort pool" style={{ border: `1px solid ${LINE}`, borderRadius: 8, fontSize: 12, padding: "0 6px" }}>
+              <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} aria-label="Sort pool" style={{ border: `1px solid ${LINE}`, borderRadius: 8, fontSize: 13, padding: "0 8px", minWidth: 104 }}>
                 <option value="score">Score ↓</option><option value="name">Name</option>
               </select>
             </div>
@@ -425,22 +480,26 @@ export default function Rosters() {
       </div>
 
       {/* peek card */}
-      {peek && byId.get(peek) && <PeekCard p={byId.get(peek)} teams={teams} pins={pins} byId={byId} allPlayers={allPlayers} teamOf={teamOf} readOnly={readOnly}
-        onClose={() => setPeek(null)} onMove={(tid) => { const pl = byId.get(peek); const t = tid === null ? null : teams.find((x) => x.id === tid); doMoves([{ player_id: peek, team_id: tid }], { note: `${fullName(pl)} → ${t ? t.name : "pool"}` }); }}
+      {peek && byId.get(peek) && <PeekCard p={byId.get(peek)} teams={teams} pins={pins} held={heldSet.has(peek)} onLock={() => toggleLock(peek)} byId={byId} allPlayers={allPlayers} teamOf={teamOf} readOnly={readOnly}
+        onClose={() => setPeek(null)} onMove={(tid) => { const pl = byId.get(peek); const lb = lockBlock(peek, tid, teams, locks); if (lb) { flash(lb, "err"); return; } const t = tid === null ? null : teams.find((x) => x.id === tid); doMoves([{ player_id: peek, team_id: tid }], { note: `${fullName(pl)} → ${t ? t.name : "pool"}` }); }}
         onCaptain={(t) => setCaptain(t, byId.get(peek))} onPins={savePins} />}
 
       {/* modals */}
       {modal?.kind === "newteam" && <TextModal title="Add a team" label="Team name" cta="Add team" onClose={() => setModal(null)} onSubmit={async (v) => { await addTeam(v); setModal(null); }} />}
       {modal?.kind === "teamedit" && <TeamEditModal team={modal.team} onClose={() => setModal(null)} onSave={async (b) => { await patchTeam(modal.team.id, b); setModal(null); }} onDelete={async () => { setModal(null); await delTeam(modal.team); }} />}
-      {modal?.kind === "balance" && <BalanceModal teams={teams} pool={pool} pins={pins} cfg={cfg} th={th} MAX={MAX} initialMode={modal.mode} onClose={() => setModal(null)}
+      {modal?.kind === "balance" && <BalanceModal teams={teams} pool={pool} pins={pins} locks={locks} cfg={cfg} th={th} MAX={MAX} initialMode={modal.mode} onClose={() => setModal(null)}
         onApply={async (moves) => { setModal(null); if (moves.length) { const ok = await doMoves(moves.map((m) => ({ player_id: m.player_id, team_id: m.to })), { type: "auto", note: `Auto-balance (${moves.length} moves)` }); if (ok) flash(`Applied ${moves.length} move${moves.length > 1 ? "s" : ""}. Undo is available.`); } }} />}
-      {modal?.kind === "swaps" && <SwapsModal teams={teams} pins={pins} cfg={cfg} MAX={MAX} onClose={() => setModal(null)}
+      {modal?.kind === "swaps" && <SwapsModal teams={teams} pins={pins} locks={locks} cfg={cfg} MAX={MAX} onClose={() => setModal(null)}
         onApply={async (s) => { setModal(null); await doMoves([{ player_id: s.a.id, team_id: s.teamB }, { player_id: s.b.id, team_id: s.teamA }], { note: `Swap ${fullName(s.a)} ⇄ ${fullName(s.b)}` }); }} />}
-      {modal?.kind === "plans" && <PlansModal plans={data.plans} readOnly={readOnly} onClose={() => setModal(null)}
+      {modal?.kind === "plans" && <PlansModal plans={data.plans} readOnly={readOnly} byId={byId} teams={teams} MAX={MAX} onClose={() => setModal(null)}
         onSave={async (name) => { try { await call("/rosters/plans", "POST", { division: data.division, name }); flash("Plan saved"); } catch (e) { flash(e.message, "err"); } }}
         onRestore={async (id) => { if (guard()) return; try { await call("/rosters/plans/restore", "POST", { division: data.division, plan_id: id }); setUndo([]); flash("Plan restored"); setModal(null); } catch (e) { flash(e.message, "err"); } }}
         onDelete={async (id) => { try { await call(`/rosters/plans/${id}`, "DELETE"); } catch (e) { flash(e.message, "err"); } }} />}
       {modal?.kind === "publish" && <PublishModal data={data} readOnly={readOnly} teams={teams} onClose={() => setModal(null)} call={call} flash={flash} lockAll={lockAll} />}
+      {modal?.kind === "rules" && <RulesModal sum={lockSum} readOnly={readOnly} onClose={() => setModal(null)}
+        onPeek={(id) => { setModal(null); setPeek(id); }} onUnlock={(id) => toggleLock(id)}
+        onRemoveRule={(a, b) => savePins(pins.filter((x) => !((x.a === a && x.b === b) || (x.a === b && x.b === a))))} />}
+      {modal?.kind === "activity" && <ActivityModal division={data.division} call={call} onClose={() => setModal(null)} />}
       {modal?.kind === "print" && <Modal title="Print rosters / Reveal" onClose={() => setModal(null)} width={440}>
         <p style={{ marginTop: 0, color: MUTED, fontSize: 14 }}>Print one clean card per team (names and positions only — no emails, ages, or payment info), or run a reveal where each team's players appear one click at a time.</p>
         <div style={{ display: "flex", gap: 8 }}>
@@ -467,7 +526,7 @@ export default function Rosters() {
 }
 
 // ─── peek card ───────────────────────────────────────────────────────────────
-function PeekCard({ p, teams, pins, byId, allPlayers, teamOf, readOnly, onClose, onMove, onCaptain, onPins }) {
+function PeekCard({ p, teams, pins, held, onLock, byId, allPlayers, teamOf, readOnly, onClose, onMove, onCaptain, onPins }) {
   const tier = tierOf(p), bd = scoreBreakdown(tier, p.years_experience || 0, 0), cur = teamOf[p.id] ?? null, team = teams.find((t) => t.id === cur);
   const mine = pins.filter((x) => x.a === p.id || x.b === p.id);
   const [other, setOther] = useState(""), [type, setType] = useState("together");
@@ -494,6 +553,10 @@ function PeekCard({ p, teams, pins, byId, allPlayers, teamOf, readOnly, onClose,
           <option value="">Unassigned (pool)</option>
           {teams.map((t) => <option key={t.id} value={t.id} disabled={t.locked && t.id !== cur}>{t.name}{t.locked ? " (locked)" : ""}</option>)}
         </select>
+        {team && !team.locked && <label style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 13, margin: "2px 0 10px", cursor: "pointer" }}>
+          <input type="checkbox" checked={!!held} onChange={onLock} style={{ marginTop: 3 }} />
+          <span><b>🔒 Lock to {team.name}</b><br /><span style={{ color: SOFT, fontSize: 12 }}>Auto-balance and swaps will leave this player here, and moving them by hand is blocked until you untick this.</span></span>
+        </label>}
         {team && !team.locked && team.captain_player_id !== p.id && <button style={btn("ghost", { marginBottom: 10 })} onClick={() => onCaptain(team)}>Make captain of {team.name}</button>}
         <div style={{ fontSize: 12, fontWeight: 700, color: SOFT, margin: "10px 0 4px" }}>KEEP TOGETHER / APART</div>
         {mine.map((x, i) => { const o = byId.get(x.a === p.id ? x.b : x.a); return (
@@ -528,9 +591,9 @@ function TeamEditModal({ team, onClose, onSave, onDelete }) {
   </Modal>;
 }
 
-function BalanceModal({ teams, pool, pins, cfg, th, MAX, initialMode, onClose, onApply }) {
+function BalanceModal({ teams, pool, pins, locks, cfg, th, MAX, initialMode, onClose, onApply }) {
   const [mode, setMode] = useState(initialMode);
-  const prop = useMemo(() => proposeBalance(teams, pool, pins, cfg, { mode, max: MAX }), [teams, pool, pins, cfg, mode, MAX]);
+  const prop = useMemo(() => proposeBalance(teams, pool, pins, cfg, { mode, max: MAX, locks }), [teams, pool, pins, cfg, mode, MAX, locks]);
   const [off, setOff] = useState({});               // player ids the user unticked
   useEffect(() => setOff({}), [mode]);
   const accepted = (prop.moves || []).filter((m) => !off[m.player_id]);
@@ -568,8 +631,8 @@ function BalanceModal({ teams, pool, pins, cfg, th, MAX, initialMode, onClose, o
   </Modal>;
 }
 
-function SwapsModal({ teams, pins, cfg, MAX, onClose, onApply }) {
-  const list = useMemo(() => findSwaps(teams, pins, cfg, { limit: 6, max: MAX }), [teams, pins, cfg, MAX]);
+function SwapsModal({ teams, pins, locks, cfg, MAX, onClose, onApply }) {
+  const list = useMemo(() => findSwaps(teams, pins, cfg, { limit: 6, max: MAX, locks }), [teams, pins, cfg, MAX, locks]);
   const nm = (id) => teams.find((t) => t.id === id)?.name || "?";
   return <Modal title="Swap finder" onClose={onClose} width={620}>
     <p style={{ marginTop: 0, fontSize: 13, color: MUTED }}>One-for-one swaps between open teams that improve balance without breaking goalie or keep-together / keep-apart rules.</p>
@@ -578,14 +641,21 @@ function SwapsModal({ teams, pins, cfg, MAX, onClose, onApply }) {
       <div style={{ flex: 1, fontSize: 13 }}>
         <div><b>{fullName(s.a)}</b> <span style={{ color: SOFT }}>({nm(s.teamA)}, {scoreOf(s.a).toFixed(1)})</span> ⇄ <b>{fullName(s.b)}</b> <span style={{ color: SOFT }}>({nm(s.teamB)}, {scoreOf(s.b).toFixed(1)})</span></div>
         <div style={{ color: MUTED, fontSize: 12 }}>Spread {s.spreadBefore.toFixed(1)} → {s.spreadAfter.toFixed(1)} pts{s.samePos ? " · same position" : " · different positions"}</div>
+        <div style={{ color: SOFT, fontSize: 12, marginTop: 2 }}>{explainSwap(s, teams, MAX)}</div>
       </div>
       <button style={btn("primary")} onClick={() => onApply(s)}>Apply</button>
     </div>)}
   </Modal>;
 }
 
-function PlansModal({ plans, readOnly, onClose, onSave, onRestore, onDelete }) {
-  const [name, setName] = useState("");
+function PlansModal({ plans, readOnly, byId, teams, MAX, onClose, onSave, onRestore, onDelete }) {
+  const [name, setName] = useState(""); const [cmp, setCmp] = useState(null);   // { id, against }
+  const nm = (id) => (id === null ? "Unassigned" : (teams.find((t) => t.id === id) || {}).name || "?");
+  const shown = useMemo(() => {
+    if (!cmp) return null; const pl = plans.find((x) => x.id === cmp.id); if (!pl) return null;
+    const other = cmp.against === "now" ? currentAssign(teams) : (plans.find((x) => x.id === cmp.against) || {}).assign || {};
+    return { pl, other, res: comparePlans(other, pl.assign || {}, byId, teams, MAX) };
+  }, [cmp, plans, teams, byId, MAX]);
   return <Modal title="Plans (saved versions)" onClose={onClose} width={520}>
     <p style={{ marginTop: 0, fontSize: 13, color: MUTED }}>Save the current rosters under a name to try another idea, then come back to it. Restoring only moves players — it never deletes anyone.</p>
     <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
@@ -593,8 +663,20 @@ function PlansModal({ plans, readOnly, onClose, onSave, onRestore, onDelete }) {
       <button style={btn("primary")} onClick={() => { onSave(name); setName(""); }}>Save current</button>
     </div>
     {plans.length === 0 && <p style={{ color: SOFT, fontSize: 13 }}>No saved plans yet.</p>}
+    {shown && <div style={{ background: PAPER, borderRadius: 10, padding: 10, marginBottom: 10 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 13 }}>
+        <b>{shown.pl.name}</b> compared with
+        <select value={cmp.against} onChange={(e) => setCmp({ ...cmp, against: e.target.value })} aria-label="Compare with" style={{ border: `1px solid ${LINE}`, borderRadius: 8, padding: "3px 6px" }}>
+          <option value="now">the rosters right now</option>{plans.filter((x) => x.id !== cmp.id).map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+        </select>
+      </div>
+      <div style={{ fontSize: 13, margin: "6px 0" }}>Spread <b style={{ fontFamily: F_NUM }}>{shown.res.spreadFrom.toFixed(1)}</b> → <b style={{ fontFamily: F_NUM }}>{shown.res.spreadTo.toFixed(1)}</b> pts if you restore it. {shown.res.moves.length} player{shown.res.moves.length === 1 ? "" : "s"} would move.</div>
+      {shown.res.moves.length === 0 && <div style={{ fontSize: 13, color: SOFT }}>No differences.</div>}
+      <div style={{ maxHeight: 200, overflowY: "auto", display: "grid", gap: 2 }}>{shown.res.moves.map((m) => <div key={m.player.id} style={{ fontSize: 12 }}><b>{fullName(m.player)}</b> <span style={{ color: SOFT }}>{nm(m.from)} → </span><b>{nm(m.to)}</b></div>)}</div>
+    </div>}
     {plans.map((p) => <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderTop: `1px solid ${LINE}` }}>
       <div style={{ flex: 1 }}><b>{p.name}</b><div style={{ fontSize: 12, color: SOFT }}>{p.created_at}{p.by ? ` · ${p.by}` : ""} · {p.count} players</div></div>
+      <button style={btn()} onClick={() => setCmp(cmp && cmp.id === p.id ? null : { id: p.id, against: "now" })} aria-pressed={!!cmp && cmp.id === p.id}>Compare</button>
       <button style={btn()} disabled={readOnly} onClick={() => onRestore(p.id)}>Restore</button>
       <button style={btn("ghost")} onClick={() => onDelete(p.id)} aria-label={`Delete plan ${p.name}`}>✕</button>
     </div>)}
@@ -607,6 +689,8 @@ function PublishModal({ data, readOnly, teams, onClose, call, flash, lockAll }) 
   const ICON = { ok: "✅", warn: "⚠️", fail: "⛔" };
   const copy = (t) => { try { navigator.clipboard.writeText(t); flash("Link copied"); } catch (e) { flash("Copy failed — select and copy the link manually.", "err"); } };
   const toggleReview = async (enable) => { try { await call("/rosters/review", "POST", { division: data.division, enable }); } catch (e) { flash(e.message, "err"); } };
+  const [pv, setPv] = useState(null);
+  const preview = async () => { try { setPv(await call(`/rosters/publish-preview?division=${encodeURIComponent(data.division)}`)); } catch (e) { flash(e.message, "err"); } };
   const checkSp = async () => { try { setSp(await call(`/rosters/sportspress?division=${encodeURIComponent(data.division)}`)); } catch (e) { flash(e.message, "err"); } };
   const publish = async (resend) => {
     if (!window.confirm(resend ? "Email every rostered player again?" : "Publish rosters and email each rostered player their team?")) return;
@@ -632,6 +716,15 @@ function PublishModal({ data, readOnly, teams, onClose, call, flash, lockAll }) 
     </> : <button style={btn()} disabled={readOnly} onClick={() => toggleReview(true)}>Create review link</button>}
     {published && data.published.url && <><h4 style={{ margin: "16px 0 6px", fontFamily: F_HEAD }}>Public roster page</h4>
       <div style={{ display: "flex", gap: 6 }}><input readOnly value={data.published.url} onFocus={(e) => e.target.select()} style={{ flex: 1, padding: 8, border: `1px solid ${LINE}`, borderRadius: 8, fontSize: 12 }} /><button style={btn()} onClick={() => copy(data.published.url)}>Copy</button></div></>}
+    <h4 style={{ margin: "16px 0 6px", fontFamily: F_HEAD }}>Who will be emailed (dry run)</h4>
+    <p style={{ fontSize: 12, color: SOFT, margin: "0 0 6px" }}>Shows each player who would be told their team, and anyone who would be skipped. Nothing is sent.</p>
+    <button style={btn()} onClick={preview}>Preview emails</button>
+    {pv && <div style={{ marginTop: 8, fontSize: 13 }}>
+      <div><b>{pv.will_send}</b> would be emailed, <b>{pv.will_skip}</b> skipped.</div>
+      {pv.sample_subject && <div style={{ background: PAPER, borderRadius: 8, padding: "6px 10px", margin: "6px 0" }}><b>Subject:</b> {pv.sample_subject}<br /><span style={{ color: MUTED }}>{pv.sample_body}</span></div>}
+      {pv.skipped.length > 0 && <div style={{ color: "#92400E" }}>Skipped: {pv.skipped.map((x) => `${x.name} (${x.reason})`).join("; ")}</div>}
+      <details style={{ marginTop: 4 }}><summary style={{ cursor: "pointer" }}>Show recipients</summary><div style={{ maxHeight: 160, overflowY: "auto", fontSize: 12 }}>{pv.recipients.map((x, i) => <div key={i}>{x.name} <span style={{ color: SOFT }}>→ {x.team} · {x.to}</span></div>)}</div></details>
+    </div>}
     <h4 style={{ margin: "16px 0 6px", fontFamily: F_HEAD }}>SportsPress check (dry run)</h4>
     <p style={{ fontSize: 12, color: SOFT, margin: "0 0 6px" }}>Shows which teams and players already exist in SportsPress. Nothing is created or changed.</p>
     <button style={btn()} onClick={checkSp}>Run check</button>
@@ -639,6 +732,53 @@ function PublishModal({ data, readOnly, teams, onClose, call, flash, lockAll }) 
       <div><b>{sp.unmatched_teams}</b> team(s) and <b>{sp.unmatched_players}</b> player(s) have no SportsPress match by name.</div>
       {sp.teams.map((t) => <div key={t.team} style={{ marginTop: 4 }}>{t.matched ? "✅" : "⛔"} {t.team}{t.players.filter((p) => !p.matched).length ? <span style={{ color: SOFT }}> — no match: {t.players.filter((p) => !p.matched).map((p) => p.name).join(", ")}</span> : ""}</div>)}
     </div>)}
+  </Modal>;
+}
+
+function RulesModal({ sum, readOnly, onClose, onPeek, onUnlock, onRemoveRule }) {
+  const [only, setOnly] = useState("all");
+  const rows = sum.rows.filter((r) => only === "all" || (only === "broken" && r.broken) || (only === "locked" && r.held) || (only === "rules" && r.rules.length));
+  const tab = (k, label, n) => <button key={k} style={btn(only === k ? "primary" : "ghost", { padding: "3px 10px", fontSize: 12 })} aria-pressed={only === k} onClick={() => setOnly(k)}>{label} {n}</button>;
+  return <Modal title="Rules & locks" onClose={onClose} width={640}>
+    <p style={{ marginTop: 0, fontSize: 13, color: MUTED }}>Every player who is held in place, has a keep-together/apart rule, or captains a team. 🔒 locked players are never moved by Auto-balance or Find swaps.{sum.onLockedTeams > 0 ? ` ${sum.onLockedTeams} more player${sum.onLockedTeams === 1 ? " is" : "s are"} held because their whole team is locked.` : ""}</p>
+    <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+      {tab("all", "All", sum.rows.length)}{tab("broken", "Broken", sum.broken)}{tab("locked", "🔒 Locked", sum.held)}{tab("rules", "With rules", sum.ruled)}
+    </div>
+    {rows.length === 0 && <p style={{ color: SOFT, fontSize: 13 }}>{sum.rows.length === 0 ? "Nothing yet. Open a player and tick “Lock to team”, or add a keep-together/apart rule." : "Nothing matches this filter."}</p>}
+    <div style={{ display: "grid", gap: 6, maxHeight: "60vh", overflowY: "auto" }}>
+      {rows.map((r) => <div key={r.player.id} style={{ border: `1px solid ${r.broken ? "#FCA5A5" : LINE}`, background: r.broken ? "#FEF2F2" : WHITE, borderRadius: 8, padding: "8px 10px", fontSize: 13 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <button style={{ background: "none", border: 0, padding: 0, fontWeight: 700, cursor: "pointer", color: INK, fontSize: 14, fontFamily: F_UI, textDecoration: "underline" }} onClick={() => onPeek(r.player.id)}>{fullName(r.player)}</button>
+          <span style={{ color: SOFT }}>{r.teamName}</span>
+          {r.held && <span style={chip({ bg: "#E0F2FE", color: "#075985" })}>🔒 Locked to team</span>}
+          {r.captain && <span style={chip({ bg: "#FEF3C7", color: "#92400E" })}>Captain</span>}
+          {r.teamLocked && <span style={chip({ bg: "#F3F4F6", color: MUTED })}>Team locked</span>}
+          <span style={{ flex: 1 }} />
+          {r.held && !readOnly && <button style={btn("ghost", { padding: "2px 8px", fontSize: 12 })} onClick={() => onUnlock(r.player.id)}>Unlock</button>}
+        </div>
+        {r.rules.map((x, i) => <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 4 }}>
+          <span style={chip(x.type === "together" ? { bg: "#DCFCE7", color: "#166534" } : { bg: "#FEE2E2", color: "#991B1B" })}>{x.type === "together" ? "Together" : "Apart"}</span>
+          <span style={{ flex: 1 }}>{fullName(x.other)} <span style={{ color: SOFT }}>({x.otherTeam})</span></span>
+          <span style={{ fontWeight: 700, color: x.met === false ? "#991B1B" : x.met ? "#166534" : SOFT }}>{x.met === null ? "not placed yet" : x.met ? "✓ kept" : "✗ broken"}</span>
+          {!readOnly && <button style={btn("ghost", { padding: "1px 7px", fontSize: 12 })} onClick={() => onRemoveRule(r.player.id, x.other.id)} aria-label="Remove rule">✕</button>}
+        </div>)}
+      </div>)}
+    </div>
+  </Modal>;
+}
+
+function ActivityModal({ division, call, onClose }) {
+  const [d, setD] = useState(null);
+  useEffect(() => { let live = true; (async () => { try { const r = await call(`/rosters/activity?division=${encodeURIComponent(division)}`); if (live) setD(r); } catch (e) { if (live) setD({ error: e.message }); } })(); return () => { live = false; }; }, [division, call]);
+  return <Modal title="Activity" onClose={onClose} width={560}>
+    {!d ? <p style={{ color: SOFT }}>Loading…</p> : d.error ? <p style={{ color: "#991B1B" }}>{d.error}</p> : <>
+      <p style={{ marginTop: 0, fontSize: 13, color: MUTED }}>Every roster change for this division: who made it and when.{d.published_at ? ` Published ${d.published_at}.` : ""}</p>
+      {d.changes_since_publish > 0 && <p style={{ background: "#FEF3C7", color: "#92400E", borderRadius: 8, padding: "6px 10px", fontSize: 13 }}>{d.changes_since_publish} move{d.changes_since_publish > 1 ? "s" : ""} since publishing. Players were not told.</p>}
+      {d.items.length === 0 && <p style={{ color: SOFT }}>Nothing recorded yet.</p>}
+      <div style={{ display: "grid", gap: 4 }}>{d.items.map((x) => <div key={x.id} style={{ borderTop: `1px solid ${LINE}`, padding: "6px 0", fontSize: 13 }}>
+        <b>{x.title}</b>{x.moved ? ` (${x.moved})` : ""} <span style={{ color: SOFT }}>{x.at} · {x.by}</span>{x.notes ? <div style={{ color: MUTED }}>{x.notes}</div> : null}
+      </div>)}</div>
+    </>}
   </Modal>;
 }
 

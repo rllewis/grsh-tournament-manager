@@ -85,9 +85,9 @@ function Funnel({ teams, active, onPick }) {
       <div className="gc-fun">
         {steps.map((s, i) => (
           <button key={s.key} type="button" className={"gc-fun-step" + (active === s.key ? " on" : "")} aria-pressed={active === s.key} onClick={() => onPick(active === s.key ? "" : s.key)} title={s.help}>
-            <span className="gc-fun-n">{s.n}</span><span className="gc-fun-l">{s.label}</span>
+            <span className="gc-fun-n">{s.n}<small> of {s.total}</small></span><span className="gc-fun-l">{s.label}</span>
             <span className="gc-fun-bar"><i style={{ width: s.pct + "%" }} /></span>
-            <span className="gc-fun-p">{s.pct}%{i === 0 ? " of teams" : ""}</span>
+            <span className="gc-fun-p">{s.showPct ? s.pct + "%" : i === 0 ? "all teams" : s.n === s.total ? "all" : s.n === 0 ? "none yet" : ""}</span>
           </button>
         ))}
       </div>
@@ -163,6 +163,102 @@ function NudgeDialog({ teams, onClose, onDone, toast }) {
   );
 }
 
+
+function RemoveDialog({ team, onClose, onDone, toast }) {
+  const [imp, setImp] = useState(null); const [typed, setTyped] = useState(""); const [reason, setReason] = useState(""); const [ack, setAck] = useState(false); const [busy, setBusy] = useState(false);
+  useEffect(() => { let live = true; (async () => { const r = await post("/captain-sync/remove-team", { team_id: team.id, dry_run: true }); if (live) setImp(r.ok && r.j.success ? r.j.impact : { error: r.j.message || "Could not check this team." }); })(); return () => { live = false; }; }, [team.id]);
+  const L = C.removalLines(imp && !imp.error ? imp : null);
+  const ok = imp && !imp.error && C.removalReady(imp, team.name, typed, reason, ack);
+  const go = async () => {
+    if (!ok || busy) return; setBusy(true);
+    const r = await post("/captain-sync/remove-team", { team_id: team.id, reason, confirm_name: typed, acknowledge: ack });
+    setBusy(false); toast(r.j.message || (r.ok ? "Removed." : "Could not remove."), r.ok && r.j.success ? "" : "bad"); if (r.ok && r.j.success) onDone();
+  };
+  return (
+    <Modal title={`Remove ${team.name}?`} onClose={onClose}>
+      {!imp ? <p className="gc-sub" role="status"><span className="gc-spin" /> Checking what is attached…</p> : imp.error ? <p className="gc-alert bad" role="alert"><Ic n="alert" s={16} /> {imp.error}</p> : (
+        <>
+          <h3 className="gc-h3">This will remove</h3>
+          <ul className="gc-res">{L.removes.map((x) => <li key={x}>{x}</li>)}</ul>
+          <h3 className="gc-h3">This will keep</h3>
+          <ul className="gc-res">{L.keeps.map((x) => <li key={x}>{x}</li>)}</ul>
+          {L.blocked.length ? <p className="gc-alert bad" role="alert"><Ic n="alert" s={16} /> <span>Cannot remove: {L.blocked.join(" and ")}.</span></p> : (
+            <>
+              <p className="gc-sub">The History tab keeps a full copy, including roster rows and the payment, so an admin can restore it.</p>
+              <label className="gc-lbl" htmlFor="gc-rm-why">Reason (goes in the history)</label>
+              <input id="gc-rm-why" data-autofocus className="gc-input" value={reason} onChange={(e) => setReason(e.target.value)} autoComplete="off" />
+              {imp.needs_ack ? <label className="gc-check"><input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} /> I understand this team has players or a payment on it</label> : null}
+              <label className="gc-lbl" htmlFor="gc-rm-name">Type the team name <b>{team.name}</b> to confirm</label>
+              <input id="gc-rm-name" className="gc-input" value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" spellCheck="false" />
+            </>
+          )}
+        </>
+      )}
+      <div className="gc-actions"><button type="button" className="gc-btn danger" disabled={!ok || busy} onClick={go}><Ic n="trash" s={16} /> {busy ? "Removing…" : "Remove team"}</button><button type="button" className="gc-btn ghost" onClick={onClose}>Cancel</button></div>
+    </Modal>
+  );
+}
+
+function ReasonDialog({ title, body, confirm, path, extra, onClose, onDone, toast, option }) {
+  const [reason, setReason] = useState(""); const [opt, setOpt] = useState(false); const [busy, setBusy] = useState(false);
+  const go = async () => {
+    if (reason.trim().length < 3 || busy) return; setBusy(true);
+    const r = await post(path, { ...extra, reason, ...(option ? { [option.key]: opt } : {}) });
+    setBusy(false); toast(r.j.message || (r.ok ? "Done." : "Could not do that."), r.ok && r.j.success ? "" : "bad"); if (r.ok && r.j.success) onDone();
+  };
+  return (
+    <Modal title={title} onClose={onClose}>
+      <p>{body}</p>
+      <label className="gc-lbl" htmlFor="gc-why">Reason (goes in the history)</label>
+      <input id="gc-why" data-autofocus className="gc-input" value={reason} onChange={(e) => setReason(e.target.value)} autoComplete="off" />
+      {option ? <label className="gc-check"><input type="checkbox" checked={opt} onChange={(e) => setOpt(e.target.checked)} /> {option.label}</label> : null}
+      <div className="gc-actions"><button type="button" className="gc-btn danger" disabled={reason.trim().length < 3 || busy} onClick={go}>{busy ? "Working…" : confirm}</button><button type="button" className="gc-btn ghost" onClick={onClose}>Cancel</button></div>
+    </Modal>
+  );
+}
+
+function DigestDialog({ onClose, toast }) {
+  const [d, setD] = useState(null); const [busy, setBusy] = useState(false);
+  useEffect(() => { let live = true; (async () => { const r = await post("/captain-sync/digest", {}); if (live) setD(r.ok && r.j.success ? r.j : { error: r.j.message || "Could not build the summary." }); })(); return () => { live = false; }; }, []);
+  const send = async () => { setBusy(true); const r = await post("/captain-sync/digest", { send: true }); setBusy(false); toast(r.j.message || (r.ok ? "Sent." : "Could not send."), r.ok && r.j.success ? "" : "bad"); };
+  return (
+    <Modal title="What needs you" onClose={onClose}>
+      {!d ? <p className="gc-sub" role="status"><span className="gc-spin" /> Building the summary…</p> : d.error ? <p className="gc-alert bad" role="alert"><Ic n="alert" s={16} /> {d.error}</p> : <pre className="gc-pre gc-digest" aria-label="Summary">{d.text}</pre>}
+      <p className="gc-sub">Email goes only to the address on your own WordPress account.</p>
+      <div className="gc-actions"><button type="button" className="gc-btn gold" data-autofocus disabled={!d || !!d.error || busy} onClick={send}><Ic n="mail" s={16} /> {busy ? "Sending…" : "Email me this"}</button><button type="button" className="gc-btn ghost" onClick={() => window.print()}>Print</button><button type="button" className="gc-btn ghost" onClick={onClose}>Close</button></div>
+    </Modal>
+  );
+}
+
+function TeamTools({ t, ov, actions }) {
+  const [det, setDet] = useState(null);
+  const n0 = t.note || {}; const [note, setNote] = useState(n0.note || ""); const [tag, setTag] = useState(n0.tag || ""); const [fu, setFu] = useState(n0.follow_up || ""); const [saving, setSaving] = useState(false);
+  useEffect(() => { let live = true; setDet(null); (async () => { const r = await call("/captain-sync/team-detail?team_id=" + t.id); if (live) setDet(r.ok && r.j.success ? r.j : { error: r.j.message || "Could not load details." }); })(); return () => { live = false; }; }, [t.id]);
+  const save = async () => { setSaving(true); const r = await post("/captain-sync/note", { team_id: t.id, note, tag, follow_up: fu }); setSaving(false); actions.toast(r.j.message || (r.ok ? "Saved." : "Could not save."), r.ok && r.j.success ? "" : "bad"); if (r.ok) actions.reload(); };
+  const rd = C.readiness(t); const idle = C.idleFlag(t); const fee = C.teamFeeLine(t, ov.money);
+  return (
+    <>
+      <div className="gc-badges"><Pill tone={rd.tone}>{rd.label}</Pill>{idle ? <Pill tone={idle.tone}>{idle.label}</Pill> : null}{t.note && t.note.tag ? <Pill tone="info">{C.noteTagLabel(t.note.tag)}</Pill> : null}</div>
+      {rd.why ? <p className="gc-sub">{rd.why}</p> : null}
+      {fee ? <p className="gc-note"><Ic n="clock" s={14} /> {fee}</p> : null}
+      {det && !det.error && det.ledger.length ? <><h3 className="gc-h3">Money for this team</h3><ul className="gc-res">{det.ledger.map((x, i) => <li key={i}>{x.label}: <b>{C.money(x.amount)}</b>{x.date ? <span className="gc-sub"> {dateOnly(x.date.length === 10 ? x.date + " 00:00:00" : x.date)}</span> : null}{x.state === "due" ? <span className="gc-sub"> still due</span> : null}</li>)}</ul></> : null}
+      {det && !det.error && det.players.length ? <><h3 className="gc-h3">Roster ({det.players.length})</h3><p className="gc-sub">{det.players.join(", ")}</p></> : null}
+      {det && !det.error && det.timeline.length ? <><h3 className="gc-h3">Everything that happened</h3><ul className="gc-res">{det.timeline.slice(0, 10).map((x, i) => <li key={i}>{x.notes || C.historyTitle(x.action)} <span className="gc-sub">{I.fmtStamp(x.at)} · {x.by}</span></li>)}</ul></> : null}
+      {det && det.error ? <p className="gc-sub">{det.error}</p> : null}
+      <h3 className="gc-h3">Your note</h3>
+      <label className="gc-sr" htmlFor="gc-note">Note</label>
+      <textarea id="gc-note" className="gc-input" rows={2} maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Phoned Sam, paying by check next week" />
+      <div className="gc-bar-f">
+        <label className="gc-sr" htmlFor="gc-tag">Tag</label>
+        <select id="gc-tag" className="gc-select" value={tag} onChange={(e) => setTag(e.target.value)}>{C.NOTE_TAGS.map((x) => <option key={x.key} value={x.key}>{x.label}</option>)}</select>
+        <label className="gc-sr" htmlFor="gc-fu">Follow up on</label>
+        <input id="gc-fu" className="gc-input gc-date" type="date" value={fu} onChange={(e) => setFu(e.target.value)} />
+        <button type="button" className="gc-btn ghost" disabled={saving} onClick={save}>{saving ? "Saving…" : "Save note"}</button>
+      </div>
+    </>
+  );
+}
+
 function TeamDrawer({ team, ov, onClose, actions }) {
   const t = team; const min = t.min_players;
   const steps = [
@@ -185,13 +281,19 @@ function TeamDrawer({ team, ov, onClose, actions }) {
         <dt>Last reminder</dt><dd>{t.last_nudged_at ? I.fmtStamp(t.last_nudged_at) : "Never"}</dd>
         <dt>Money</dt><dd>{t.deposit_paid_at ? `${C.statusLabel(t.payment_status)} · balance ${C.money(t.balance_due)}` : "No deposit yet"}</dd>
       </dl>
+      <TeamTools t={t} ov={ov} actions={actions} />
       {hist.length ? <><h3 className="gc-h3">Recent changes</h3><ul className="gc-res">{hist.map((h) => <li key={h.id}>{C.historyTitle(h.action)}: {h.notes} <span className="gc-sub">{I.fmtStamp(h.at)}</span></li>)}</ul></> : null}
       <div className="gc-actions">
         <button type="button" className="gc-btn" onClick={() => actions.captain(t)}><Ic n="userplus" s={16} /> {t.captain ? "Change captain" : "Add a captain"}</button>
         {t.captain && t.account === "none" ? <a className="gc-btn ghost" href={adminUrl("grsh-tm-invite-captain")}>Send an invite <Ic n="ext" s={14} /></a> : null}
       </div>
-      {t.delete && t.delete.allowed ? <div className="gc-danger-zone"><p className="gc-sub">Nothing real is attached to this team.</p><button type="button" className="gc-btn ghost" onClick={() => actions.clean(t)}><Ic n="trash" s={16} /> Select for clean-up</button></div>
-        : <p className="gc-sub gc-lock">Cannot be deleted: {t.delete && t.delete.reasons ? t.delete.reasons.join(" and ") : "protected"}.</p>}
+      {t.captain && t.account === "pending" ? <div className="gc-actions"><button type="button" className="gc-btn ghost" onClick={() => actions.revoke(t)}>Revoke invite link</button></div> : null}
+      {t.captain ? <div className="gc-actions"><button type="button" className="gc-btn ghost" onClick={() => actions.detach(t)}>Detach captain</button></div> : null}
+      <div className="gc-danger-zone">
+        {t.delete && t.delete.allowed ? <p className="gc-sub">Nothing real is attached to this team.</p> : <p className="gc-sub gc-lock">{C.protectedHelp(t)}</p>}
+        {t.delete && t.delete.allowed ? <button type="button" className="gc-btn ghost" onClick={() => actions.clean(t)}><Ic n="trash" s={16} /> Select for clean-up</button> : null}
+        <button type="button" className="gc-btn ghost" disabled={!ov.can_write} onClick={() => actions.remove(t)}><Ic n="trash" s={16} /> Remove team…</button>
+      </div>
     </Modal>
   );
 }
@@ -304,7 +406,7 @@ export default function CaptainSync() {
   const m = ov.money;
   const tabs = [["deposits", "Deposits", ov.pending || 0], ["teams", "Teams", ov.teams.length], ["cleanup", "Clean-up", groups.suspect.length], ["problems", "Problems", counts.bad + counts.warn], ["history", "History", 0]];
   const sel2 = C.deleteSummary(ov.teams, cleanSel);
-  const teamActions = { captain: (t) => setModal({ t: "captain", id: t.id }), clean: (t) => { setCleanSel([t.id]); setModal(null); setTab("cleanup"); } };
+  const teamActions = { toast, reload: () => load(true), remove: (t) => setModal({ t: "remove", id: t.id }), revoke: (t) => setModal({ t: "revoke", id: t.id }), detach: (t) => setModal({ t: "detach", id: t.id }), captain: (t) => setModal({ t: "captain", id: t.id }), clean: (t) => { setCleanSel([t.id]); setModal(null); setTab("cleanup"); } };
   const openTeam = ov.teams.find((t) => modal && modal.id === t.id);
 
   return (
@@ -320,6 +422,7 @@ export default function CaptainSync() {
           </div>
           <div className="gc-hero-btns">
             <button type="button" className="gc-btn onnavy" onClick={() => load(true)}><Ic n="refresh" s={16} /> Refresh</button>
+            <button type="button" className="gc-btn onnavy" onClick={() => setModal({ t: "digest" })}><Ic n="mail" s={16} /> What needs me</button>
             <button type="button" className="gc-btn onnavy" onClick={() => saveBlob("captain-teams.csv", C.teamsCSV(ov))}><Ic n="download" s={16} /> Export teams</button>
           </div>
         </div>
@@ -337,7 +440,7 @@ export default function CaptainSync() {
 
         <div className="gc-health" aria-label="Wiring checks">
           {hs.failed.map((h) => <span key={h.key} className="gc-chip2 bad"><Ic n="alert" s={14} />{h.text}</span>)}
-          <button type="button" className={"gc-chip2 " + (hs.allOk ? "ok" : "mute")} aria-expanded={healthOpen} onClick={() => setHealthOpen(!healthOpen)}><Ic n={hs.allOk ? "check" : "info"} s={14} />{hs.allOk ? `All ${hs.okCount} checks passed` : `${hs.okCount} checks passed`}<Ic n="chev" s={12} /></button>
+          <button type="button" className={"gc-chip2 " + (hs.allOk ? "ok" : "mute")} aria-expanded={healthOpen} onClick={() => setHealthOpen(!healthOpen)}><Ic n={hs.allOk ? "check" : "info"} s={14} />{C.healthLabel(hs, v)}<Ic n="chev" s={12} /></button>
           {healthOpen ? ov.health.filter((h) => h.ok).map((h) => <span key={h.key} className="gc-chip2 ok"><Ic n="check" s={14} />{h.text}</span>) : null}
         </div>
 
@@ -363,8 +466,8 @@ export default function CaptainSync() {
             <div className="gc-card-h"><h2 id="gc-money-t" className="gc-h2">Money</h2><span className="gc-sub">{m.balance_due_date ? "Balance due " + dateOnly(m.balance_due_date + " 00:00:00") : ""}</span></div>
             <div className="gc-tiles">
               <div className="gc-tile"><span className="gc-tile-n">{C.money(m.collected)}</span><span className="gc-tile-l">Collected</span></div>
-              <div className="gc-tile"><span className="gc-tile-n">{C.money(m.outstanding)}</span><span className="gc-tile-l">Still owed by paying teams</span></div>
-              <div className="gc-tile"><span className="gc-tile-n">{C.money(m.potential_now)}</span><span className="gc-tile-l">If {I.plural(m.waiting, "waiting team")} paid at {C.money(m.fee_now)}</span></div>
+              <div className="gc-tile"><span className="gc-tile-n">{C.money(m.outstanding)}</span><span className="gc-tile-l">Balance owed by teams that paid a deposit</span></div>
+              <div className="gc-tile"><span className="gc-tile-n">{C.money(m.potential_now)}</span><span className="gc-tile-l">Expected if {I.plural(m.waiting, "waiting team")} paid now at {C.money(m.fee_now)} each</span></div>
             </div>
             {C.earlyBirdLine(m) ? <p className="gc-note"><Ic n="clock" s={14} /> {C.earlyBirdLine(m)}</p> : null}
           </section>
@@ -372,7 +475,7 @@ export default function CaptainSync() {
             <div className="gc-card-h"><h2 id="gc-bal-t" className="gc-h2">Division balance</h2><span className="gc-sub">Teams against the plan in Settings.</span></div>
             <ul className="gc-dv">
               {ov.balance.rows.map((r) => {
-                const st = C.balanceStatus(r); const pct = r.expected ? Math.min(100, Math.round((r.actual / r.expected) * 100)) : 100;
+                const st = C.balanceStatus(r); const pct = r.expected ? Math.min(100, Math.round((r.actual / r.expected) * 100)) : 0;
                 return <li key={r.key}><span className="gc-dv-h"><b>{r.label}</b><span>{r.actual}{r.expected !== null ? " of " + r.expected : ""}</span><Pill tone={st.tone}>{st.label}</Pill></span><span className="gc-dv-bar" role="img" aria-label={`${r.label}: ${r.actual} of ${r.expected === null ? "no target" : r.expected} teams`}><i className={st.tone} style={{ width: pct + "%" }} /></span></li>;
               })}
             </ul>
@@ -471,7 +574,7 @@ export default function CaptainSync() {
                       </div>
                       {!t.division_ok ? <DivFix teamId={t.id} divisions={ov.divisions} value={divPick[t.id]} onChange={setDiv} onSave={saveDivision} /> : null}
                       <p className="gc-team-cap">{t.captain ? <><span className="gc-strong">{t.captain.name}</span><span className="gc-sm">{t.captain.email}</span></> : <><span className="gc-neg">No captain</span> <button type="button" className="gc-btn ghost sm" onClick={() => teamActions.captain(t)}><Ic n="userplus" s={14} /> Add</button></>}</p>
-                      <div className="gc-team-row"><span className="gc-dots" role="img" aria-label={"Stage: " + C.STAGES[si].label}>{C.STAGES.map((s, i) => <i key={s.key} className={i <= si ? "on" : ""} title={s.label} />)}</span><span>{C.STAGES[si].label}</span>{sd ? <Pill tone={C.stuckTone(sd)}>{C.ageLabel(sd)} stuck</Pill> : null}</div>
+                      <div className="gc-team-row"><span className="gc-dots" role="img" aria-label={"Stage: " + C.STAGES[si].label}>{C.STAGES.map((s, i) => <i key={s.key} className={i <= si ? "on" : ""} title={s.label} />)}</span><span>{C.STAGES[si].label}</span>{sd ? <Pill tone={C.stuckTone(sd)}>{C.ageLabel(sd)} stuck</Pill> : null}{C.idleFlag(t) ? <Pill tone={C.idleFlag(t).tone}>{C.idleFlag(t).label}</Pill> : null}<Pill tone={C.readiness(t).tone}>{C.readiness(t).label}</Pill>{t.note && t.note.tag ? <Pill tone="info">{C.noteTagLabel(t.note.tag)}</Pill> : null}</div>
                       <div className="gc-team-row"><span className={t.roster_size >= t.min_players ? "" : "gc-dim"}>Roster {t.roster_size}/{t.min_players}</span>{t.deposit_paid_at ? <Pill tone={t.payment_status === "paid_in_full" ? "ok" : "info"}>{C.statusLabel(t.payment_status)} · {C.money(t.balance_due)} due</Pill> : <span className="gc-dim">No deposit</span>}</div>
                       <p className="gc-team-next"><b>Next:</b> {C.nextStep(t)}{t.account === "none" && t.captain ? <> · <a className="gc-a" href={adminUrl("grsh-tm-invite-captain")}>Invite <Ic n="ext" s={12} /></a></> : null}{t.last_nudged_at ? <span className="gc-sub"> · reminded {dateOnly(t.last_nudged_at)}</span> : null}</p>
                     </li>
@@ -479,7 +582,6 @@ export default function CaptainSync() {
                 })}
               </ul>
             ) : <div className="gc-empty"><p>{ov.teams.length ? "No teams match." : "No captain teams this season yet. Teams are created by Invite Captain and the captain signup page."}</p></div>}
-            <div className="gc-alert info"><Ic n="info" s={16} /> <span><b>Tahoe Champions Cup is not synced here.</b> Form #{ov.tcc.form_id}{ov.tcc.entries !== null ? ` has ${I.plural(ov.tcc.entries, "entry", "entries")}` : ""} and is a separate tournament with different divisions. It needs its own design before anything is copied into GRSH.</span></div>
           </div>
         ) : null}
 
@@ -511,15 +613,15 @@ export default function CaptainSync() {
               </section>
             ))}
             {groups.protected.length ? (
-              <details className="gc-det"><summary>{I.plural(groups.protected.length, "team")} protected, cannot be deleted</summary>
-                <ul className="gc-res">{groups.protected.map((t) => <li key={t.id}><b>{t.name}</b>: {t.delete.reasons.join(" and ")}.</li>)}</ul></details>
+              <details className="gc-det"><summary>{I.plural(groups.protected.length, "team")} kept because of real data (players or money)</summary>
+                <ul className="gc-res">{groups.protected.map((t) => <li key={t.id}><b>{t.name}</b>: {C.protectedHelp(t)} <button type="button" className="gc-link" onClick={() => setModal({ t: "team", id: t.id })}>Open team</button></li>)}</ul></details>
             ) : null}
-            <div className="gc-sticky">
-              <span aria-live="polite">{cleanSel.length ? I.plural(cleanSel.length, "team") + " selected" : "Nothing selected"}</span>
+            {cleanSel.length ? <div className="gc-sticky" role="region" aria-label="Selected teams">
+              <span aria-live="polite">{I.plural(cleanSel.length, "team")} selected</span>
               <span className="gc-grow" />
-              {cleanSel.length ? <button type="button" className="gc-link" onClick={() => setCleanSel([])}>Clear</button> : null}
-              <button type="button" className="gc-btn danger" disabled={!canWrite || !cleanSel.length} onClick={() => { setDelText(""); setModal({ t: "delete" }); }}><Ic n="trash" s={16} /> Delete {cleanSel.length ? I.plural(cleanSel.length, "team") : "selected"} permanently…</button>
-            </div>
+              <button type="button" className="gc-link" onClick={() => setCleanSel([])}>Clear</button>
+              <button type="button" className="gc-btn danger" disabled={!canWrite || !cleanSel.length} onClick={() => { setDelText(""); setModal({ t: "delete" }); }}><Ic n="trash" s={16} /> Delete {I.plural(cleanSel.length, "team")} permanently…</button>
+            </div> : null}
           </div>
         ) : null}
 
@@ -552,6 +654,7 @@ export default function CaptainSync() {
                 <div className="gc-log-h"><div><b>{C.historyTitle(h.action)}</b> <span className="gc-sub">#{h.id} · {I.fmtStamp(h.at)} · {h.by}</span></div>{h.undone ? <Pill>{h.action === "captain_sync_team_deleted" ? "Restored" : "Undone"}</Pill> : null}</div>
                 <p className="gc-note">{h.notes}</p>
                 {h.can_undo ? <button type="button" className="gc-btn ghost" onClick={() => setModal({ t: "undo", id: h.id })}><Ic n="undo" s={15} /> Undo</button> : h.action === "captain_sync_deposit" && !h.undone ? <span className="gc-sub">The team has changed since, so this can no longer be undone safely.</span> : null}
+                {h.can_reattach ? <button type="button" className="gc-btn ghost" onClick={async () => { const r = await post("/captain-sync/reattach-captain", { audit_id: h.id }); toast(r.j.message || (r.ok ? "Done." : "Could not do that."), r.ok && r.j.success ? "" : "bad"); load(true); }}><Ic n="undo" s={15} /> Put captain back</button> : null}
                 {h.can_restore ? <button type="button" className="gc-btn ghost" onClick={() => setModal({ t: "restore", id: h.id })}><Ic n="undo" s={15} /> Restore team</button> : null}
               </article>
             ))}
@@ -592,6 +695,10 @@ export default function CaptainSync() {
       ) : null}
       {modal && modal.t === "captain" && ov.teams.find((t) => t.id === modal.id) ? <CaptainPicker team={ov.teams.find((t) => t.id === modal.id)} toast={toast} onClose={() => setModal(null)} onDone={() => { setModal(null); load(true); }} /> : null}
       {modal && modal.t === "nudge" ? <NudgeDialog teams={ov.teams.filter((t) => (modal.ids || []).includes(t.id))} toast={toast} onClose={() => setModal(null)} onDone={() => { setModal(null); load(true); }} /> : null}
+      {modal && modal.t === "remove" && openTeam ? <RemoveDialog team={openTeam} toast={toast} onClose={() => setModal(null)} onDone={() => { setModal(null); load(true); }} /> : null}
+      {modal && modal.t === "revoke" && openTeam ? <ReasonDialog title="Revoke the invite link?" body={`The link sent to ${openTeam.captain ? openTeam.captain.name : "the captain"} stops working. Their account and player record are kept. Send a new link from Invite Captain if you change your mind.`} confirm="Revoke link" path="/captain-sync/revoke-invite" extra={{ team_id: openTeam.id }} toast={toast} onClose={() => setModal(null)} onDone={() => { setModal(null); load(true); }} /> : null}
+      {modal && modal.t === "detach" && openTeam ? <ReasonDialog title="Detach the captain?" body={`${openTeam.captain ? openTeam.captain.name : "The captain"} stops being captain of ${openTeam.name}. Nothing is deleted, and History can put them back.`} confirm="Detach captain" path="/captain-sync/detach-captain" extra={{ team_id: openTeam.id }} option={openTeam.account === "pending" ? { key: "revoke_invite", label: "Also revoke their unused invite link (cannot be undone)" } : null} toast={toast} onClose={() => setModal(null)} onDone={() => { setModal(null); load(true); }} /> : null}
+      {modal && modal.t === "digest" ? <DigestDialog toast={toast} onClose={() => setModal(null)} /> : null}
       {modal && modal.t === "team" && openTeam ? <TeamDrawer team={openTeam} ov={ov} onClose={() => setModal(null)} actions={teamActions} /> : null}
       <div className="gc-toasts" role="status" aria-live="polite">{toasts.map((t) => <div key={t.id} className={"gc-toast" + (t.tone === "bad" ? " bad" : "")}>{t.msg}</div>)}</div>
     </div>
@@ -601,16 +708,16 @@ export default function CaptainSync() {
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=DM+Mono:wght@400;500&display=swap');
 .gc{--navy:#1a1a2e;--gold:#d4a017;--goldt:#7a5a05;--cream:#f6f5f0;--line:#e3e0d6;--mut:#55556a;--ok:#1f6f46;--okb:#e6f4ec;--warn:#85540a;--warnb:#fdf3dc;--bad:#b3261e;--badb:#fdeceb;--info:#27578f;--infob:#e8f0fa;
- font-family:'DM Mono',ui-monospace,Menlo,monospace;font-size:14px;line-height:1.55;color:var(--navy);background:var(--cream);margin:0 -20px;padding:0 20px 56px;min-height:100vh;box-sizing:border-box}
+ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:15px;line-height:1.55;color:var(--navy);background:var(--cream);margin:0 -20px;padding:0 20px 56px;min-height:100vh;box-sizing:border-box}
 .gc *,.gc *::before,.gc *::after{box-sizing:border-box}
-.gc button,.gc select,.gc input,.gc textarea{font-family:inherit;font-size:inherit;color:inherit}
+.gc :where(button,select,input,textarea){font-family:inherit;font-size:inherit;color:inherit}
 .gc button:focus-visible,.gc select:focus-visible,.gc input:focus-visible,.gc textarea:focus-visible,.gc [tabindex]:focus-visible,.gc a:focus-visible,.gc summary:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
 .gc-wrap{max-width:1180px;margin:0 auto}
-.gc-hero{background:linear-gradient(135deg,#1a1a2e 0%,#2a2a4a 100%);color:#fff;border-radius:0 0 18px 18px;margin:0 -20px 22px;padding:30px 20px 26px;position:relative;overflow:hidden}
+.gc-hero{background:linear-gradient(135deg,#1a1a2e 0%,#2a2a4a 100%);color:#fff;border-radius:0 0 18px 18px;margin:0 -20px 16px;padding:16px 20px 14px;position:relative;overflow:hidden}
 .gc-hero::after{content:"";position:absolute;right:-60px;top:-60px;width:260px;height:260px;border-radius:50%;background:radial-gradient(circle,rgba(212,160,23,.35),transparent 70%)}
 .gc-hero-in{max-width:1180px;margin:0 auto;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between;position:relative;z-index:1}
 .gc-kicker{color:#f0cf6e;font-size:12px;letter-spacing:.14em;text-transform:uppercase;margin:0 0 6px}
-.gc-h1{font-family:'Fraunces',Georgia,serif;font-size:34px;line-height:1.1;margin:0 0 8px;font-weight:700;color:#fff}
+.gc-h1{font-family:'Fraunces',Georgia,serif;font-size:28px;line-height:1.1;margin:0 0 4px;font-weight:700;color:#fff}
 .gc-lead{margin:0;color:#e4e4ee;max-width:640px}
 .gc-last{margin-top:12px;display:inline-flex;gap:8px;align-items:center;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.22);border-radius:999px;padding:5px 14px;font-size:13px;color:#fff}
 .gc-h2{font-family:'Fraunces',Georgia,serif;font-size:21px;margin:0;font-weight:600;color:var(--navy)}
@@ -813,7 +920,7 @@ a.gc-btn{text-decoration:none}.gc-badge.hot{background:var(--bad)}
 .gc-clean{list-style:none;margin:0;padding:0}.gc-clean li{border-bottom:1px solid var(--line)}.gc-clean li:last-child{border-bottom:0}
 .gc-clean-row{display:flex;gap:12px;align-items:flex-start;padding:10px 4px;cursor:pointer}.gc-clean-row input{margin-top:4px;width:18px;height:18px;accent-color:var(--bad)}
 .gc-clean-row .gc-grow{display:flex;flex-direction:column;gap:2px}.gc-why{color:var(--warn)}
-.gc-sticky{position:sticky;bottom:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#fff;border-top:2px solid var(--line);margin:18px -20px -20px;padding:12px 20px;border-radius:0 0 16px 16px}
+.gc-sticky{position:sticky;z-index:5;bottom:0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#fff;border-top:2px solid var(--line);margin:18px -20px -20px;padding:12px 20px;border-radius:0 0 16px 16px}
 .gc-scrim.side{place-items:stretch end;padding:0}
 .gc-modal.drawer{max-width:440px;width:100%;height:100%;max-height:100vh;border-radius:16px 0 0 16px;animation:gc-in .2s ease-out}
 @keyframes gc-in{from{transform:translateX(30px);opacity:0}to{transform:none;opacity:1}}
@@ -825,4 +932,14 @@ a.gc-btn{text-decoration:none}.gc-badge.hot{background:var(--bad)}
 @media(max-width:600px){.gc-modal.drawer{max-width:100%;border-radius:0}.gc-dl{grid-template-columns:1fr}.gc-verdict{flex-wrap:wrap}.gc-act{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){.gc *{animation:none!important;transition:none!important}}
 @media print{.gc-scrim,.gc-toasts{display:none}}
+
+.gc-lead{display:none}
+.gc-fun-n small{font-size:13px;font-weight:500;color:var(--mut);font-family:inherit}
+.gc-fun{grid-template-columns:repeat(5,minmax(0,1fr))}
+@media(max-width:900px){.gc-fun{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}}
+.gc-badges{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.gc-date{max-width:170px}
+.gc-digest{white-space:pre-wrap;font-family:inherit}
+.gc-tile-n,.gc-fun-n,.gc-dv-h span{font-variant-numeric:tabular-nums}
+@media print{.gc-hero-btns,.gc-tabs,.gc-sticky,.gc-scrim .gc-actions{display:none!important}.gc{background:#fff}.gc-card{break-inside:avoid;box-shadow:none}}
 `;

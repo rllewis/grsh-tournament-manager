@@ -139,7 +139,7 @@ eq( $ov['registered']['gold_open']['registered'], 2, 'Gold Open registered (labe
 eq( $ov['registered']['45a']['registered'], 0, 'waitlist and subs are not counted' ); eq( $ov['registered']['gold_open']['teams'], 2, 'teams counted' ); eq( $ov['registered']['gold_open']['no_captain'], 1, 'team without captain' );
 $dr = $ov['readiness']['draft']; $txt = implode( ' | ', array_column( $dr, 'text' ) );
 ok( strpos( $txt, 'Gold Open: 2 registered, 32 needed' ) !== false, "draft readiness counts shortfall ($txt)" );
-ok( strpos( $txt, 'Gold Open: 2 of 4 teams created' ) !== false, 'teams created vs configured' );
+ok( strpos( $txt, 'Gold Open: 2 of 4 draft teams created' ) !== false, 'teams created vs configured' );
 ok( strpos( $txt, 'no captain' ) !== false, 'captain warning' );
 eq( $ov['readiness']['locked'][0]['text'], '2 registered players are not on a roster yet.', 'unassigned players counted' );
 $levels = array_column( $ov['readiness']['open'], 'level' ); ok( in_array( 'warn', $levels, true ) && ! in_array( 'block', $levels, true ), 'open: fee warning but nothing blocking' );
@@ -171,5 +171,71 @@ $GLOBALS['forms_posts'] = [];
 GRSH_Settings::save_settings( req( [], [ 'status' => 'open', 'registration_opens' => '2025-01-01', 'registration_closes' => '2025-02-01', 'draft_date' => '2025-03-01' ] ) );
 $hl = implode( ' | ', array_column( GRSH_Settings::get_overview()->data['health'], 'text' ) );
 ok( strpos( $hl, 'Status is Open but the registration close date has passed' ) !== false, 'stale open status flagged' );
+
+echo "11. division format (draft / registered teams / both)\n";
+function divs() { return GRSH_Settings::get()['divisions']; }
+function with_div( $key, $patch ) { $d = divs(); foreach ( $d as $i => $x ) { if ( $x['key'] === $key ) { $d[ $i ] = array_merge( $x, $patch ); } } return $d; }
+function div_idx( $key ) { foreach ( divs() as $i => $x ) { if ( $x['key'] === $key ) { return $i; } } return -1; }
+function save_divs( $d ) { return GRSH_Settings::save_settings( req( [], [ 'divisions' => $d ] ) ); }
+foreach ( divs() as $x ) { eq( [ $x['format'], $x['reg_teams'] ], [ 'both', 0 ], $x['key'] . ' defaults to both / 0 slots (old behaviour)' ); }
+eq( GRSH_Settings::division_format( 'gold_open' ), 'both', 'division_format reads the default' );
+eq( GRSH_Settings::division_format( 'nope' ), 'both', 'unknown division is never blocked' );
+eq( count( GRSH_Settings::divisions_for( 'full_team' ) ), 5, 'all five take registered teams while on both' );
+eq( GRSH_Settings::fill_division( [ 'teams' => 4, 'reg_teams' => 9 ] )['reg_teams'], 4, 'fill_division clamps slots to the team count' );
+
+$r = save_divs( with_div( 'gold_open', [ 'format' => 'bogus' ] ) );
+ok( $r->status === 422 && isset( $r->data['errors'][ 'divisions.' . div_idx( 'gold_open' ) . '.format' ] ), 'bad format is refused' );
+$r = save_divs( with_div( '45a', [ 'format' => 'both', 'reg_teams' => 5 ] ) );
+ok( $r->status === 422 && isset( $r->data['errors'][ 'divisions.' . div_idx( '45a' ) . '.reg_teams' ] ), 'more registered slots than teams is refused' );
+$r = save_divs( with_div( '45a', [ 'format' => 'both', 'reg_teams' => 1 ] ) );
+eq( $r->status, 200, 'both with 1 registered slot saves' );
+eq( GRSH_Settings::slots( divs()[ div_idx( '45a' ) ] ), [ 2, 1 ], '45A (3 teams) splits 2 draft + 1 registered' );
+$r = save_divs( with_div( 'senior_c', [ 'format' => 'teams', 'reg_teams' => 0 ] ) );
+eq( $r->status, 200, 'registered-teams format saves' );
+eq( divs()[ div_idx( 'senior_c' ) ]['reg_teams'], 2, 'teams format forces every slot to registered (2 of 2)' );
+eq( GRSH_Settings::slots( divs()[ div_idx( 'senior_c' ) ] ), [ 0, 2 ], 'no draft slots in a teams division' );
+$r = save_divs( with_div( 'womens', [ 'format' => 'draft', 'reg_teams' => 2 ] ) );
+eq( $r->status, 200, 'draft format saves' );
+eq( divs()[ div_idx( 'womens' ) ]['reg_teams'], 0, 'draft format zeroes the registered slots' );
+$fk = array_column( GRSH_Settings::divisions_for( 'full_team' ), 'key' ); $dk = array_column( GRSH_Settings::divisions_for( 'draft' ), 'key' );
+ok( ! in_array( 'womens', $fk, true ) && in_array( 'senior_c', $fk, true ), 'invite list leaves out draft-only divisions' );
+ok( in_array( 'womens', $dk, true ) && ! in_array( 'senior_c', $dk, true ), 'draft list leaves out teams-only divisions' );
+$ch = array_column( GRSH_Settings::get()['divisions'] ? $r->data['changes'] : [], 'key' ); ok( in_array( 'divisions.womens.format', $ch, true ), 'format change shows in the change list' );
+$r = GRSH_Settings::save_settings( req( [], [ 'divisions' => array_map( function ( $d ) { unset( $d['format'], $d['reg_teams'] ); return $d; }, divs() ) ] ) );
+eq( $r->status, 200, 'an older client that sends no format still saves' );
+eq( [ divs()[ div_idx( 'senior_c' ) ]['format'], divs()[ div_idx( 'womens' ) ]['format'] ], [ 'teams', 'draft' ], 'omitted format keeps the saved one' );
+
+echo "12. impact checks against teams that already exist\n";
+$r = save_divs( with_div( 'gold_open', [ 'format' => 'teams' ] ) );
+ok( $r->status === 422 && strpos( $r->data['errors'][ 'divisions.' . div_idx( 'gold_open' ) . '.format' ] ?? '', '2 draft teams already exist' ) !== false, 'cannot switch to teams while draft teams exist' );
+$r = save_divs( with_div( 'gold_open', [ 'teams' => 1 ] ) );
+ok( $r->status === 422 && isset( $r->data['errors'][ 'divisions.' . div_idx( 'gold_open' ) . '.teams' ] ), 'cannot drop teams below the number already created' );
+$r = save_divs( with_div( 'gold_open', [ 'teams' => 2 ] ) );
+eq( $r->status, 200, 'dropping to exactly the number created is fine' );
+$db->pdo->exec( "INSERT INTO wp_grsh_teams (season_id,division,team_type,name,captain_player_id) VALUES (1,'senior_b','full_team','Reds',NULL)" );
+$r = save_divs( with_div( 'senior_b', [ 'format' => 'draft' ] ) );
+ok( $r->status === 422 && strpos( $r->data['errors'][ 'divisions.' . div_idx( 'senior_b' ) . '.format' ] ?? '', '1 registered team already exist' ) !== false, 'cannot switch to draft while a registered team exists' );
+$db->pdo->exec( "INSERT INTO wp_grsh_players (first_name,last_name,email,is_goalie) VALUES ('E','E','e@x.com',0),('F','F','f@x.com',0)" );
+$db->pdo->exec( "INSERT INTO wp_grsh_rosters (team_id,player_id,season_id) VALUES (1,1,1),(1,2,1),(1,3,1),(1,4,1),(1,5,1),(1,6,1)" );
+$r = save_divs( with_div( 'gold_open', [ 'min_roster' => 4, 'max_roster' => 5, 'goalie_min' => 0, 'goalie_max' => 1 ] ) );
+ok( $r->status === 422 && isset( $r->data['errors'][ 'divisions.' . div_idx( 'gold_open' ) . '.max_roster' ] ), 'max roster cannot go below a roster that already has 6 players' );
+$r = save_divs( with_div( 'gold_open', [ 'min_roster' => 4, 'max_roster' => 6, 'goalie_min' => 0, 'goalie_max' => 1 ] ) );
+eq( $r->status, 200, 'max roster equal to the biggest roster is fine' );
+$r = save_divs( with_div( 'gold_open', [ 'max_roster' => 5, 'min_roster' => 4 ] ) );
+ok( $r->status === 422, 'second attempt below the biggest roster still refused' );
+
+echo "13. readiness and health follow the format\n";
+$ov = GRSH_Settings::get_overview()->data; $txt = implode( ' | ', array_column( $ov['readiness']['draft'], 'text' ) );
+ok( strpos( $txt, 'Senior C' ) !== false && strpos( $txt, 'Senior C: 0 of 2 registered teams are in' ) !== false, 'teams division is checked for registered teams' );
+ok( strpos( $txt, 'Senior C: 0 registered' ) === false && strpos( $txt, 'Senior C: 0 of 2 draft' ) === false, 'teams division is not held to the draft pool' );
+ok( strpos( $txt, 'Womens: 0 registered' ) !== false || strpos( $txt, 'Womens' ) !== false, 'draft division still checked for the draft pool' );
+ok( strpos( $txt, '45A: 0 registered, 14 needed for 2 draft teams' ) !== false, 'both-division needs only its draft slots (2 x 7), not all 3 teams' );
+ok( strpos( $txt, '45A: 0 of 1 registered teams are in' ) !== false, 'both-division also tracks its registered slot' );
+ok( strpos( $txt, 'Senior B is set to' ) === false, 'no mismatch warning while formats match' );
+$db->pdo->exec( "INSERT INTO wp_grsh_teams (season_id,division,team_type,name,captain_player_id) VALUES (1,'womens','full_team','Wrong',NULL)" );
+$ov = GRSH_Settings::get_overview()->data; $txt = implode( ' | ', array_column( $ov['readiness']['draft'], 'text' ) ); $hl = implode( ' | ', array_column( $ov['health'], 'text' ) );
+ok( strpos( $txt, 'Womens is set to Draft but has 1 registered team' ) !== false, 'readiness flags a registered team in a draft division' );
+ok( strpos( $hl, 'Womens is set to Draft but has teams of the other kind' ) !== false, 'health flags the same mismatch' );
+ok( ! (bool) preg_grep( '/Every division/', explode( ' | ', $hl ) ), 'health does not claim everything matches' );
 
 echo "\nPASS $pass  FAIL $fail\n"; exit( $fail ? 1 : 0 );

@@ -102,4 +102,68 @@ const d = E.diffAssign(m1, m2); eq(d.find((x) => x.player_id === 1).team_id, 12,
 eq(E.diffAssign(m1, m1), [], "no diff when equal");
 const back = E.diffAssign(m2, m1); eq(back.length, d.length, "inverse diff same size");
 
+
+console.log("v4: tab labels, position needs, explain, compare, names, blockers");
+eq(E.divisionTabLabel({ assigned: 0, total: 2, pct: 0 }).text, "0 of 2 placed", "tab says what the numbers are");
+eq([E.divisionTabLabel({ assigned: 0, total: 0, pct: 0 }).text, E.divisionTabLabel({ assigned: 0, total: 0, pct: 0 }).muted], ["no players", true], "an empty division is not '0%'");
+const pl = mk(); const g1 = pl.find((p) => p.is_goalie); const dd = pl.filter((p) => p.position === "defenseman").slice(0, 2);
+const needs = E.positionNeeds({ players: [g1, ...dd, pl.find((p) => p.position === "center")] }, cfg);
+eq(needs.map((x) => [x.short, x.have, x.tone]), [["G", 1, "ok"], ["D", 2, "ok"], ["C", 1, "ok"], ["W", 0, "warn"]], "no wingers on a 5-player team is a warning");
+eq(E.positionNeeds({ players: [dd[0]] }, cfg)[0].tone, "bad", "no goalie is red");
+eq(E.positionNeeds({ players: [g1, pl.filter((p) => p.is_goalie)[1], pl.filter((p) => p.is_goalie)[2]] }, cfg)[0].tone, "warn", "too many goalies is amber");
+eq(E.positionNeeds({ players: [dd[0]] }, cfg)[1].tone, "ok", "small teams are not nagged about skaters");
+const tm = [{ id: 1, name: "Hi", locked: false, players: [pl[0], pl[1], pl[2]] }, { id: 2, name: "Lo", locked: false, players: [pl[5], pl[6], pl[8]] }];
+const ex = E.explainSwap({ a: pl[0], b: pl[5], teamA: 1, teamB: 2 }, tm);
+ok(/Hi averages .* and Lo .*moves .* score points of strength from Hi to Lo/.test(ex), "swap explanation names the stronger team and the points moved (" + ex + ")");
+eq(E.explainSwap({ a: pl[0], b: pl[5], teamA: 1, teamB: 9 }, tm), "", "no explanation when a team is missing");
+const byId = new Map(pl.map((p) => [p.id, p])); const from = { 1: 10, 2: 10, 3: 11 }, to = { 1: 10, 2: 11, 3: 11, 4: 12 };
+const cp = E.comparePlans(from, to, byId, freshTeams());
+eq(cp.moves.map((m) => [m.player.id, m.from, m.to]).sort((a, b) => a[0] - b[0]), [[2, 10, 11], [4, null, 12]], "compare lists only players whose team differs");
+eq(E.comparePlans(from, from, byId, freshTeams()).moves, [], "identical plans differ by nothing");
+ok(typeof cp.spreadFrom === "number" && typeof cp.spreadTo === "number", "compare reports spread before and after");
+eq(E.comparePlans({ 999: 10 }, {}, byId, freshTeams()).moves, [], "players no longer in the division are ignored");
+eq(E.currentAssign([{ id: 5, players: [{ id: 1 }, { id: 2 }] }]), { 1: 5, 2: 5 }, "current rosters as an assignment map");
+eq(E.plannedTeamNames([], 3), ["Team A", "Team B", "Team C"], "team names from A");
+eq(E.plannedTeamNames(["team a", "Team C"], 3), ["Team B", "Team D", "Team E"], "existing names are skipped, any case");
+eq(E.plannedTeamNames([], 0), [], "none asked, none made");
+eq(E.plannedTeamNames([], 28).slice(25), ["Team Z", "Team AA", "Team AB"], "past Z it carries on");
+const gate = [{ key: "teams", level: "ok", text: "3 teams" }, { key: "goalies", level: "fail", text: "Needs a goalie: A" }, { key: "locked", level: "fail", text: "Lock every team" }, { key: "pool", level: "warn", text: "2 not on a team" }, { key: "unpaid", level: "warn", text: "1 not paid" }];
+eq(E.blockers(gate).map((b) => [b.key, b.fix && b.fix.act]), [["goalies", "balance"], ["locked", "lockall"]], "blockers carry a one-press fix");
+eq(E.warnings(gate).map((b) => [b.key, b.fix ? b.fix.act : null]), [["pool", "balance"], ["unpaid", null]], "warnings with no fix say so");
+eq(E.blockers([{ key: "weird", level: "fail", text: "x" }])[0].fix, null, "unknown blockers have no fix button");
+eq(E.blockers([]), [], "no gate, no blockers");
+eq([E.whyDisabled("balance", { teams: 0 }), E.whyDisabled("swaps", { teams: 1 }), E.whyDisabled("undo", { undo: 0 }), E.whyDisabled("undo", { undo: 2 }), E.whyDisabled("balance", { readOnly: true, teams: 3 }).length > 10], ["Add a team first.", "Needs at least two teams.", "Nothing to undo yet.", "", true], "reasons for switched-off buttons");
+ok(E.KEY_ITEMS.length >= 7 && E.KEY_ITEMS.every((k) => k.mark && k.text), "legend entries are complete");
+
+console.log("v5: player locks");
+{
+  const mk = (id, tier, pos = "winger") => ({ id, first_name: "F" + id, last_name: "L" + id, position: pos, is_goalie: pos === "goaltender", skill_tier_reported: tier, skill_tier_assigned: null, years_experience: 3, payment_status: "paid", returning_seasons: [] });
+  const A = [mk(1, "A"), mk(2, "A"), mk(3, "A"), mk(4, "B")], B = [mk(5, "D"), mk(6, "D"), mk(7, "C"), mk(8, "D")];
+  const teams = [{ id: 10, name: "Team A", locked: false, captain_player_id: 1, players: A }, { id: 11, name: "Team B", locked: false, captain_player_id: null, players: B }];
+  const cfg = { min_roster: 2, max_roster: 12, goalie_min: 0, goalie_max: 2, planned_teams: 2 };
+  const byId = new Map([...A, ...B].map((p) => [p.id, p]));
+  const free = E.proposeBalance(teams, [], [], cfg, { mode: "rebalance" });
+  const held = E.proposeBalance(teams, [], [], cfg, { mode: "rebalance", locks: [1, 2, 5] });
+  ok(!held.moves.some((m) => [1, 2, 5].includes(m.player_id)), "auto-balance never moves a locked player");
+  ok(free.moves.length >= held.moves.length, "locks only reduce what can move");
+  ok(held.assignment[1] === 10 && held.assignment[2] === 10 && held.assignment[5] === 11, "locked players stay on their teams in the proposal");
+  const sw = E.findSwaps(teams, [], cfg, { locks: [1, 2, 3, 4, 5, 6, 7, 8] });
+  eq(sw.length, 0, "no swaps when everyone is locked");
+  const sw2 = E.findSwaps(teams, [], cfg, { locks: [1] });
+  ok(sw2.every((x) => x.a.id !== 1 && x.b.id !== 1), "swaps skip a locked player");
+  const pins = [{ a: 1, b: 5, type: "together" }, { a: 2, b: 3, type: "apart" }];
+  const sum = E.lockSummary(teams, pins, [2, 99], byId);
+  eq(sum.held, 1, "unknown locked id ignored, one real lock counted");
+  eq(sum.broken, 2, "each broken rule is counted once");
+  const r1 = sum.rows.find((r) => r.player.id === 1);
+  ok(r1.captain && r1.rules[0].met === false && r1.rules[0].otherTeam === "Team B", "captain row shows its broken together rule and where the partner is");
+  ok(sum.rows[0].broken > 0, "broken rows sort first");
+  eq(E.lockSummary(teams, [], [], byId).rows.map((r) => r.player.id), [1], "a captain with no rules still shows");
+  eq(E.lockBlock(2, 11, teams, [2]), "Locked to Team A. Unlock the player first.", "moving a locked player is refused with a reason");
+  eq(E.lockBlock(2, 10, teams, [2]), null, "dropping on the same team is fine");
+  eq(E.lockBlock(3, 11, teams, [2]), null, "unlocked player moves freely");
+  const un = [{ id: 20, name: "T", locked: true, players: [mk(30, "B")] }];
+  eq(E.lockSummary(un, [], [], new Map([[30, mk(30, "B")]])).onLockedTeams, 1, "players on a locked team are counted, not listed");
+}
+
 console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);

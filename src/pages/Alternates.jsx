@@ -3,7 +3,7 @@
 // New: email sub requests (first YES wins), coverage heat map, goalie safety net,
 //      fit check before activation, reliability + fair call order.
 
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { computeScore, TIER_DESCRIPTIONS } from "../lib/playerScoring";
 
 const API   = window.grshConfig?.apiUrl || "/wp-json/grsh/v1";
@@ -482,7 +482,99 @@ function SmartDispatch({ pool, divs, filterDiv, filterDay, dm, onActivate, onAsk
 }
 
 // ─── Pool rows / cards ───────────────────────────────────────────────────────
-const LIST_COLS = "34px minmax(160px,1.5fr) 62px minmax(110px,1fr) 190px minmax(130px,1fr) 100px";
+
+// ─── Remove from the sub pool ────────────────────────────────────────────────
+const btnDanger = { fontFamily:F_UI,fontSize:13,fontWeight:700,background:"#B91C1C",color:"#fff",border:"none",padding:"8px 14px",borderRadius:8,cursor:"pointer" };
+
+function RemoveModal({ alt, onClose, onDone }) {
+  const [info,setInfo]=useState(null);
+  const [err,setErr]=useState("");
+  const [typed,setTyped]=useState("");
+  const [busy,setBusy]=useState(false);
+  const hdr={"Content-Type":"application/json","X-WP-Nonce":NONCE};
+  useEffect(()=>{
+    fetch(`${API}/alternates/${alt.id}/removal-impact`,{headers:hdr})
+      .then(async r=>{ const d=await r.json().catch(()=>({}));
+        if(r.status===403||r.status===401) throw new Error("Only a site administrator can remove alternates.");
+        if(!r.ok) throw new Error(d?.error||`Server returned ${r.status}`);
+        setInfo(d); })
+      .catch(e=>setErr(e.message||"Could not check what removing this person would affect."));
+  },[alt.id]);
+  const go = async () => {
+    setBusy(true); setErr("");
+    try{
+      const res=await fetch(`${API}/alternates/${alt.id}`,{method:"DELETE",headers:hdr,body:JSON.stringify({confirm:typed})});
+      const d=await res.json().catch(()=>({}));
+      if(!res.ok||!d.removed){ setErr(d?.error||`Server returned ${res.status}`); setBusy(false); return; }
+      onDone(d);
+    }catch(e){ setErr("Could not reach the server. Nothing was removed."); setBusy(false); }
+  };
+  const name=`${alt.first_name} ${alt.last_name}`;
+  const li={ fontFamily:F_UI,fontSize:14,color:INK,lineHeight:1.5,marginBottom:5 };
+  return (
+    <Modal title={`Remove ${name}?`} sub="From the sub pool" onClose={onClose} width={520}>
+      {!info && !err && <div style={{ color:MUTED,fontSize:14 }}>Checking what this would touch…</div>}
+      {info && (
+        <>
+          {info.blockers.length>0 ? (
+            <div style={{ background:"#FEF2F2",border:"1px solid #FCA5A5",borderRadius:10,padding:"10px 14px",fontSize:14,color:"#991B1B",marginBottom:12 }}>
+              <b>Can't remove yet.</b>{info.blockers.map((b,i)=><div key={i}>{b}</div>)}
+            </div>
+          ) : (
+            <>
+              <div style={{ fontFamily:F_UI,fontSize:12,fontWeight:700,color:MUTED,textTransform:"uppercase",letterSpacing:".05em",marginBottom:6 }}>What will happen</div>
+              <ul style={{ margin:"0 0 12px",paddingLeft:18 }}>
+                {info.mode==="unflag"
+                  ? <li style={li}>They are registered as a regular player, so that registration <b>stays</b>. Only the sub flag and their sub availability are removed.</li>
+                  : <li style={li}>Their sub registration and availability for this season are removed.</li>}
+                {info.requests_total>0 && <li style={li}>{info.requests_total} e-mail request{info.requests_total===1?"":"s"} sent to them {info.requests_total===1?"is":"are"} removed{info.requests_pending>0?` (${info.requests_pending} still waiting for an answer)`:""}.</li>}
+                {info.activations_this_season>0 && <li style={li}>Their {info.activations_this_season} activation{info.activations_this_season===1?"":"s"} stay in the Activation log.</li>}
+                {info.delete_player
+                  ? <li style={li}>Their player record is deleted too, because nothing else uses it.</li>
+                  : <li style={li}>Their player record is <b>kept</b> because they {info.keep_reasons.join(", ")}.</li>}
+                <li style={li}>You can undo this from the <b>Removed</b> tab.</li>
+              </ul>
+              {info.warnings.map((w,i)=><div key={i} style={{ background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,padding:"8px 12px",fontSize:13.5,color:"#7A4A00",marginBottom:10 }}>{w}</div>)}
+              <div style={{ fontSize:13,color:MUTED,marginBottom:12 }}>If they fill out the sub form again later, they will show up again as a new entry.</div>
+              <label style={lbl}>Type DELETE to confirm</label>
+              <input value={typed} onChange={e=>setTyped(e.target.value)} autoFocus placeholder="DELETE" style={{ ...inp,maxWidth:220,marginBottom:4 }}
+                onKeyDown={e=>{ if(e.key==="Enter"&&typed==="DELETE"&&!busy) go(); }} />
+            </>
+          )}
+        </>
+      )}
+      {err && <div style={{ background:"#FEF2F2",border:"1px solid #FCA5A5",borderRadius:10,padding:"8px 12px",fontSize:13.5,color:"#991B1B",margin:"12px 0 0" }}>{err}</div>}
+      <div style={{ display:"flex",justifyContent:"flex-end",gap:8,marginTop:18 }}>
+        <button onClick={onClose} style={btnLight}>{info&&!info.can_remove?"Close":"Cancel"}</button>
+        {info && info.can_remove && <button onClick={go} disabled={typed!=="DELETE"||busy}
+          style={{ ...btnDanger,opacity:typed==="DELETE"&&!busy?1:.4,cursor:typed==="DELETE"&&!busy?"pointer":"not-allowed" }}>{busy?"Removing…":"Remove from sub pool"}</button>}
+      </div>
+    </Modal>
+  );
+}
+
+function RemovedTab({ removed, onRestore, busyId }) {
+  if(!removed.length) return (
+    <div style={{ background:"#fff",border:`1px solid ${LINE}`,borderRadius:12,padding:"44px 24px",textAlign:"center",fontSize:14,color:MUTED }}>
+      Nobody has been removed. When you remove a sub, they appear here so you can put them back.
+    </div>
+  );
+  return (
+    <div style={{ background:"#fff",border:`1px solid ${LINE}`,borderRadius:12,overflow:"hidden" }}>
+      {removed.map(r=>(
+        <div key={r.log_id} style={{ display:"flex",gap:12,alignItems:"center",padding:"12px 16px",borderBottom:"1px solid #F0EEE8" }}>
+          <div style={{ flex:1,minWidth:0 }}>
+            <div style={{ fontFamily:F_HEAD,fontSize:15,fontWeight:700 }}>{r.name}</div>
+            <div style={{ fontSize:12.5,color:MUTED }}>Removed by {r.removed_by||"someone"} · {r.removed_at}</div>
+          </div>
+          <button onClick={()=>onRestore(r)} disabled={busyId===r.log_id} style={{ ...btnDark,padding:"6px 12px",fontSize:12.5,opacity:busyId===r.log_id?.5:1 }}>{busyId===r.log_id?"Restoring…":"Restore"}</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const LIST_COLS = "34px minmax(160px,1.5fr) 62px minmax(110px,1fr) 190px minmax(130px,1fr) 150px";
 function ListHeader() {
   return (
     <div style={{ display:"grid",gridTemplateColumns:LIST_COLS,gap:12,padding:"9px 16px",background:"#FAFAF8",borderBottom:`1px solid ${LINE}`,
@@ -491,7 +583,7 @@ function ListHeader() {
     </div>
   );
 }
-function ListRow({ alt, dm, divLabel, filterDay, onActivate }) {
+function ListRow({ alt, dm, divLabel, filterDay, onActivate, onRemove }) {
   const maxed = alt.today_activations>=alt.max_games_per_day;
   return (
     <div style={{ display:"grid",gridTemplateColumns:LIST_COLS,gap:12,alignItems:"center",padding:"10px 16px",borderBottom:"1px solid #F0EEE8",background:maxed?"#FEF7F7":"transparent" }}>
@@ -504,11 +596,15 @@ function ListRow({ alt, dm, divLabel, filterDay, onActivate }) {
       <div style={{ fontFamily:F_UI,fontSize:13,color:MUTED }}>{alt.division_eligibility.length?alt.division_eligibility.map(divLabel).join(", "):"All"}</div>
       <AvailabilityChips days={alt.available_days} filterDay={filterDay} dm={dm} />
       <div style={{ display:"flex",flexDirection:"column",gap:2 }}><StatusLine alt={alt} dm={dm} /><RelBadge alt={alt} /></div>
-      <button onClick={()=>!maxed&&onActivate(alt)} disabled={maxed} style={{ ...btnDark,padding:"6px 10px",fontSize:12,background:maxed?"#EFEDE6":INK,color:maxed?"#8a8a96":GOLD,cursor:maxed?"not-allowed":"pointer" }}>{maxed?"Maxed":"Activate →"}</button>
+      <div style={{ display:"flex",gap:6,alignItems:"center",justifyContent:"flex-end" }}>
+        <button onClick={()=>!maxed&&onActivate(alt)} disabled={maxed} style={{ ...btnDark,padding:"6px 10px",fontSize:12,background:maxed?"#EFEDE6":INK,color:maxed?"#8a8a96":GOLD,cursor:maxed?"not-allowed":"pointer" }}>{maxed?"Maxed":"Activate →"}</button>
+        <button onClick={()=>onRemove(alt)} title={`Remove ${alt.first_name} ${alt.last_name} from the sub pool`} aria-label={`Remove ${alt.first_name} ${alt.last_name}`}
+          style={{ ...btnLight,padding:"6px 9px",fontSize:12,color:"#991B1B" }}>Remove</button>
+      </div>
     </div>
   );
 }
-function AlternateCard({ alt, dm, divLabel, filterDay, onActivate, onNoteChange }) {
+function AlternateCard({ alt, dm, divLabel, filterDay, onActivate, onNoteChange, onRemove }) {
   const [editing,setEditing]=useState(false);
   const [note,setNote]=useState(cleanNote(alt.notes));
   const maxed = alt.today_activations>=alt.max_games_per_day;
@@ -553,8 +649,10 @@ function AlternateCard({ alt, dm, divLabel, filterDay, onActivate, onNoteChange 
           ) : <div style={{ fontFamily:F_UI,fontSize:13,color:note?INK:SOFT }}>{note||"No notes"}</div>}
         </div>
       </div>
-      <div style={{ padding:"10px 16px 14px",borderTop:"1px solid #F0EEE8" }}>
-        <button onClick={()=>!maxed&&onActivate(alt)} disabled={maxed} style={{ ...btnDark,width:"100%",background:maxed?"#EFEDE6":INK,color:maxed?"#8a8a96":GOLD,cursor:maxed?"not-allowed":"pointer" }}>{maxed?"Maxed out today":"Activate sub →"}</button>
+      <div style={{ padding:"10px 16px 14px",borderTop:"1px solid #F0EEE8",display:"flex",gap:8 }}>
+        <button onClick={()=>!maxed&&onActivate(alt)} disabled={maxed} style={{ ...btnDark,flex:1,background:maxed?"#EFEDE6":INK,color:maxed?"#8a8a96":GOLD,cursor:maxed?"not-allowed":"pointer" }}>{maxed?"Maxed out today":"Activate sub →"}</button>
+        <button onClick={()=>onRemove(alt)} title={`Remove ${alt.first_name} ${alt.last_name} from the sub pool`} aria-label={`Remove ${alt.first_name} ${alt.last_name}`}
+          style={{ ...btnLight,color:"#991B1B" }}>Remove</button>
       </div>
     </div>
   );
@@ -669,10 +767,14 @@ export default function Alternates() {
   const [recruiting,setRecruiting]=useState(false);
   const [showDispatch,setShowDispatch]=useState(false);
   const [toast,setToast]=useState(null);
+  const [removing,setRemoving]=useState(null);       // alt being removed
+  const [removed,setRemoved]=useState([]);
+  const [restoringId,setRestoringId]=useState(null);
   const [editDates,setEditDates]=useState(false);
   const [startDraft,setStartDraft]=useState("");
 
-  const showToast=(m)=>{ setToast(m); setTimeout(()=>setToast(null),3800); };
+  const toastTimer=useRef(null);
+  const showToast=(m,action)=>{ setToast(action?{msg:m,action}:m); clearTimeout(toastTimer.current); toastTimer.current=setTimeout(()=>setToast(null),action?10000:3800); };
   const headers={"Content-Type":"application/json","X-WP-Nonce":NONCE};
 
   const loadAlts=useCallback(()=>{
@@ -685,7 +787,24 @@ export default function Alternates() {
   const loadLog=useCallback(()=>{ fetch(`${API}/alternates/log`,{headers}).then(r=>r.ok?r.json():[]).then(d=>setLog(Array.isArray(d)?d:[])).catch(()=>{}); },[]);
   const loadMeta=useCallback(()=>{ fetch(`${API}/alternates/meta`,{headers}).then(r=>r.ok?r.json():null).then(d=>{ if(d) setMeta(d); }).catch(()=>{}); },[]);
   const loadReq=useCallback(()=>{ fetch(`${API}/alternates/requests`,{headers}).then(r=>r.ok?r.json():[]).then(d=>setRequests(Array.isArray(d)?d:[])).catch(()=>{}); },[]);
-  useEffect(()=>{ loadAlts(); loadLog(); loadMeta(); loadReq(); },[]);
+  const loadRemoved=useCallback(()=>{ fetch(`${API}/alternates/removed`,{headers}).then(r=>r.ok?r.json():[]).then(d=>setRemoved(Array.isArray(d)?d:[])).catch(()=>{}); },[]);
+  useEffect(()=>{ loadAlts(); loadLog(); loadMeta(); loadReq(); loadRemoved(); },[]);
+
+  const restoreOne = async (r) => {
+    setRestoringId(r.log_id);
+    try{
+      const res=await fetch(`${API}/alternates/removed/${r.log_id}/restore`,{method:"POST",headers});
+      const d=await res.json().catch(()=>({}));
+      if(!res.ok||!d.restored){ showToast(d?.error||`Could not restore (server ${res.status})`); }
+      else { showToast(`${r.name} is back in the sub pool`); loadAlts(); loadReq(); loadLog(); }
+      loadRemoved();
+    }catch(e){ showToast("Could not reach the server. Nothing was restored."); }
+    setRestoringId(null);
+  };
+  const afterRemove = (d) => {
+    setRemoving(null); loadAlts(); loadReq(); loadLog(); loadRemoved();
+    showToast(`${d.name} removed from the sub pool`,{ label:"Undo", fn:()=>restoreOne({log_id:d.log_id,name:d.name}) });
+  };
   useEffect(()=>{ if(tab!=="requests") return; const t=setInterval(()=>{loadReq();loadLog();loadAlts();},30000); return ()=>clearInterval(t); },[tab]);
 
   const dm   = useMemo(()=>buildDays(meta?.tournament_start||""),[meta?.tournament_start]);
@@ -750,7 +869,7 @@ export default function Alternates() {
   };
 
   const openActivate=(alt,preset)=>setActivating({alt,preset});
-  const tabs=[["pool","Sub pool"],["coverage","Coverage"],["requests",`Requests${requests.some(g=>!g.filled_by)?" ·  "+requests.filter(g=>!g.filled_by).length+" open":""}`],["log",`Activation log · ${log.length}`]];
+  const tabs=[["pool","Sub pool"],["coverage","Coverage"],["requests",`Requests${requests.some(g=>!g.filled_by)?" ·  "+requests.filter(g=>!g.filled_by).length+" open":""}`],["log",`Activation log · ${log.length}`],["removed",`Removed${removed.length?" · "+removed.length:""}`]];
   const startLabel = meta?.tournament_start ? `${dayText(dm,"thursday")} – ${dayText(dm,"sunday")}` : "";
 
   return (
@@ -865,15 +984,17 @@ export default function Alternates() {
           ) : curView==="list" ? (
             <div style={{ background:"#fff",border:`1px solid ${LINE}`,borderRadius:12,overflow:"hidden" }}>
               <ListHeader />
-              {filtered.map(a=><ListRow key={a.id} alt={a} dm={dm} divLabel={divLabel} filterDay={filterDay} onActivate={(x)=>openActivate(x,{division:filterDiv,day:filterDay})} />)}
+              {filtered.map(a=><ListRow key={a.id} alt={a} dm={dm} divLabel={divLabel} filterDay={filterDay} onActivate={(x)=>openActivate(x,{division:filterDiv,day:filterDay})} onRemove={setRemoving} />)}
             </div>
           ) : (
             <div className="alt-grid" style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(290px,1fr))",gap:14 }}>
-              {filtered.map(a=><AlternateCard key={a.id} alt={a} dm={dm} divLabel={divLabel} filterDay={filterDay} onActivate={(x)=>openActivate(x,{division:filterDiv,day:filterDay})} onNoteChange={noteChange} />)}
+              {filtered.map(a=><AlternateCard key={a.id} alt={a} dm={dm} divLabel={divLabel} filterDay={filterDay} onActivate={(x)=>openActivate(x,{division:filterDiv,day:filterDay})} onNoteChange={noteChange} onRemove={setRemoving} />)}
             </div>
           )}
         </>
       )}
+
+      {tab==="removed" && <RemovedTab removed={removed} onRestore={restoreOne} busyId={restoringId} />}
 
       {tab==="log" && (
         <div style={{ background:"#fff",border:`1px solid ${LINE}`,borderRadius:12,overflow:"hidden" }}>
@@ -906,10 +1027,15 @@ export default function Alternates() {
         onConfirm={(d)=>confirmActivation(activating.alt,d)} onClose={()=>setActivating(null)} />}
       {asking && <RequestModal pool={pool} meta={meta} dm={dm} preset={asking} onClose={()=>setAsking(null)} onSent={()=>{loadReq();}} />}
       {recruiting && <RecruitGoaliesModal onClose={()=>setRecruiting(false)} onSent={()=>{}} />}
+      {removing && <RemoveModal alt={removing} onClose={()=>setRemoving(null)} onDone={afterRemove} />}
 
       {toast && (
         <div style={{ position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",fontSize:14,fontWeight:600,background:INK,color:GOLD,
-          padding:"11px 22px",borderRadius:99,boxShadow:"0 8px 24px rgba(0,0,0,.2)",zIndex:200000 }}>{toast}</div>
+          padding:"11px 22px",borderRadius:99,boxShadow:"0 8px 24px rgba(0,0,0,.2)",zIndex:200000,display:"flex",gap:14,alignItems:"center" }}>
+          <span>{typeof toast==="string"?toast:toast.msg}</span>
+          {typeof toast!=="string" && toast.action && <button onClick={()=>{ const a=toast.action; setToast(null); a.fn(); }}
+            style={{ fontFamily:F_UI,fontSize:13,fontWeight:700,background:GOLD,color:INK,border:"none",borderRadius:99,padding:"4px 12px",cursor:"pointer" }}>{toast.action.label}</button>}
+        </div>
       )}
     </div>
   );
